@@ -1,0 +1,54 @@
+name: Feature request
+description: Suggest an improvement or new chat/Codex workflow.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please avoid sharing private chat content, credentials, local paths, or internal documents.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what blocks you today?
+      placeholder: I want to use Chat2Codex to ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or command you would like.
+      placeholder: Add ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Feishu/Lark bot
+        - Codex app-server protocol
+        - Approvals and safety
+        - Attachments
+        - Service deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workaround or different design you tried?
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, screenshots, or examples are welcome if they do not expose private data.
+    validations:
+      required: false

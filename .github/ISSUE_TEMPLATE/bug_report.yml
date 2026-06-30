@@ -1,0 +1,80 @@
+name: Bug report
+description: Report a reproducible Chat2Codex problem.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        Do not include real Feishu/Lark credentials, Codex tokens, chat ids, user ids, local absolute paths, private chat screenshots, or attached documents.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+      placeholder: Chat2Codex fails to ...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact chat command or setup step when possible.
+      placeholder: |
+        1. Configure ...
+        2. Send `/status`
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: I expected Chat2Codex to ...
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: Instead, Chat2Codex ...
+    validations:
+      required: true
+  - type: input
+    id: chat_surface
+    attributes:
+      label: Chat surface
+      description: Direct message or group chat?
+      placeholder: Direct message / allowlisted group chat
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime
+      description: OS, Bun version, Node.js version, and Codex CLI version.
+      placeholder: macOS 15, Bun 1.3.9, Node.js 24.x, Codex CLI ...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Redact secrets and replace local paths with placeholders.
+      placeholder: |
+        CODEX_SANDBOX=workspace-write
+        CODEX_APPROVAL_POLICY=never
+        ALLOW_GROUPS=false
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or diagnostics
+      description: Include only sanitized logs. `/status` diagnostics are often useful.
+      render: text
+    validations:
+      required: false
