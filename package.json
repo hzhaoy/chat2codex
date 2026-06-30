@@ -1,0 +1,67 @@
+{
+  "name": "chat2codex",
+  "version": "0.1.0",
+  "description": "Run local Codex from Feishu/Lark chat.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "packageManager": "bun@1.3.9",
+  "bin": {
+    "chat2codex": "./dist/index.js"
+  },
+  "files": [
+    ".env.example",
+    "dist",
+    "docs/codex-app-server-protocol"
+  ],
+  "keywords": [
+    "codex",
+    "feishu",
+    "lark",
+    "chatops",
+    "bot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hzhaoy/chat2codex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hzhaoy/chat2codex/issues"
+  },
+  "homepage": "https://github.com/hzhaoy/chat2codex#readme",
+  "scripts": {
+    "dev": "bun src/index.ts",
+    "protocol:generate": "bun src/setup/generate-app-server-schema.ts",
+    "smoke:app-server": "bun src/setup/smoke-app-server.ts",
+    "smoke:app-server:approval": "bun src/setup/smoke-app-server.ts --mode approval",
+    "smoke:app-server:turn": "bun src/setup/smoke-app-server.ts --mode turn",
+    "setup:feishu": "bun src/setup/feishu.ts",
+    "setup:service": "bun src/setup/service.ts install",
+    "service:print": "bun src/setup/service.ts print",
+    "service:uninstall": "bun src/setup/service.ts uninstall",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
+    "check": "bun run typecheck && bun test && bun run build",
+    "prepack": "bun run build",
+    "start": "node dist/index.js",
+    "start:bun": "bun src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.68.0",
+    "dotenv": "^17.4.2",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "axios": "^1.16.0"
+  },
+  "engines": {
+    "node": ">=20.12.0"
+  },
+  "license": "MIT"
+}

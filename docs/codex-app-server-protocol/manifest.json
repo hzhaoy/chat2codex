@@ -1,0 +1,8 @@
+{
+  "generatedAt": "2026-06-30T11:00:34.202Z",
+  "codexVersion": "codex-cli 0.142.4",
+  "command": "/opt/homebrew/bin/codex app-server generate-json-schema --experimental --out <temp-dir>",
+  "schemaFile": "codex_app_server_protocol.schemas.json",
+  "schemaSha256": "c75ba8ea4631337f6f451e94c1c2dcf94e554ef509759dc4bb4038541ffac7a4",
+  "note": "Regenerate after Codex CLI upgrades and review the schema diff before changing app-server wiring."
+}
