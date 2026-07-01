@@ -1,5 +1,7 @@
 # Chat2Codex
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Run Codex on your own machine from Feishu/Lark chat.
 
 Chat2Codex turns a Feishu/Lark bot into a message platform for the local Codex

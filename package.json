@@ -10,6 +10,7 @@
   },
   "files": [
     ".env.example",
+    "README.zh-CN.md",
     "dist",
     "docs/codex-app-server-protocol"
   ],
