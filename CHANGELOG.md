@@ -5,7 +5,7 @@ All notable changes to Chat2Codex will be documented in this file.
 This project follows the spirit of Keep a Changelog and uses semantic version
 numbers once releases are published.
 
-## 0.1.0 - Unreleased
+## 0.1.0 - 2026-07-01
 
 ### Added
 
