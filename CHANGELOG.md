@@ -5,6 +5,14 @@ All notable changes to Chat2Codex will be documented in this file.
 This project follows the spirit of Keep a Changelog and uses semantic version
 numbers once releases are published.
 
+## 0.2.0 - 2026-07-02
+
+### Added
+
+- Operational `/status` details for queue depth, active run age, approval wait
+  age, and recent failures.
+- Configurable run and approval timeouts for long-running team bot deployments.
+
 ## 0.1.1 - 2026-07-02
 
 ### Added

@@ -79,6 +79,8 @@ Summarize this repository.
 - 支持用飞书/Lark 审批卡片处理 Codex 命令执行和文件变更审批请求。按钮会根据 Codex 当前提供的审批选项生成，包括 Approve、Approve session、Deny、Cancel turn 等。
 - 支持飞书/Lark 图片和文件消息，把附件下载为本地路径后随 prompt 传给 Codex。
 - 在日志和 `/status` 中记录近期消息路由/丢弃诊断信息。
+- `/status` 会显示队列深度、当前运行时长、审批等待时长和近期失败信息。
+- 为无人值守团队机器人提供可选的运行超时和审批超时。
 - Codex 失败或无法启动时，会返回适合团队机器人场景的错误摘要。
 - 最终 Codex 回复会渲染为飞书/Lark 富文本消息。
 - 支持用户级 launchd/systemd 服务，方便长期运行团队机器人。
@@ -150,11 +152,14 @@ ALLOWED_CHAT_IDS=oc_xxx
    CODEX_GROUP_ALLOWED_ROOTS=/absolute/path/to/your/repo,/absolute/path/to/team/repos
    CODEX_BIN=/absolute/path/to/codex
    CODEX_APPROVAL_POLICY=on-request
+   CODEX_RUN_TIMEOUT_MS=1800000
+   CODEX_APPROVAL_TIMEOUT_MS=300000
    ATTACHMENT_DOWNLOAD_DIR=/absolute/path/to/chat2codex-attachments
    ```
 
    后台服务建议把 `CODEX_BIN` 配成绝对路径，因为 launchd 和 systemd 不会加载你的交互式 shell 启动文件。
    如果机器人需要无人值守运行，不希望等待飞书/Lark 审批点击，可以使用 `CODEX_APPROVAL_POLICY=never`。
+   `CODEX_RUN_TIMEOUT_MS=0` 和 `CODEX_APPROVAL_TIMEOUT_MS=0` 表示关闭自动超时；团队机器人建议设置为正整数毫秒值，避免任务或审批无限等待。
 
 3. 预览服务文件：
 
@@ -189,7 +194,7 @@ chat2codex service uninstall
 
 | 命令 | 作用 |
 | --- | --- |
-| `/status` | 显示当前 chat 会话、cwd、附件目录和近期事件诊断。 |
+| `/status` | 显示当前 chat 会话、cwd、队列深度、当前运行时长、审批等待时长、近期失败、附件目录和近期事件诊断。 |
 | `/projects` | 按 cwd 分组列出 Codex app-server 发现的项目。 |
 | `/project <index\|path>` | 通过编号进入已列出的项目，或切换到指定目录，并清空当前选中的线程。 |
 | `/threads` | 列出当前项目最近的 Codex 对话。`/sessions` 是别名。 |
@@ -204,6 +209,8 @@ chat2codex service uninstall
 Chat2Codex 默认使用 `CODEX_SANDBOX=workspace-write`，所以 Codex 可以编辑当前选中的工作区。对于只问答、不改代码的机器人，可以改成 `read-only`。
 
 默认 `CODEX_APPROVAL_POLICY=never`，适合无人值守运行。如果你希望 Codex 审批请求以飞书/Lark 卡片形式出现，可以设置为 `CODEX_APPROVAL_POLICY=on-request` 或 `untrusted`。在群聊中，审批按钮只能由 `ALLOWED_USER_IDS` 中列出的用户处理。
+
+`CODEX_RUN_TIMEOUT_MS=0` 和 `CODEX_APPROVAL_TIMEOUT_MS=0` 表示关闭自动超时。对于长期运行的后台机器人，可以设置正整数毫秒值；当 Codex turn 或审批请求卡住时，Chat2Codex 会取消它，并在 `/status` 的近期失败中留下恢复提示。
 
 私聊默认开启。群聊消息必须提到机器人，并且群聊默认关闭，直到同时配置 `ALLOW_GROUPS=true` 和 `ALLOWED_CHAT_IDS`。你也可以把 `ALLOWED_USER_IDS` 设置为发送者 `open_id`、`user_id` 或 `union_id` 的逗号分隔列表。私聊可以切换到任意本机目录；群聊只能切换到 `CODEX_GROUP_ALLOWED_ROOTS`，如果没有配置这个变量，则只能使用 `CODEX_WORKDIR`。
 
@@ -236,7 +243,5 @@ bun run check
 
 ## 后续功能
 
-1. 更丰富的 `/status` 输出，包括队列深度、当前运行时长、审批等待时长和近期失败信息。
-2. 为长期运行的团队机器人提供可配置的运行超时和审批超时。
-3. 在 app-server 支持验证完成后，加入更高级的线程控制能力，例如 history、compact、fork 和 rollback。
-4. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。
+1. 在 app-server 支持验证完成后，加入更高级的线程控制能力，例如 history、compact、fork 和 rollback。
+2. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。

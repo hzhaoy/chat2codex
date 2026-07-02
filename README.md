@@ -110,6 +110,9 @@ when you need a separate bot instance.
 - Feishu/Lark image and file messages downloaded to local paths and passed to
   Codex with the prompt.
 - Event diagnostics in logs and `/status` for recent routed/dropped messages.
+- Operational `/status` details for queue depth, active run age, approval wait
+  age, and recent failures.
+- Optional run and approval timeouts for unattended team bot deployments.
 - Team-bot friendly error summaries when Codex fails or cannot start.
 - Final Codex replies rendered as Feishu/Lark rich-text posts.
 - User-level launchd/systemd setup for long-running team deployments.
@@ -205,6 +208,8 @@ service instead of leaving `chat2codex start` in a terminal.
    CODEX_GROUP_ALLOWED_ROOTS=/absolute/path/to/your/repo,/absolute/path/to/team/repos
    CODEX_BIN=/absolute/path/to/codex
    CODEX_APPROVAL_POLICY=on-request
+   CODEX_RUN_TIMEOUT_MS=1800000
+   CODEX_APPROVAL_TIMEOUT_MS=300000
    ATTACHMENT_DOWNLOAD_DIR=/absolute/path/to/chat2codex-attachments
    ```
 
@@ -212,6 +217,9 @@ service instead of leaving `chat2codex start` in a terminal.
    systemd do not load your interactive shell startup files.
    Use `CODEX_APPROVAL_POLICY=never` for unattended bots that should never wait
    for a Feishu/Lark approval click.
+   Leave `CODEX_RUN_TIMEOUT_MS=0` and `CODEX_APPROVAL_TIMEOUT_MS=0` to disable
+   automatic timeouts; set positive millisecond values when team bots should
+   fail fast instead of waiting forever.
 
 3. Preview the service file:
 
@@ -247,7 +255,7 @@ chat2codex service uninstall
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Show current chat session, cwd, attachment directory, and recent event diagnostics. |
+| `/status` | Show current chat session, cwd, queue depth, active run age, approval wait age, recent failures, attachment directory, and recent event diagnostics. |
 | `/projects` | List projects discovered from Codex app-server threads, grouped by cwd. |
 | `/project <index\|path>` | Enter a listed project by number, or switch to a directory path, and start with no selected thread. |
 | `/threads` | List recent Codex conversations for the current project. `/sessions` is an alias. |
@@ -265,6 +273,11 @@ It defaults to `CODEX_APPROVAL_POLICY=never` for unattended operation. Set
 `CODEX_APPROVAL_POLICY=on-request` or `untrusted` when you want Codex approval
 requests to appear as Feishu/Lark cards. In group chats, approval buttons can
 only be handled by users listed in `ALLOWED_USER_IDS`.
+
+`CODEX_RUN_TIMEOUT_MS=0` and `CODEX_APPROVAL_TIMEOUT_MS=0` disable automatic
+timeouts. For long-running background bots, set positive millisecond values so a
+stuck Codex turn or unattended approval request is cancelled and recorded in
+`/status` as a recent failure with a recovery hint.
 
 Direct messages are enabled by default. Group messages must mention the bot,
 and group chats are disabled by default until enabled with `ALLOW_GROUPS=true`
@@ -306,7 +319,5 @@ chat or reporting a security issue.
 
 ## Next Features To Add
 
-1. Richer `/status` output for queue depth, active run age, approval wait age, and recent failures.
-2. Configurable run and approval timeouts for long-running team bots.
-3. Advanced thread controls beyond start/resume/reset, such as history, compact, fork, and rollback after app-server support is verified.
-4. A chat-adapter boundary before adding Slack, Discord, or other platforms.
+1. Advanced thread controls beyond start/resume/reset, such as history, compact, fork, and rollback after app-server support is verified.
+2. A chat-adapter boundary before adding Slack, Discord, or other platforms.

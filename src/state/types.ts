@@ -46,6 +46,28 @@ export interface EventDiagnosticSnapshot {
 export interface BridgeDiagnostics {
   lastEvent?: EventDiagnosticSnapshot;
   lastDroppedEvent?: EventDiagnosticSnapshot;
+  recentFailures?: RecentFailureDiagnostic[];
+}
+
+export type FailureDiagnosticCategory =
+  | "codex_missing"
+  | "app_server_timeout"
+  | "approval_timeout"
+  | "run_timeout"
+  | "thread_unavailable"
+  | "attachment_download_failed"
+  | "unknown";
+
+export interface RecentFailureDiagnostic {
+  at: string;
+  category: FailureDiagnosticCategory;
+  cwd?: string;
+  promptPreview?: string;
+  threadId?: string;
+  exitCode?: number | null;
+  signal?: string | null;
+  detail: string;
+  hint?: string;
 }
 
 export interface BridgeState {

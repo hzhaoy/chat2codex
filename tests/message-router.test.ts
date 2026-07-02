@@ -246,6 +246,41 @@ class BlockingCodex implements CodexClient {
   }
 }
 
+class FirstBlockingThenDoneCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  abortCount = 0;
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    if (this.runs.length > 1) {
+      return {
+        threadId: "thread_after_queue",
+        finalText: "queued done",
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    return new Promise((resolve) => {
+      const finishCancelled = () => {
+        this.abortCount += 1;
+        resolve({
+          threadId: "thread_test",
+          finalText: "",
+          stderr: "",
+          exitCode: null,
+          cancelled: true,
+        });
+      };
+
+      if (input.signal?.aborted) {
+        finishCancelled();
+        return;
+      }
+      input.signal?.addEventListener("abort", finishCancelled, { once: true });
+    });
+  }
+}
+
 class ApprovalCodex implements CodexClient {
   readonly runs: CodexRunInput[] = [];
   decision: CodexApprovalDecision | undefined;
@@ -388,6 +423,55 @@ describe("MessageRouter access control", () => {
       expect(sender.messages[0]?.text).toContain("type=audio");
       expect(sender.messages[0]?.text).toContain("reason=unsupported_message_type");
       expect(sender.messages[0]?.text).toContain("last_dropped:");
+      expect(sender.messages[0]?.text).toContain("queue_depth: 0");
+      expect(sender.messages[0]?.text).toContain("active_run: (none)");
+      expect(sender.messages[0]?.text).toContain("approval_wait: (none)");
+      expect(sender.messages[0]?.text).toContain("recent_failures: (none)");
+    });
+  });
+
+  test("status bypasses the queue and reports active run metadata", async () => {
+    const codex = new FirstBlockingThenDoneCodex();
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      const running = router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "long running task",
+      });
+      await waitFor(() => codex.runs.length === 1);
+
+      const queued = router.enqueue({
+        messageId: "m_queued",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "queued task",
+      });
+      await router.enqueue({
+        messageId: "m_status",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/status",
+      });
+
+      const status = sender.messages.at(-1)?.text ?? "";
+      expect(status).toContain("queue_depth: 1");
+      expect(status).toContain("active_run: age=");
+      expect(status).toContain('prompt="long running task"');
+
+      await router.enqueue({
+        messageId: "m_stop",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/stop",
+      });
+      await running;
+      await queued;
+      expect(codex.runs.map((run) => run.prompt)).toEqual(["long running task", "queued task"]);
     });
   });
 
@@ -1396,6 +1480,41 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("run timeout aborts the task and records a recent failure", async () => {
+    const codex = new BlockingCodex();
+    const sender = new CardCollectingSender();
+    await withRouterAndSender(
+      { CODEX_RUN_TIMEOUT_MS: "10" },
+      codex,
+      sender,
+      async ({ router }) => {
+        await router.enqueue({
+          messageId: "m1",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "long task",
+        });
+
+        expect(codex.abortCount).toBe(1);
+        expect(sender.cardUpdates.at(-1)?.input).toMatchObject({
+          status: "failed",
+          detail: "Codex 运行超时，已停止当前任务。",
+        });
+        expect(sender.messages.at(-1)?.text).toContain("CODEX_RUN_TIMEOUT_MS=10");
+
+        await router.enqueue({
+          messageId: "m_status",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        expect(sender.messages.at(-1)?.text).toContain("run_timeout");
+      },
+    );
+  });
+
   test("card stop action aborts the active run without sending chat text", async () => {
     const codex = new BlockingCodex();
     const sender = new CardCollectingSender();
@@ -1546,6 +1665,92 @@ describe("MessageRouter access control", () => {
         text: "decision=acceptForSession",
       });
     });
+  });
+
+  test("status reports pending approval wait details", async () => {
+    const request: CodexApprovalRequest = {
+      id: "approval_1",
+      kind: "command",
+      command: "rm -rf build",
+      cwd: "/tmp/chat2codex",
+      decisions: ["accept", "decline", "cancel"],
+    };
+    const codex = new ApprovalCodex(request);
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "run command",
+      });
+      await waitFor(() => sender.approvalCards.length === 1);
+
+      await router.enqueue({
+        messageId: "m_status",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/status",
+      });
+
+      const status = sender.messages.at(-1)?.text ?? "";
+      expect(status).toContain("approval_wait: count=1");
+      expect(status).toContain("type=commandExecution");
+      expect(status).toContain("decisions=3");
+      expect(status).toContain('command="rm -rf build"');
+
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_1",
+        decisionIndex: 2,
+        sender: { openId: "ou_user" },
+      });
+      await running;
+    });
+  });
+
+  test("approval timeout cancels the request and records a recent failure", async () => {
+    const codex = new ApprovalCodex({
+      id: "approval_1",
+      kind: "command",
+      command: "rm -rf build",
+      decisions: ["accept", "cancel"],
+    });
+    const sender = new CardCollectingSender();
+    await withRouterAndSender(
+      { CODEX_APPROVAL_TIMEOUT_MS: "10" },
+      codex,
+      sender,
+      async ({ router }) => {
+        await router.enqueue({
+          messageId: "m1",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "run command",
+        });
+
+        expect(codex.decision).toBe("cancel");
+        expect(sender.approvalCardUpdates.at(-1)?.input).toMatchObject({
+          status: "cancelled",
+        });
+
+        await router.enqueue({
+          messageId: "m_status",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        const status = sender.messages.at(-1)?.text ?? "";
+        expect(status).toContain("approval_timeout");
+        expect(status).toContain("CODEX_APPROVAL_TIMEOUT_MS=10");
+      },
+    );
   });
 
   test("group approval card action requires an allowed user list", async () => {

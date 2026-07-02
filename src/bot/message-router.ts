@@ -18,7 +18,9 @@ import {
   BridgeState,
   type EventDiagnosticOutcome,
   type EventDiagnosticSnapshot,
+  type FailureDiagnosticCategory,
   type ProjectSelection,
+  type RecentFailureDiagnostic,
   type ThreadSelection,
 } from "../state/types.js";
 import type { Logger } from "../util/logger.js";
@@ -120,15 +122,34 @@ interface PendingApproval {
   request: CodexApprovalRequest;
   resolve: (decision: CodexApprovalDecision) => void;
   handle: StatusCardHandle | null;
+  createdAt: string;
+  createdAtMs: number;
+  timeoutTimer?: NodeJS.Timeout;
   decision?: CodexApprovalDecision;
   resolvedAt?: string;
   cancelledAt?: string;
+  cancelReason?: "run_cancelled" | "timeout";
+}
+
+interface ActiveRunState {
+  controller: AbortController;
+  cwd: string;
+  prompt: string;
+  threadId?: string;
+  startedAt: string;
+  startedAtMs: number;
+  lastProgressAt?: string;
+  lastProgressAtMs?: number;
+  lastProgressText?: string;
+  timeoutTimer?: NodeJS.Timeout;
+  timedOut?: boolean;
 }
 
 export class MessageRouter {
   private state: BridgeState | null = null;
   private readonly queues = new Map<string, Promise<void>>();
-  private readonly activeRuns = new Map<string, AbortController>();
+  private readonly queueDepths = new Map<string, number>();
+  private readonly activeRuns = new Map<string, ActiveRunState>();
   private readonly activeApprovals = new Map<string, PendingApproval>();
   private readonly statusCardRuns = new Map<string, { chatId: string; prompt: string }>();
   private readonly codex: CodexClient;
@@ -179,6 +200,11 @@ export class MessageRouter {
         this.logger.error("Immediate stop command failed", error);
       });
     }
+    if (!message.attachments?.length && isStatusCommand(message)) {
+      return this.handleImmediateStatus(message).catch((error) => {
+        this.logger.error("Immediate status command failed", error);
+      });
+    }
 
     return this.enqueueTask(message.chatId, () => this.handle(message));
   }
@@ -222,11 +248,15 @@ export class MessageRouter {
 
   private enqueueTask(chatId: string, task: () => Promise<void>): Promise<void> {
     const previous = this.queues.get(chatId) ?? Promise.resolve();
+    this.incrementQueueDepth(chatId);
     const next = previous
       .catch((error) => {
         this.logger.warn("Previous chat task failed", error);
       })
-      .then(task)
+      .then(async () => {
+        this.decrementQueueDepth(chatId);
+        await task();
+      })
       .finally(() => {
         if (this.queues.get(chatId) === next) {
           this.queues.delete(chatId);
@@ -235,6 +265,19 @@ export class MessageRouter {
 
     this.queues.set(chatId, next);
     return next;
+  }
+
+  private incrementQueueDepth(chatId: string): void {
+    this.queueDepths.set(chatId, (this.queueDepths.get(chatId) ?? 0) + 1);
+  }
+
+  private decrementQueueDepth(chatId: string): void {
+    const next = (this.queueDepths.get(chatId) ?? 0) - 1;
+    if (next <= 0) {
+      this.queueDepths.delete(chatId);
+      return;
+    }
+    this.queueDepths.set(chatId, next);
   }
 
   private async handle(message: IncomingTextMessage): Promise<void> {
@@ -336,7 +379,8 @@ export class MessageRouter {
     }
     await this.store.save(state);
 
-    const startedAt = new Date().toISOString();
+    const startedAtMs = Date.now();
+    const startedAt = new Date(startedAtMs).toISOString();
     const statusCard = await this.createStatusCard(chatId, {
       status: "running",
       detail: "收到，已开始处理。",
@@ -348,6 +392,24 @@ export class MessageRouter {
     this.rememberStatusCardRun(statusCard, chatId, prompt);
 
     const controller = new AbortController();
+    const runState: ActiveRunState = {
+      controller,
+      cwd: session.cwd,
+      prompt,
+      threadId: session.threadId,
+      startedAt,
+      startedAtMs,
+    };
+    if (this.config.codexRunTimeoutMs > 0) {
+      runState.timeoutTimer = setTimeout(() => {
+        if (this.activeRuns.get(chatId) !== runState || controller.signal.aborted) {
+          return;
+        }
+        runState.timedOut = true;
+        controller.abort();
+      }, this.config.codexRunTimeoutMs);
+      runState.timeoutTimer.unref?.();
+    }
     const reportProgress = this.createProgressReporter(
       chatId,
       controller.signal,
@@ -355,8 +417,9 @@ export class MessageRouter {
       session.cwd,
       prompt,
       startedAt,
+      runState,
     );
-    this.activeRuns.set(chatId, controller);
+    this.activeRuns.set(chatId, runState);
     try {
       const result = await this.codex.run({
         prompt,
@@ -377,6 +440,10 @@ export class MessageRouter {
       });
 
       if (result.cancelled || controller.signal.aborted) {
+        if (runState.timedOut) {
+          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt);
+          return;
+        }
         this.logger.info("Codex run stopped", { chatId });
         await this.updateStatusCard(statusCard, {
           status: "stopped",
@@ -397,6 +464,16 @@ export class MessageRouter {
 
       if (result.exitCode !== 0) {
         const failure = formatCodexFailure(result, session.cwd);
+        await this.recordRecentFailure(chatId, {
+          category: inferCodexResultFailureCategory(result),
+          cwd: session.cwd,
+          promptPreview: prompt,
+          threadId: session.threadId,
+          exitCode: result.exitCode,
+          signal: result.signal ?? null,
+          detail: formatExit(result),
+          hint: inferCodexFailureHint(result.finalText, result.stderr) ?? undefined,
+        });
         await this.updateStatusCard(statusCard, {
           status: "failed",
           detail: "Codex 运行失败，错误摘要已发送。",
@@ -424,6 +501,10 @@ export class MessageRouter {
       }
     } catch (error) {
       if (controller.signal.aborted) {
+        if (runState.timedOut) {
+          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt);
+          return;
+        }
         this.logger.info("Codex run stopped", { chatId });
         return;
       }
@@ -434,6 +515,14 @@ export class MessageRouter {
         delete session.threadId;
         session.updatedAt = new Date().toISOString();
         await this.store.save(state);
+        await this.recordRecentFailure(chatId, {
+          category: "thread_unavailable",
+          cwd: session.cwd,
+          promptPreview: prompt,
+          threadId: failedThreadId,
+          detail: formatError(error),
+          hint: "发送 /sessions 重新选择可恢复会话，或直接重发消息在当前项目新建会话。",
+        });
         failure = [
           failure,
           "",
@@ -442,6 +531,15 @@ export class MessageRouter {
             "可以发送 /sessions 重新选择可恢复会话，或直接重发消息在当前项目新建会话。",
           ].join("\n"),
         ].join("\n");
+      } else {
+        await this.recordRecentFailure(chatId, {
+          category: inferStartupFailureCategory(error),
+          cwd: session.cwd,
+          promptPreview: prompt,
+          threadId: session.threadId,
+          detail: formatError(error),
+          hint: inferStartupFailureHint(getErrorCode(error), this.config.codexBin) ?? undefined,
+        });
       }
       await this.updateStatusCard(statusCard, {
         status: "failed",
@@ -455,10 +553,47 @@ export class MessageRouter {
         await this.sender.sendText(chatId, chunk);
       }
     } finally {
+      if (runState.timeoutTimer) {
+        clearTimeout(runState.timeoutTimer);
+      }
       await this.cancelApprovalsForChat(chatId);
-      if (this.activeRuns.get(chatId) === controller) {
+      if (this.activeRuns.get(chatId) === runState) {
         this.activeRuns.delete(chatId);
       }
+    }
+  }
+
+  private async reportRunTimeout(
+    chatId: string,
+    statusCard: StatusCardHandle | null,
+    cwd: string,
+    prompt: string,
+    threadId: string | undefined,
+    startedAt: string,
+  ): Promise<void> {
+    const failure = formatRunTimeoutFailure(this.config.codexRunTimeoutMs, cwd);
+    this.logger.warn("Codex run timed out", {
+      chatId,
+      timeoutMs: this.config.codexRunTimeoutMs,
+    });
+    await this.recordRecentFailure(chatId, {
+      category: "run_timeout",
+      cwd,
+      promptPreview: prompt,
+      threadId,
+      detail: `Run exceeded CODEX_RUN_TIMEOUT_MS=${this.config.codexRunTimeoutMs}.`,
+      hint: runTimeoutHint(this.config.codexRunTimeoutMs),
+    });
+    await this.updateStatusCard(statusCard, {
+      status: "failed",
+      detail: "Codex 运行超时，已停止当前任务。",
+      cwd,
+      prompt,
+      startedAt,
+      updatedAt: new Date().toISOString(),
+    });
+    for (const chunk of splitForChat(failure)) {
+      await this.sender.sendText(chatId, chunk);
     }
   }
 
@@ -498,18 +633,31 @@ export class MessageRouter {
     }
 
     if (!this.sender.downloadAttachment) {
+      await this.recordRecentFailure(message.chatId, {
+        category: "attachment_download_failed",
+        cwd: this.requireState().chats[message.chatId]?.cwd ?? this.config.codexWorkdir,
+        promptPreview: text || "attachment-only message",
+        detail: "Current chat adapter does not support attachment downloads.",
+        hint: "请使用支持附件下载的飞书/Lark 适配器，或改为发送本机文件路径。",
+      });
       await this.sender.sendText(message.chatId, "当前聊天适配器暂不支持下载附件。");
       return null;
     }
 
-    let downloaded: DownloadedAttachment[];
+    let downloaded: DownloadedAttachment[] = [];
     try {
-      downloaded = [];
       for (const attachment of attachments) {
         downloaded.push(await this.sender.downloadAttachment(message, attachment));
       }
     } catch (error) {
       this.logger.error("Attachment download failed", error);
+      await this.recordRecentFailure(message.chatId, {
+        category: "attachment_download_failed",
+        cwd: this.requireState().chats[message.chatId]?.cwd ?? this.config.codexWorkdir,
+        promptPreview: text || defaultAttachmentPrompt(downloaded),
+        detail: formatError(error),
+        hint: "检查飞书/Lark 消息资源读取权限，或确认附件仍可由当前应用读取。",
+      });
       await this.sender.sendText(
         message.chatId,
         `附件下载失败：${formatError(error)}\n请确认机器人仍在该会话中，且附件大小不超过飞书/Lark下载限制。`,
@@ -539,18 +687,37 @@ export class MessageRouter {
     await this.stopCodex(message.chatId);
   }
 
+  private async handleImmediateStatus(message: IncomingTextMessage): Promise<void> {
+    const state = this.requireState();
+    if (state.processedMessageIds.includes(message.messageId)) {
+      this.logger.debug("Skipping duplicate message", { messageId: message.messageId });
+      return;
+    }
+    state.processedMessageIds.push(message.messageId);
+    await this.store.save(state);
+
+    const decision = decideAccess(this.config.access, toAccessContext(message));
+    if (!decision.allowed) {
+      await this.rejectUnauthorized(message, decision);
+      return;
+    }
+
+    await this.sendStatus(message.chatId);
+  }
+
   private async sendStatus(chatId: string): Promise<void> {
     const state = this.requireState();
     const session = state.chats[chatId];
     if (!session) {
       await this.sender.sendText(
         chatId,
-        [
-          "当前 chat 还没有 Codex session。",
-          `默认 cwd: ${this.config.codexWorkdir}`,
-          ...this.formatDiagnosticStatusLines(state),
-        ].join("\n"),
-      );
+          [
+            "当前 chat 还没有 Codex session。",
+            `默认 cwd: ${this.config.codexWorkdir}`,
+            ...this.formatRuntimeStatusLines(chatId, state),
+            ...this.formatDiagnosticStatusLines(state),
+          ].join("\n"),
+        );
       return;
     }
 
@@ -561,9 +728,21 @@ export class MessageRouter {
         `cwd: ${session.cwd}`,
         `thread: ${session.threadId ?? "(未创建)"}`,
         `updated: ${session.updatedAt}`,
+        ...this.formatRuntimeStatusLines(chatId, state),
         ...this.formatDiagnosticStatusLines(state),
       ].join("\n"),
     );
+  }
+
+  private formatRuntimeStatusLines(chatId: string, state: BridgeState): string[] {
+    return [
+      `queue_depth: ${this.queueDepths.get(chatId) ?? 0}`,
+      `active_run: ${formatActiveRun(this.activeRuns.get(chatId))}`,
+      `approval_wait: ${formatApprovalWait(
+        [...this.activeApprovals.values()].filter((approval) => approval.chatId === chatId),
+      )}`,
+      ...formatRecentFailureStatusLines(state.diagnostics.recentFailures),
+    ];
   }
 
   private formatDiagnosticStatusLines(state: BridgeState): string[] {
@@ -852,8 +1031,8 @@ export class MessageRouter {
     chatId: string,
     options: { notifyChat?: boolean } = {},
   ): Promise<{ stopped: boolean; message: string }> {
-    const controller = this.activeRuns.get(chatId);
-    if (!controller || controller.signal.aborted) {
+    const runState = this.activeRuns.get(chatId);
+    if (!runState || runState.controller.signal.aborted) {
       const message = "当前 chat 没有正在运行的 Codex 任务。";
       if (options.notifyChat !== false) {
         await this.sender.sendText(chatId, message);
@@ -861,7 +1040,7 @@ export class MessageRouter {
       return { stopped: false, message };
     }
 
-    controller.abort();
+    runState.controller.abort();
     const message = "已请求停止当前 chat 的 Codex 任务。";
     if (options.notifyChat !== false) {
       await this.sender.sendText(chatId, message);
@@ -1032,6 +1211,9 @@ export class MessageRouter {
     }
 
     this.activeApprovals.delete(action.approvalId);
+    if (pending.timeoutTimer) {
+      clearTimeout(pending.timeoutTimer);
+    }
     pending.decision = decision;
     pending.resolvedAt = new Date().toISOString();
     pending.resolve(decision);
@@ -1068,11 +1250,14 @@ export class MessageRouter {
     });
 
     return new Promise<CodexApprovalDecision>((resolve) => {
+      const createdAtMs = Date.now();
       const pending: PendingApproval = {
         chatId,
         request,
         resolve,
         handle: null,
+        createdAt: new Date(createdAtMs).toISOString(),
+        createdAtMs,
       };
       this.activeApprovals.set(request.id, pending);
       const cancel = () => {
@@ -1080,7 +1265,11 @@ export class MessageRouter {
           return;
         }
         this.activeApprovals.delete(request.id);
+        if (pending.timeoutTimer) {
+          clearTimeout(pending.timeoutTimer);
+        }
         pending.cancelledAt = new Date().toISOString();
+        pending.cancelReason = "run_cancelled";
         resolve("cancel");
         this.updateApprovalCard(pending.handle, {
           status: "cancelled",
@@ -1091,6 +1280,45 @@ export class MessageRouter {
         });
       };
       signal.addEventListener("abort", cancel, { once: true });
+
+      if (this.config.codexApprovalTimeoutMs > 0) {
+        pending.timeoutTimer = setTimeout(() => {
+          if (this.activeApprovals.get(request.id) !== pending) {
+            return;
+          }
+          this.activeApprovals.delete(request.id);
+          pending.cancelledAt = new Date().toISOString();
+          pending.cancelReason = "timeout";
+          resolve("cancel");
+          this.updateApprovalCard(pending.handle, {
+            status: "cancelled",
+            request,
+            updatedAt: pending.cancelledAt,
+          }).catch((error: unknown) => {
+            this.logger.warn("Approval card timeout update failed", error);
+          });
+          this.updateStatusCard(statusCard, {
+            status: "running",
+            detail: "Codex 审批等待超时，已取消这次审批请求。",
+            cwd,
+            prompt,
+            startedAt,
+            updatedAt: pending.cancelledAt,
+          }).catch((error: unknown) => {
+            this.logger.warn("Status card approval-timeout update failed", error);
+          });
+          this.recordRecentFailure(chatId, {
+            category: "approval_timeout",
+            cwd,
+            promptPreview: prompt,
+            detail: `Approval exceeded CODEX_APPROVAL_TIMEOUT_MS=${this.config.codexApprovalTimeoutMs}.`,
+            hint: approvalTimeoutHint(this.config.codexApprovalTimeoutMs),
+          }).catch((error: unknown) => {
+            this.logger.warn("Failed to record approval timeout", error);
+          });
+        }, this.config.codexApprovalTimeoutMs);
+        pending.timeoutTimer.unref?.();
+      }
 
       this.createApprovalCard(chatId, {
         status: "pending",
@@ -1140,7 +1368,11 @@ export class MessageRouter {
         continue;
       }
       this.activeApprovals.delete(approval.request.id);
+      if (approval.timeoutTimer) {
+        clearTimeout(approval.timeoutTimer);
+      }
       approval.cancelledAt = new Date().toISOString();
+      approval.cancelReason = "run_cancelled";
       approval.resolve("cancel");
       await this.updateApprovalCard(approval.handle, {
         status: "cancelled",
@@ -1176,6 +1408,7 @@ export class MessageRouter {
     cwd: string,
     prompt: string,
     startedAt: string,
+    runState: ActiveRunState,
   ): (update: CodexProgressUpdate) => Promise<void> {
     let lastSentAt = 0;
     let cardUpdatesFailed = false;
@@ -1184,6 +1417,9 @@ export class MessageRouter {
         return;
       }
       const now = Date.now();
+      runState.lastProgressAtMs = now;
+      runState.lastProgressAt = new Date(now).toISOString();
+      runState.lastProgressText = update.text;
       if (lastSentAt !== 0 && now - lastSentAt < minProgressIntervalMs) {
         return;
       }
@@ -1389,6 +1625,35 @@ export class MessageRouter {
     ].join("\n");
   }
 
+  private async recordRecentFailure(
+    chatId: string,
+    failure: Omit<RecentFailureDiagnostic, "at"> & { at?: string },
+  ): Promise<void> {
+    const state = this.requireState();
+    const recentFailures = state.diagnostics.recentFailures ?? [];
+    state.diagnostics.recentFailures = [
+      ...recentFailures,
+      {
+        at: failure.at ?? new Date().toISOString(),
+        category: failure.category,
+        cwd: failure.cwd,
+        promptPreview: failure.promptPreview
+          ? truncateInline(failure.promptPreview, 120)
+          : undefined,
+        threadId: failure.threadId,
+        exitCode: failure.exitCode,
+        signal: failure.signal,
+        detail: truncateInline(failure.detail, 240),
+        hint: failure.hint ? truncateInline(failure.hint, 240) : undefined,
+      },
+    ].slice(-5);
+    this.logger.warn("Recorded recent Chat2Codex failure", {
+      chatId,
+      category: failure.category,
+    });
+    await this.store.save(state);
+  }
+
   private requireState(): BridgeState {
     if (!this.state) {
       throw new Error("MessageRouter.start() must be called before handling messages.");
@@ -1576,6 +1841,16 @@ export function formatCodexStartupFailure(error: unknown, codexBin: string, cwd:
   return lines.join("\n");
 }
 
+function formatRunTimeoutFailure(timeoutMs: number, cwd: string): string {
+  return [
+    "Codex 运行超时，已停止当前任务。",
+    `timeout: CODEX_RUN_TIMEOUT_MS=${timeoutMs}`,
+    `cwd: ${cwd}`,
+    "",
+    `提示：${runTimeoutHint(timeoutMs)}`,
+  ].join("\n");
+}
+
 function formatExit(result: CodexRunResult): string {
   const parts = [`code=${result.exitCode ?? "null"}`];
   if (result.signal) {
@@ -1615,6 +1890,14 @@ function inferCodexFailureHint(finalText: string, stderr: string): string | null
   return null;
 }
 
+function inferCodexResultFailureCategory(result: CodexRunResult): FailureDiagnosticCategory {
+  const combined = `${result.finalText}\n${result.stderr}`.toLowerCase();
+  if (combined.includes("timed out") && combined.includes("app-server")) {
+    return "app_server_timeout";
+  }
+  return "unknown";
+}
+
 function inferStartupFailureHint(code: string | null, codexBin: string): string | null {
   if (code === "ENOENT") {
     return `找不到 Codex 命令 ${codexBin}；请设置 CODEX_BIN 为绝对路径，后台服务不会加载你的交互式 shell PATH。`;
@@ -1623,6 +1906,18 @@ function inferStartupFailureHint(code: string | null, codexBin: string): string 
     return `Codex 命令 ${codexBin} 不可执行；请检查文件权限或改用可执行文件的绝对路径。`;
   }
   return null;
+}
+
+function inferStartupFailureCategory(error: unknown): FailureDiagnosticCategory {
+  return getErrorCode(error) === "ENOENT" ? "codex_missing" : "unknown";
+}
+
+function runTimeoutHint(timeoutMs: number): string {
+  return `任务超过 ${formatDuration(timeoutMs)}；可以调大 CODEX_RUN_TIMEOUT_MS、拆小任务，或稍后用 /status 查看队列后重试。`;
+}
+
+function approvalTimeoutHint(timeoutMs: number): string {
+  return `审批等待超过 ${formatDuration(timeoutMs)}；可以调大 CODEX_APPROVAL_TIMEOUT_MS，或让授权用户更快处理审批卡片。`;
 }
 
 function isThreadResumeReadFailure(error: unknown): boolean {
@@ -1659,6 +1954,10 @@ function routedText(message: IncomingTextMessage): string {
 
 function isStopCommand(message: IncomingTextMessage): boolean {
   return routedText(message) === "/stop";
+}
+
+function isStatusCommand(message: IncomingTextMessage): boolean {
+  return routedText(message) === "/status";
 }
 
 function defaultAttachmentPrompt(attachments: DownloadedAttachment[]): string {
@@ -1701,6 +2000,89 @@ function formatEventDiagnostic(diagnostic: EventDiagnosticSnapshot | undefined):
     parts.push(`message=${diagnostic.messageId}`);
   }
   return parts.join(" ");
+}
+
+function formatActiveRun(run: ActiveRunState | undefined): string {
+  if (!run) {
+    return "(none)";
+  }
+  const parts = [
+    `age=${formatDuration(Date.now() - run.startedAtMs)}`,
+    `cwd=${run.cwd}`,
+    `thread=${run.threadId ?? "(new)"}`,
+    `prompt="${truncateInline(run.prompt, 90)}"`,
+  ];
+  if (run.lastProgressAtMs && run.lastProgressText) {
+    parts.push(
+      `last_progress=${formatDuration(Date.now() - run.lastProgressAtMs)} ago "${truncateInline(
+        run.lastProgressText,
+        80,
+      )}"`,
+    );
+  }
+  return parts.join(" ");
+}
+
+function formatApprovalWait(approvals: PendingApproval[]): string {
+  if (approvals.length === 0) {
+    return "(none)";
+  }
+  const [approval] = approvals;
+  if (!approval) {
+    return "(none)";
+  }
+  const parts = [
+    `count=${approvals.length}`,
+    `age=${formatDuration(Date.now() - approval.createdAtMs)}`,
+    `type=${approval.request.kind === "command" ? "commandExecution" : "fileChange"}`,
+    `decisions=${approval.request.decisions.length}`,
+  ];
+  if (approval.request.command) {
+    parts.push(`command="${truncateInline(approval.request.command, 90)}"`);
+  }
+  if (approval.request.cwd) {
+    parts.push(`cwd=${approval.request.cwd}`);
+  }
+  return parts.join(" ");
+}
+
+function formatRecentFailureStatusLines(
+  recentFailures: RecentFailureDiagnostic[] | undefined,
+): string[] {
+  if (!recentFailures?.length) {
+    return ["recent_failures: (none)"];
+  }
+  return [
+    "recent_failures:",
+    ...recentFailures.slice(-5).map((failure, index) => {
+      const parts = [
+        `${index + 1}.`,
+        failure.at,
+        failure.category,
+        failure.cwd ? `cwd=${failure.cwd}` : null,
+        failure.threadId ? `thread=${failure.threadId}` : null,
+        failure.promptPreview ? `prompt="${failure.promptPreview}"` : null,
+        `detail="${failure.detail}"`,
+        failure.hint ? `hint="${failure.hint}"` : null,
+      ].filter(Boolean);
+      return `- ${parts.join(" ")}`;
+    }),
+  ];
+}
+
+function formatDuration(durationMs: number): string {
+  const seconds = Math.max(0, Math.floor(durationMs / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (minutes < 60) {
+    return remainder === 0 ? `${minutes}m` : `${minutes}m${remainder}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const minuteRemainder = minutes % 60;
+  return minuteRemainder === 0 ? `${hours}h` : `${hours}h${minuteRemainder}m`;
 }
 
 function cardActionSenderAllowed(

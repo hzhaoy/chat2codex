@@ -13,6 +13,21 @@ export interface AccessControlConfig {
 
 const codexApprovalPolicies = ["untrusted", "on-request", "on-failure", "never"] as const;
 
+const timeoutEnv = () =>
+  z.preprocess((value) => {
+    if (value === undefined || value === "") {
+      return 0;
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return 0;
+      }
+      return Number(trimmed);
+    }
+    return value;
+  }, z.number().int().nonnegative());
+
 const booleanEnv = (defaultValue: boolean) =>
   z.preprocess((value) => {
     if (value === undefined || value === "") {
@@ -42,6 +57,8 @@ const configSchema = z.object({
   CODEX_WORKDIR: z.string().min(1).default(process.cwd()),
   CODEX_SANDBOX: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("workspace-write"),
   CODEX_APPROVAL_POLICY: z.enum(codexApprovalPolicies).default("never"),
+  CODEX_RUN_TIMEOUT_MS: timeoutEnv().default(0),
+  CODEX_APPROVAL_TIMEOUT_MS: timeoutEnv().default(0),
   CODEX_MODEL: z.string().optional(),
   CODEX_SKIP_GIT_REPO_CHECK: booleanEnv(false),
   CODEX_GROUP_ALLOWED_ROOTS: z.string().default(""),
@@ -72,6 +89,8 @@ export function loadConfig(env: NodeJS.ProcessEnv) {
     codexWorkdir,
     codexSandbox: parsed.CODEX_SANDBOX,
     codexApprovalPolicy: parsed.CODEX_APPROVAL_POLICY,
+    codexRunTimeoutMs: parsed.CODEX_RUN_TIMEOUT_MS,
+    codexApprovalTimeoutMs: parsed.CODEX_APPROVAL_TIMEOUT_MS,
     codexModel: parsed.CODEX_MODEL?.trim() || undefined,
     codexSkipGitRepoCheck: parsed.CODEX_SKIP_GIT_REPO_CHECK,
     codexGroupAllowedRoots: groupAllowedRoots.length > 0 ? groupAllowedRoots : [codexWorkdir],

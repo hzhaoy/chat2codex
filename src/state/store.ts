@@ -4,6 +4,7 @@ import path from "node:path";
 import { BridgeState, emptyState } from "./types.js";
 
 const maxProcessedMessageIds = 500;
+const maxRecentFailures = 5;
 
 export class JsonStateStore {
   constructor(private readonly filePath: string) {}
@@ -27,6 +28,9 @@ export class JsonStateStore {
 
   async save(state: BridgeState): Promise<void> {
     state.processedMessageIds = state.processedMessageIds.slice(-maxProcessedMessageIds);
+    if (state.diagnostics.recentFailures) {
+      state.diagnostics.recentFailures = state.diagnostics.recentFailures.slice(-maxRecentFailures);
+    }
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     const tempPath = `${this.filePath}.${process.pid}.tmp`;
     await fs.writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`);
