@@ -53,13 +53,13 @@ const defaultApprovalPrompt = [
 ].join(" ");
 
 if (isDirectRun()) {
-  main(process.argv.slice(2)).catch((error: unknown) => {
+  runAppServerSmoke(process.argv.slice(2)).catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });
 }
 
-async function main(argv: string[]): Promise<void> {
+export async function runAppServerSmoke(argv: string[]): Promise<void> {
   const options = parseArgs(argv);
   const codexVersion = commandOutput(options.codexBin, ["--version"]);
   const temporaryCwd = options.cwd
@@ -496,7 +496,7 @@ function parseArgs(argv: string[]): SmokeOptions {
 }
 
 function printHelp(): void {
-  console.log(`Usage: bun src/setup/smoke-app-server.ts [options]
+  console.log(`Usage: chat2codex smoke [options]
 
 Options:
   --mode handshake|turn|approval

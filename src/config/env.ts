@@ -2,6 +2,8 @@ import path from "node:path";
 
 import { z } from "zod";
 
+import { defaultChat2CodexHome } from "./paths.js";
+
 export interface AccessControlConfig {
   allowDirectMessages: boolean;
   allowGroups: boolean;
@@ -56,6 +58,7 @@ export type BridgeConfig = ReturnType<typeof loadConfig>;
 
 export function loadConfig(env: NodeJS.ProcessEnv) {
   const parsed = configSchema.parse(env);
+  const home = defaultChat2CodexHome(env);
   const codexWorkdir = path.resolve(parsed.CODEX_WORKDIR);
   const groupAllowedRoots = parseCsv(parsed.CODEX_GROUP_ALLOWED_ROOTS).map((entry) =>
     path.resolve(entry),
@@ -78,8 +81,10 @@ export function loadConfig(env: NodeJS.ProcessEnv) {
       allowedChatIds: parseCsv(parsed.ALLOWED_CHAT_IDS),
       allowedUserIds: parseCsv(parsed.ALLOWED_USER_IDS),
     } satisfies AccessControlConfig,
-    attachmentDownloadDir: path.resolve(parsed.ATTACHMENT_DOWNLOAD_DIR),
-    bridgeStatePath: path.resolve(parsed.BRIDGE_STATE_PATH),
+    attachmentDownloadDir: path.resolve(
+      env.ATTACHMENT_DOWNLOAD_DIR || path.join(home, "attachments"),
+    ),
+    bridgeStatePath: path.resolve(env.BRIDGE_STATE_PATH || path.join(home, "state.json")),
     logLevel: parsed.LOG_LEVEL,
   };
 }

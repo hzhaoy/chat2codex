@@ -6,7 +6,7 @@
   "main": "./dist/index.js",
   "packageManager": "bun@1.3.9",
   "bin": {
-    "chat2codex": "./dist/index.js"
+    "chat2codex": "dist/index.js"
   },
   "files": [
     ".env.example",
@@ -30,15 +30,15 @@
   },
   "homepage": "https://github.com/hzhaoy/chat2codex#readme",
   "scripts": {
-    "dev": "bun src/index.ts",
-    "protocol:generate": "bun src/setup/generate-app-server-schema.ts",
-    "smoke:app-server": "bun src/setup/smoke-app-server.ts",
-    "smoke:app-server:approval": "bun src/setup/smoke-app-server.ts --mode approval",
-    "smoke:app-server:turn": "bun src/setup/smoke-app-server.ts --mode turn",
-    "setup:feishu": "bun src/setup/feishu.ts",
-    "setup:service": "bun src/setup/service.ts install",
-    "service:print": "bun src/setup/service.ts print",
-    "service:uninstall": "bun src/setup/service.ts uninstall",
+    "dev": "bun src/index.ts start --env .env",
+    "protocol:generate": "bun src/index.ts protocol generate",
+    "smoke:app-server": "bun src/index.ts smoke",
+    "smoke:app-server:approval": "bun src/index.ts smoke --mode approval",
+    "smoke:app-server:turn": "bun src/index.ts smoke --mode turn",
+    "setup:feishu": "bun src/index.ts setup --env .env",
+    "setup:service": "bun src/index.ts service install --env .env --project-dir .",
+    "service:print": "bun src/index.ts service print --env .env --project-dir .",
+    "service:uninstall": "bun src/index.ts service uninstall --env .env --project-dir .",
     "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
     "check": "bun run typecheck && bun test && bun run build",
     "prepack": "bun run build",

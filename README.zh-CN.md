@@ -17,30 +17,31 @@ Chat2Codex 会把一个飞书/Lark 机器人变成本机 Codex CLI 的消息平�
 
 ### 前置条件
 
-- Bun `>= 1.3.9`，用于安装和本地开发。
 - Node.js `>= 20.12.0`。
-- 一个自己创建的飞书/Lark 应用，并已启用机器人能力。
+- npm，用于安装包。
 - 运行 Chat2Codex 的机器上已经安装并登录 Codex CLI。
+- 一个可以创建应用的飞书/Lark 账号，或一个已经启用机器人的飞书/Lark 应用。
 - 飞书/Lark 应用需要消息接收、消息发送、消息资源读取权限，消息事件的长连接订阅，以及 `card.action.trigger` 卡片回调。
 
 ### 安装并运行
 
 ```bash
-bun install
+npm install -g chat2codex
 ```
 
 通过扫码自动创建并连接飞书/Lark 应用：
 
 ```bash
-bun run setup:feishu
+chat2codex setup --workdir /absolute/path/to/your/repo
 ```
 
-setup 命令会在终端渲染二维码，并保留授权 URL 作为备用入口。用飞书/Lark 扫码，确认创建应用后，它会把 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `LARK_DOMAIN` 写入 `.env`。如果你已经有应用，也可以复制 [`.env.example`](.env.example) 为 `.env` 后手动编辑。
+setup 命令会在终端渲染二维码，并保留授权 URL 作为备用入口。用飞书/Lark 扫码，确认创建应用后，它会把 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `LARK_DOMAIN` 写入 `~/.chat2codex/.env`。如果你已经有应用，也可以运行 `chat2codex init --workdir /absolute/path/to/your/repo` 后手动编辑这份 env 文件。
 
-然后运行：
+检查本地配置，然后启动桥接服务：
 
 ```bash
-bun run dev
+chat2codex doctor
+chat2codex start
 ```
 
 给机器人发送私聊消息：
@@ -53,6 +54,19 @@ Summarize this repository.
 你也可以发送文件或图片。Chat2Codex 会把支持的附件下载到 `ATTACHMENT_DOWNLOAD_DIR`，并把本地路径附加到 Codex prompt 中。如果消息只有附件没有文字，它会使用默认 prompt，让 Codex 检查这个文件或图片。
 
 运行过程中，Chat2Codex 会发送一张状态卡片，最多每 15 秒更新一次，并把最终 Codex 回复渲染成飞书/Lark 富文本消息。点击卡片里的停止按钮，或发送 `/stop`，可以中止当前运行。失败和已停止的卡片会带有重试按钮，可以重新运行同一个 prompt。如果卡片创建或更新失败，会回退为文本进度消息。
+
+### CLI 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `chat2codex` / `chat2codex start` | 启动飞书/Lark 桥接服务。 |
+| `chat2codex setup --workdir <path>` | 创建/连接飞书/Lark 应用，并写入 `.env`。 |
+| `chat2codex init --workdir <path>` | 已有应用时，创建一份初始 `.env`。 |
+| `chat2codex doctor` | 检查 `.env`、Node.js、Codex CLI 和工作目录。 |
+| `chat2codex smoke [--mode turn\|approval]` | 本地验证 Codex app-server 协议。 |
+| `chat2codex service print\|install\|uninstall` | 管理用户级 launchd/systemd 服务。 |
+
+默认情况下，Chat2Codex 会把配置和运行状态放在 `~/.chat2codex`。如果需要多个机器人实例，可以设置 `CHAT2CODEX_HOME=/path/to/home`，或者通过 `--env /path/to/.env` 指定另一份配置文件。
 
 ## 功能
 
@@ -82,19 +96,19 @@ Summarize this repository.
 Chat2Codex 使用实验性的 `codex app-server --stdio` 协议来控制线程、接收进度事件和处理审批回调。安装或升级 Codex CLI 后，先运行快速本地 smoke test：
 
 ```bash
-bun run smoke:app-server
+chat2codex smoke
 ```
 
 这个命令会在临时工作区验证 `initialize` 和 `thread/start`，但不会启动模型 turn。如果还想验证一次完整的模型 turn：
 
 ```bash
-bun run smoke:app-server:turn
+chat2codex smoke --mode turn
 ```
 
 如果要验证真实的命令审批请求：
 
 ```bash
-bun run smoke:app-server:approval
+chat2codex smoke --mode approval
 ```
 
 这个模式会使用临时工作区、`approvalPolicy=untrusted` 和 `sandbox=workspace-write`。它会要求 Codex 创建 `approval-smoke.txt`，验证 app-server 发出 `item/commandExecution/requestApproval`，返回 `accept`，等待 `turn/completed`，然后检查文件内容。
@@ -110,7 +124,7 @@ git diff -- docs/codex-app-server-protocol
 
 当 `CODEX_APPROVAL_POLICY` 允许交互式审批时，Codex app-server 会在 turn 运行过程中发出审批请求。Chat2Codex 会向同一个 chat 发送一张独立审批卡片，并暂停 Codex，直到授权用户点击其中一个选项。命令执行审批卡片的按钮会镜像 Codex 的 `availableDecisions`；文件变更审批卡片会使用 Codex 的文件变更审批选项。
 
-用当前 `bun run setup:feishu` 流程创建的应用会包含这个回调。如果你的飞书/Lark 应用是在状态卡片动作加入之前创建的，请在开发者后台手动订阅 `card.action.trigger` 回调，这样停止按钮才能通过长连接回到这个桥接服务。
+用当前 `chat2codex setup` 流程创建的应用会包含这个回调。如果你的飞书/Lark 应用是在状态卡片动作加入之前创建的，请在开发者后台手动订阅 `card.action.trigger` 回调，这样停止按钮才能通过长连接回到这个桥接服务。
 
 如果你的应用是在附件能力加入之前创建的，也需要补充飞书/Lark `im.v1.messageResource.get` API 所需的消息资源读取权限；否则文本消息仍然可用，但附件下载会失败。
 
@@ -123,10 +137,10 @@ ALLOWED_CHAT_IDS=oc_xxx
 
 ## 团队机器人部署
 
-如果要在团队群里使用，请保持机器人在允许列表内，并把它作为用户级后台服务运行，而不是长期把 `bun run dev` 留在终端里。
+如果要在团队群里使用，请保持机器人在允许列表内，并把它作为用户级后台服务运行，而不是长期把 `chat2codex start` 留在终端里。
 
 1. 在目标群里发送 `@Chat2Codex /whoami`，复制返回的 `chat_id`。
-2. 更新 `.env`：
+2. 更新 `~/.chat2codex/.env`：
 
    ```env
    ALLOW_GROUPS=true
@@ -142,17 +156,16 @@ ALLOWED_CHAT_IDS=oc_xxx
    后台服务建议把 `CODEX_BIN` 配成绝对路径，因为 launchd 和 systemd 不会加载你的交互式 shell 启动文件。
    如果机器人需要无人值守运行，不希望等待飞书/Lark 审批点击，可以使用 `CODEX_APPROVAL_POLICY=never`。
 
-3. 构建并预览服务文件：
+3. 预览服务文件：
 
    ```bash
-   bun run build
-   bun run service:print
+   chat2codex service print
    ```
 
 4. 安装用户级服务：
 
    ```bash
-   bun run setup:service
+   chat2codex service install
    ```
 
    在 macOS 上会安装名为 `com.chat2codex.bridge` 的 launchd agent；在 Linux 上会安装名为 `chat2codex.service` 的 systemd user service。
@@ -169,7 +182,7 @@ systemctl --user status chat2codex
 journalctl --user -u chat2codex -f
 
 # 卸载用户级服务
-bun run service:uninstall
+chat2codex service uninstall
 ```
 
 ## 聊天命令
@@ -198,11 +211,11 @@ Chat2Codex 默认使用 `CODEX_SANDBOX=workspace-write`，所以 Codex 可以编
 
 ## 运行形态
 
-这个项目本地开发以 Bun 为主，但生产运行会构建为标准 Node.js ESM：
+通过 npm 安装的包会运行已经构建好的 Node.js ESM 入口。如果是从源码仓库本地开发，可以使用 Bun：
 
 ```bash
-bun run build
-node dist/index.js
+bun install
+bun run dev
 ```
 
 只有在你的环境中验证过飞书 SDK 长连接路径后，才建议使用 `bun run start:bun`。

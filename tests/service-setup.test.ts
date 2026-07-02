@@ -34,6 +34,7 @@ describe("service setup", () => {
     const options = createServiceOptions({
       target: "systemd",
       projectDir: "/tmp/chat 2 codex",
+      envFile: "/tmp/chat 2 codex/.env",
       nodeBin: "/usr/local/bin/node",
       pathEnv: "/usr/local/bin:/usr/bin",
       systemdServiceName: "chat2codex-test.service",

@@ -5,6 +5,13 @@ All notable changes to Chat2Codex will be documented in this file.
 This project follows the spirit of Keep a Changelog and uses semantic version
 numbers once releases are published.
 
+## Unreleased
+
+### Added
+
+- npm-friendly CLI commands for setup, init, doctor, app-server smoke checks, and
+  user service management.
+
 ## 0.1.0 - 2026-07-01
 
 ### Added

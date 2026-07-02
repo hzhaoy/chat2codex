@@ -24,10 +24,11 @@ without exposing a public webhook server.
 
 ### Prerequisites
 
-- Bun `>= 1.3.9` for install and local development.
 - Node.js `>= 20.12.0`
-- A self-built Feishu/Lark app with bot enabled.
+- npm for installing the package.
 - Codex CLI installed and logged in on the machine running this bridge.
+- A Feishu/Lark account that can create an app, or an existing Feishu/Lark app
+  with bot enabled.
 - The app needs message receive/send/resource permissions, long-connection
   event subscriptions for message events, and the `card.action.trigger`
   callback.
@@ -35,25 +36,27 @@ without exposing a public webhook server.
 ### Install And Run
 
 ```bash
-bun install
+npm install -g chat2codex
 ```
 
 Create and connect a Feishu/Lark app automatically by scanning a QR code:
 
 ```bash
-bun run setup:feishu
+chat2codex setup --workdir /absolute/path/to/your/repo
 ```
 
 The setup command renders a terminal QR code and keeps the authorization URL as
 a fallback. Scan it with Feishu/Lark, confirm the app creation, and it writes
-`FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `LARK_DOMAIN` to `.env`. You can still
-copy [`.env.example`](.env.example) to `.env` and edit it manually if you already
-have an app.
+`FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `LARK_DOMAIN` to
+`~/.chat2codex/.env`. You can still run
+`chat2codex init --workdir /absolute/path/to/your/repo` and edit that env file
+manually if you already have an app.
 
-Then run:
+Check the local setup, then start the bridge:
 
 ```bash
-bun run dev
+chat2codex doctor
+chat2codex start
 ```
 
 Send a DM to the bot:
@@ -73,6 +76,21 @@ every 15 seconds, and sends the final Codex response as a rendered rich-text
 post. Click the card's stop button or send `/stop` to abort the active run.
 Failed and stopped cards include a retry button for re-running the same prompt.
 If card creation or updates fail, it falls back to text progress replies.
+
+### CLI Commands
+
+| Command | Effect |
+| --- | --- |
+| `chat2codex` / `chat2codex start` | Start the Feishu/Lark bridge. |
+| `chat2codex setup --workdir <path>` | Create/connect a Feishu/Lark app and write `.env`. |
+| `chat2codex init --workdir <path>` | Create a starter `.env` when you already have an app. |
+| `chat2codex doctor` | Check `.env`, Node.js, Codex CLI, and workspace paths. |
+| `chat2codex smoke [--mode turn\|approval]` | Verify the Codex app-server protocol locally. |
+| `chat2codex service print\|install\|uninstall` | Manage a user-level launchd/systemd service. |
+
+By default, Chat2Codex stores configuration and runtime state under
+`~/.chat2codex`. Set `CHAT2CODEX_HOME=/path/to/home` or pass `--env /path/to/.env`
+when you need a separate bot instance.
 
 ## Features
 
@@ -110,20 +128,20 @@ thread control, progress events, and approval callbacks. After installing or
 upgrading Codex CLI, run the fast local smoke test:
 
 ```bash
-bun run smoke:app-server
+chat2codex smoke
 ```
 
 This validates `initialize` and `thread/start` against a temporary workspace
 without starting a model turn. To verify a full model-backed turn as well:
 
 ```bash
-bun run smoke:app-server:turn
+chat2codex smoke --mode turn
 ```
 
 To verify a real command-approval request, run:
 
 ```bash
-bun run smoke:app-server:approval
+chat2codex smoke --mode approval
 ```
 
 That mode uses a temporary workspace, `approvalPolicy=untrusted`, and
@@ -151,7 +169,7 @@ one of the options. The card buttons mirror Codex's `availableDecisions` for
 command execution requests; file-change approval cards use Codex's file-change
 decision set.
 
-Apps created with the current `bun run setup:feishu` flow include that callback.
+Apps created with the current `chat2codex setup` flow include that callback.
 If you created the Feishu/Lark app before status-card actions were added,
 manually subscribe the `card.action.trigger` callback in the developer console
 so the stop button can reach this bridge over the long connection.
@@ -173,11 +191,11 @@ ALLOWED_CHAT_IDS=oc_xxx
 ## Team Bot Deployment
 
 For a team group, keep the bot allowlisted and run it as a user-level background
-service instead of leaving `bun run dev` in a terminal.
+service instead of leaving `chat2codex start` in a terminal.
 
 1. In the target group, send `@Chat2Codex /whoami` and copy the reported
    `chat_id`.
-2. Update `.env`:
+2. Update `~/.chat2codex/.env`:
 
    ```env
    ALLOW_GROUPS=true
@@ -195,17 +213,16 @@ service instead of leaving `bun run dev` in a terminal.
    Use `CODEX_APPROVAL_POLICY=never` for unattended bots that should never wait
    for a Feishu/Lark approval click.
 
-3. Build and preview the service file:
+3. Preview the service file:
 
    ```bash
-   bun run build
-   bun run service:print
+   chat2codex service print
    ```
 
 4. Install the user service:
 
    ```bash
-   bun run setup:service
+   chat2codex service install
    ```
 
    On macOS this installs a launchd agent named `com.chat2codex.bridge`. On
@@ -223,7 +240,7 @@ systemctl --user status chat2codex
 journalctl --user -u chat2codex -f
 
 # Uninstall the user service
-bun run service:uninstall
+chat2codex service uninstall
 ```
 
 ## Chat Commands
@@ -260,11 +277,12 @@ Do not run this bot in a group with untrusted people while using broad filesyste
 
 ## Runtime Shape
 
-This project is Bun-first for local development, but it still builds to standard Node.js ESM for production:
+The npm package runs the built Node.js ESM entrypoint. For local development from
+a source checkout, use Bun:
 
 ```bash
-bun run build
-node dist/index.js
+bun install
+bun run dev
 ```
 
 Use `bun run start:bun` only after validating the Feishu SDK long-connection path in your environment.

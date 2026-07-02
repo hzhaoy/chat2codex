@@ -13,13 +13,13 @@ interface GenerateOptions {
 const bundledSchemaFile = "codex_app_server_protocol.schemas.json";
 
 if (isDirectRun()) {
-  main(process.argv.slice(2)).catch((error: unknown) => {
+  generateAppServerSchema(process.argv.slice(2)).catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });
 }
 
-async function main(argv: string[]): Promise<void> {
+export async function generateAppServerSchema(argv: string[]): Promise<void> {
   const options = parseArgs(argv);
   const outDir = path.resolve(options.outDir);
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat2codex-app-server-schema-"));

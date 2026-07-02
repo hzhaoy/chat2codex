@@ -35,6 +35,7 @@ describe("loadConfig", () => {
       FEISHU_APP_ID: "cli_test",
       FEISHU_APP_SECRET: "secret",
       CODEX_WORKDIR: "/tmp/chat2codex",
+      CHAT2CODEX_HOME: "/tmp/chat2codex-home",
     });
 
     expect(config.access).toEqual({
@@ -43,7 +44,8 @@ describe("loadConfig", () => {
       allowedChatIds: [],
       allowedUserIds: [],
     });
-    expect(config.attachmentDownloadDir).toMatch(/\.data\/attachments$/u);
+    expect(config.attachmentDownloadDir).toBe("/tmp/chat2codex-home/attachments");
+    expect(config.bridgeStatePath).toBe("/tmp/chat2codex-home/state.json");
     expect(config.codexApprovalPolicy).toBe("never");
     expect(config.codexGroupAllowedRoots).toEqual(["/tmp/chat2codex"]);
   });

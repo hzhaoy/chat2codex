@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { defaultChat2CodexHome, defaultEnvPath } from "../config/paths.js";
+
 export type ServiceTarget = "launchd" | "systemd";
 type ServiceCommand = "print" | "install" | "uninstall";
 
@@ -24,10 +26,10 @@ const defaultLaunchdLabel = "com.chat2codex.bridge";
 const defaultSystemdServiceName = "chat2codex";
 
 if (isDirectRun()) {
-  await main(process.argv.slice(2));
+  await runServiceSetup(process.argv.slice(2));
 }
 
-async function main(argv: string[]): Promise<void> {
+export async function runServiceSetup(argv: string[]): Promise<void> {
   try {
     const parsed = parseCliArgs(argv);
     if (parsed.help) {
@@ -57,13 +59,13 @@ export function defaultServiceTarget(platform: NodeJS.Platform = process.platfor
 
 export function createServiceOptions(args: ServiceCliArgs = {}): ServiceOptions {
   const target = args.target ?? defaultServiceTarget();
-  const projectDir = path.resolve(args.projectDir ?? process.cwd());
+  const projectDir = path.resolve(args.projectDir ?? defaultChat2CodexHome());
   const logsDir = path.join(projectDir, ".data", "logs");
   return {
     target,
     projectDir,
-    entrypoint: path.resolve(projectDir, args.entrypoint ?? "dist/index.js"),
-    envFile: path.resolve(projectDir, args.envFile ?? ".env"),
+    entrypoint: path.resolve(args.entrypoint ?? defaultEntrypoint(projectDir)),
+    envFile: path.resolve(args.envFile ?? defaultEnvPath()),
     nodeBin: args.nodeBin ?? findExecutable("node"),
     pathEnv: args.pathEnv ?? defaultServicePath(target),
     launchdLabel: args.launchdLabel ?? defaultLaunchdLabel,
@@ -227,10 +229,10 @@ async function uninstallSystemd(options: ServiceOptions): Promise<void> {
 async function ensureInstallInputs(options: ServiceOptions): Promise<void> {
   const missing: string[] = [];
   if (!(await fileExists(options.envFile))) {
-    missing.push(`${options.envFile} (.env; run bun run setup:feishu first)`);
+    missing.push(`${options.envFile} (.env; run chat2codex setup first)`);
   }
   if (!(await fileExists(options.entrypoint))) {
-    missing.push(`${options.entrypoint} (run bun run build first)`);
+    missing.push(`${options.entrypoint} (install chat2codex globally, or run bun run build first)`);
   }
   if (missing.length > 0) {
     throw new Error(`Cannot install service; missing required file(s):\n- ${missing.join("\n- ")}`);
@@ -307,6 +309,7 @@ function parseCliArgs(argv: string[]): ServiceCliArgs {
       case "--entrypoint":
         result.entrypoint = value;
         break;
+      case "--env":
       case "--env-file":
         result.envFile = value;
         break;
@@ -359,6 +362,15 @@ function findExecutable(command: string): string {
   return command;
 }
 
+function defaultEntrypoint(projectDir: string): string {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const parentDir = path.dirname(moduleDir);
+  if (path.basename(parentDir) === "dist") {
+    return path.join(parentDir, "index.js");
+  }
+  return path.join(projectDir, "dist", "index.js");
+}
+
 function run(
   command: string,
   args: string[],
@@ -404,15 +416,16 @@ function isDirectRun(): boolean {
 
 function printHelp(): void {
   console.log(`Usage:
-  bun src/setup/service.ts print [options]
-  bun src/setup/service.ts install [options]
-  bun src/setup/service.ts uninstall [options]
+  chat2codex service print [options]
+  chat2codex service install [options]
+  chat2codex service uninstall [options]
 
 Options:
   --target launchd|systemd       Defaults to launchd on macOS, systemd elsewhere
-  --project-dir <path>           Defaults to the current directory
-  --entrypoint <path>            Defaults to dist/index.js under project dir
-  --env-file <path>              Defaults to .env under project dir
+  --project-dir <path>           Defaults to ~/.chat2codex
+  --entrypoint <path>            Defaults to the installed chat2codex entrypoint,
+                                  or dist/index.js when run from source
+  --env <path>                   Env file path; defaults to ~/.chat2codex/.env
   --node-bin <path>              Defaults to the current node executable from PATH
   --path <PATH>                  PATH passed to the service environment
                                   Defaults to a stable service PATH
