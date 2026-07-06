@@ -5,6 +5,16 @@ All notable changes to Chat2Codex will be documented in this file.
 This project follows the spirit of Keep a Changelog and uses semantic version
 numbers once releases are published.
 
+## Unreleased
+
+### Added
+
+- Completed run cards now include compact run results and detail buttons for
+  summary, changed files, diff, and command logs.
+- New chat commands: `/summary`, `/files`, `/diff`, `/logs`, `/host`/`/health`,
+  and `/steer <instruction>`.
+- `chat2codex doctor` and `/host` now surface mobile/team-bot safety warnings.
+
 ## 0.2.0 - 2026-07-02
 
 ### Added

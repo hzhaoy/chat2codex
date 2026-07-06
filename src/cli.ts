@@ -210,10 +210,11 @@ Options:
   checks.push(checkNodeVersion(process.versions.node));
 
   const envPath = path.resolve(options.envFile);
+  const envExists = await fileExists(envPath);
   checks.push({
     label: ".env",
-    status: (await fileExists(envPath)) ? "ok" : "error",
-    detail: (await fileExists(envPath)) ? envPath : "missing; run chat2codex setup or chat2codex init",
+    status: envExists ? "ok" : "error",
+    detail: envExists ? envPath : "missing; run chat2codex setup or chat2codex init",
   });
   loadRuntimeEnv(envPath);
 
@@ -232,6 +233,7 @@ Options:
     checks.push(await checkDirectory(config.codexWorkdir, "CODEX_WORKDIR"));
     checks.push(await checkRuntimeDirectory(path.dirname(config.bridgeStatePath), "state directory"));
     checks.push(await checkRuntimeDirectory(path.dirname(config.attachmentDownloadDir), "attachment parent"));
+    checks.push(...checkMobileSafeConfig(config));
   }
 
   printDoctorChecks(checks);
@@ -421,6 +423,60 @@ function checkCommand(command: string, args: string[], label: string): DoctorChe
     status: "error",
     detail: `failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout || "not found"}`,
   };
+}
+
+function checkMobileSafeConfig(config: ReturnType<typeof loadConfig>): DoctorCheck[] {
+  const checks: DoctorCheck[] = [];
+  if (!path.isAbsolute(config.codexBin)) {
+    checks.push({
+      label: "mobile-safe CODEX_BIN",
+      status: "warn",
+      detail: "CODEX_BIN is not absolute; background services may not load your interactive shell PATH",
+    });
+  }
+  if (config.access.allowGroups && config.access.allowedUserIds.length === 0) {
+    checks.push({
+      label: "mobile-safe group users",
+      status: "warn",
+      detail: "ALLOW_GROUPS is true but ALLOWED_USER_IDS is empty; restrict who can click control and approval buttons",
+    });
+  }
+  if (config.access.allowGroups && config.codexApprovalPolicy === "never") {
+    checks.push({
+      label: "mobile-safe approvals",
+      status: "warn",
+      detail: "group bots should usually use CODEX_APPROVAL_POLICY=on-request instead of never",
+    });
+  }
+  if (config.access.allowGroups && config.codexRunTimeoutMs === 0) {
+    checks.push({
+      label: "mobile-safe run timeout",
+      status: "warn",
+      detail: "CODEX_RUN_TIMEOUT_MS=0 disables automatic run cancellation for group bots",
+    });
+  }
+  if (config.access.allowGroups && config.codexApprovalTimeoutMs === 0) {
+    checks.push({
+      label: "mobile-safe approval timeout",
+      status: "warn",
+      detail: "CODEX_APPROVAL_TIMEOUT_MS=0 disables automatic approval cancellation for group bots",
+    });
+  }
+  if (config.codexSandbox === "danger-full-access") {
+    checks.push({
+      label: "mobile-safe sandbox",
+      status: "warn",
+      detail: "danger-full-access is risky for a remote chat entrypoint; prefer workspace-write",
+    });
+  }
+  if (checks.length === 0) {
+    checks.push({
+      label: "mobile-safe profile",
+      status: "ok",
+      detail: "no mobile/team-bot safety warnings detected",
+    });
+  }
+  return checks;
 }
 
 function printDoctorChecks(checks: DoctorCheck[]): void {

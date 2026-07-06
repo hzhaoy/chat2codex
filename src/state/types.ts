@@ -5,6 +5,7 @@ export interface ChatSession {
   updatedAt: string;
   lastProjects?: ProjectSelection[];
   lastThreads?: ThreadSelection[];
+  lastRun?: LastRunSummary;
 }
 
 export interface ProjectSelection {
@@ -24,6 +25,39 @@ export interface ThreadSelection {
   updatedAt?: string;
   resumable?: boolean;
   unavailableReason?: string;
+}
+
+export type LastRunStatus = "success" | "failed" | "stopped";
+
+export interface LastRunCommandSummary {
+  command: string;
+  cwd?: string;
+  status?: string;
+  exitCode?: number | null;
+  durationMs?: number;
+  outputPreview?: string;
+}
+
+export interface LastRunReviewSummary {
+  changedFiles: string[];
+  diff?: string;
+  diffStat?: string;
+  fileChangeCount: number;
+  commands: LastRunCommandSummary[];
+}
+
+export interface LastRunSummary {
+  id: string;
+  status: LastRunStatus;
+  cwd: string;
+  threadId?: string;
+  promptPreview: string;
+  startedAt: string;
+  completedAt: string;
+  durationMs?: number;
+  finalTextPreview?: string;
+  errorPreview?: string;
+  review: LastRunReviewSummary;
 }
 
 export type EventDiagnosticOutcome = "routed" | "dropped";

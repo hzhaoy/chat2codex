@@ -53,7 +53,7 @@ Summarize this repository.
 
 你也可以发送文件或图片。Chat2Codex 会把支持的附件下载到 `ATTACHMENT_DOWNLOAD_DIR`，并把本地路径附加到 Codex prompt 中。如果消息只有附件没有文字，它会使用默认 prompt，让 Codex 检查这个文件或图片。
 
-运行过程中，Chat2Codex 会发送一张状态卡片，最多每 15 秒更新一次，并把最终 Codex 回复渲染成飞书/Lark 富文本消息。点击卡片里的停止按钮，或发送 `/stop`，可以中止当前运行。失败和已停止的卡片会带有重试按钮，可以重新运行同一个 prompt。如果卡片创建或更新失败，会回退为文本进度消息。
+运行过程中，Chat2Codex 会发送一张状态卡片，最多每 15 秒更新一次，并把最终 Codex 回复渲染成飞书/Lark 富文本消息。点击卡片里的停止按钮，或发送 `/stop`，可以中止当前运行。失败和已停止的卡片会带有重试按钮，可以重新运行同一个 prompt。完成卡片会展示紧凑的本轮结果，并提供摘要、文件、Diff、日志详情按钮；也可以发送 `/summary`、`/files`、`/diff`、`/logs` 查看同一轮详情。如果卡片创建或更新失败，会回退为文本进度消息。
 
 ### CLI 命令
 
@@ -62,7 +62,7 @@ Summarize this repository.
 | `chat2codex` / `chat2codex start` | 启动飞书/Lark 桥接服务。 |
 | `chat2codex setup --workdir <path>` | 创建/连接飞书/Lark 应用，并写入 `.env`。 |
 | `chat2codex init --workdir <path>` | 已有应用时，创建一份初始 `.env`。 |
-| `chat2codex doctor` | 检查 `.env`、Node.js、Codex CLI 和工作目录。 |
+| `chat2codex doctor` | 检查 `.env`、Node.js、Codex CLI、工作目录和移动/群机器人安全提示。 |
 | `chat2codex smoke [--mode turn\|approval]` | 本地验证 Codex app-server 协议。 |
 | `chat2codex service print\|install\|uninstall` | 管理用户级 launchd/systemd 服务。 |
 
@@ -72,14 +72,16 @@ Summarize this repository.
 
 - 飞书/Lark 长连接机器人，不需要公网 webhook 服务。
 - 每个 chat 对应一个 Codex 会话。
-- 支持 `/status`、`/projects`、`/project <index|path>`、`/threads`、`/resume`、`/new`、`/cd <path>`、`/stop` 和 `/whoami` 命令。
+- 支持 `/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/resume`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
 - 使用 JSON 保存本地状态。
 - 使用 Codex app-server JSON-RPC 获取机器可读的进度、最终输出和审批回调。
-- Codex 运行时会限频更新状态卡片，并提供停止/重试按钮；卡片不可用时自动回退为文本。
+- Codex 运行时会限频更新状态卡片，并提供停止/重试、本轮详情按钮；卡片不可用时自动回退为文本。
 - 支持用飞书/Lark 审批卡片处理 Codex 命令执行和文件变更审批请求。按钮会根据 Codex 当前提供的审批选项生成，包括 Approve、Approve session、Deny、Cancel turn 等。
 - 支持飞书/Lark 图片和文件消息，把附件下载为本地路径后随 prompt 传给 Codex。
 - 在日志和 `/status` 中记录近期消息路由/丢弃诊断信息。
 - `/status` 会显示队列深度、当前运行时长、审批等待时长和近期失败信息。
+- `/host` 会发送 Host 健康卡，展示桥接主机、Codex binary、默认 cwd、队列、运行中任务、审批等待和移动/群机器人安全提示。
+- 支持用 `/steer <补充指令>` 在当前 Codex 运行中追加指导，不会排在普通聊天任务队列后面。
 - 为无人值守团队机器人提供可选的运行超时和审批超时。
 - Codex 失败或无法启动时，会返回适合团队机器人场景的错误摘要。
 - 最终 Codex 回复会渲染为飞书/Lark 富文本消息。
@@ -195,6 +197,7 @@ chat2codex service uninstall
 | 命令 | 作用 |
 | --- | --- |
 | `/status` | 显示当前 chat 会话、cwd、队列深度、当前运行时长、审批等待时长、近期失败、附件目录和近期事件诊断。 |
+| `/host` | 发送 Host 健康卡，展示 Codex CLI 可用性、服务路径、队列/审批数量和移动/群机器人安全提示。`/health` 是别名。 |
 | `/projects` | 按 cwd 分组列出 Codex app-server 发现的项目。 |
 | `/project <index\|path>` | 通过编号进入已列出的项目，或切换到指定目录，并清空当前选中的线程。 |
 | `/threads` | 列出当前项目最近的 Codex 对话。`/sessions` 是别名。 |
@@ -202,6 +205,11 @@ chat2codex service uninstall
 | `/new` | 在当前项目开始一个新的 Codex 对话。 |
 | `/cd <path>` | 修改当前 chat 的 cwd，并开始一个新的 Codex thread。 |
 | `/stop` | 停止当前 chat 正在运行的 Codex。运行状态卡片里也有停止按钮。 |
+| `/steer <补充指令>` | 立即把补充指令发送给当前 Codex 运行，绕过当前 chat 的普通任务队列。 |
+| `/summary` | 查看当前 chat 最近一轮运行摘要。 |
+| `/files` | 查看最近一轮变更文件。 |
+| `/diff` | 查看最近一轮捕获到的 diff。 |
+| `/logs` | 查看最近一轮命令摘要和输出预览。 |
 | `/whoami` | 显示当前 `chat_id`、chat 类型、发送者 id 和访问判断。 |
 
 ## 安全默认值
@@ -211,6 +219,8 @@ Chat2Codex 默认使用 `CODEX_SANDBOX=workspace-write`，所以 Codex 可以编
 默认 `CODEX_APPROVAL_POLICY=never`，适合无人值守运行。如果你希望 Codex 审批请求以飞书/Lark 卡片形式出现，可以设置为 `CODEX_APPROVAL_POLICY=on-request` 或 `untrusted`。在群聊中，审批按钮只能由 `ALLOWED_USER_IDS` 中列出的用户处理。
 
 `CODEX_RUN_TIMEOUT_MS=0` 和 `CODEX_APPROVAL_TIMEOUT_MS=0` 表示关闭自动超时。对于长期运行的后台机器人，可以设置正整数毫秒值；当 Codex turn 或审批请求卡住时，Chat2Codex 会取消它，并在 `/status` 的近期失败中留下恢复提示。
+
+`chat2codex doctor` 和 `/host` 都会提示移动/群机器人常见风险，包括相对路径 `CODEX_BIN`、群聊开启但没有 `ALLOWED_USER_IDS`、关闭运行/审批超时，以及高风险 sandbox 配置。
 
 私聊默认开启。群聊消息必须提到机器人，并且群聊默认关闭，直到同时配置 `ALLOW_GROUPS=true` 和 `ALLOWED_CHAT_IDS`。你也可以把 `ALLOWED_USER_IDS` 设置为发送者 `open_id`、`user_id` 或 `union_id` 的逗号分隔列表。私聊可以切换到任意本机目录；群聊只能切换到 `CODEX_GROUP_ALLOWED_ROOTS`，如果没有配置这个变量，则只能使用 `CODEX_WORKDIR`。
 

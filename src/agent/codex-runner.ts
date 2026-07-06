@@ -4,6 +4,8 @@ import readline from "node:readline";
 import type { BridgeConfig } from "../config/env.js";
 import type { Logger } from "../util/logger.js";
 
+const appServerSteerRetryDelaysMs = [0, 100, 250, 500, 1000, 1500];
+
 export interface CodexRunInput {
   prompt: string;
   cwd: string;
@@ -11,6 +13,7 @@ export interface CodexRunInput {
   signal?: AbortSignal;
   onProgress?: (update: CodexProgressUpdate) => void | Promise<void>;
   onApprovalRequest?: (request: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
+  onRunControl?: (control: CodexRunControl) => void;
 }
 
 export interface CodexRunResult {
@@ -20,6 +23,31 @@ export interface CodexRunResult {
   exitCode: number | null;
   signal?: NodeJS.Signals | null;
   cancelled?: boolean;
+  summary?: CodexRunSummary;
+}
+
+export interface CodexRunControl {
+  threadId?: string;
+  turnId?: string;
+  steer(input: string): Promise<void>;
+}
+
+export interface CodexRunSummary {
+  durationMs?: number;
+  diff?: string;
+  diffStat?: string;
+  changedFiles: string[];
+  fileChangeCount: number;
+  commands: CodexCommandSummary[];
+}
+
+export interface CodexCommandSummary {
+  command: string;
+  cwd?: string;
+  status?: string;
+  exitCode?: number | null;
+  durationMs?: number;
+  outputPreview?: string;
 }
 
 export interface CodexProgressUpdate {
@@ -212,6 +240,8 @@ export class CodexRunner {
     let turnCompleted = false;
     let turnError: string | null = null;
     let approvalCancelled = false;
+    const summary = createEmptyRunSummary();
+    const commandOutputBuffers = new Map<string, string>();
     let resolveTurn: (() => void) | null = null;
     const pendingRequests = new Map<
       string,
@@ -287,6 +317,7 @@ export class CodexRunner {
       }
       if (message.method === "turn/completed") {
         const turn = asRecord(message.params?.turn);
+        summary.durationMs = getNumber(turn, "durationMs") ?? summary.durationMs;
         if (!activeTurnId || getString(turn, "id") === activeTurnId) {
           turnCompleted = true;
           resolveTurn?.();
@@ -307,6 +338,29 @@ export class CodexRunner {
             finalText = text;
           }
         }
+        recordCompletedItem(summary, item, commandOutputBuffers);
+      }
+      if (message.method === "turn/diff/updated") {
+        const diff = getString(message.params, "diff");
+        if (diff !== undefined) {
+          summary.diff = diff;
+          summary.diffStat = summarizeUnifiedDiff(diff);
+          addChangedFiles(summary, filesFromUnifiedDiff(diff));
+        }
+      }
+      if (message.method === "item/commandExecution/outputDelta") {
+        const itemId = getString(message.params, "itemId");
+        const delta = getString(message.params, "delta");
+        if (itemId !== undefined && delta !== undefined) {
+          const outputPreview = truncateOutputPreview(`${commandOutputBuffers.get(itemId) ?? ""}${delta}`);
+          if (outputPreview !== undefined) {
+            commandOutputBuffers.set(itemId, outputPreview);
+          }
+        }
+      }
+      if (message.method === "item/fileChange/patchUpdated") {
+        const changes = Array.isArray(message.params?.changes) ? message.params.changes : [];
+        recordFileChanges(summary, changes);
       }
 
       const progress = summarizeCodexAppServerProgress(message);
@@ -375,6 +429,19 @@ export class CodexRunner {
         ...(this.config.codexModel ? { model: this.config.codexModel } : {}),
       });
       activeTurnId = extractTurnId(turnResult) ?? activeTurnId;
+      input.onRunControl?.({
+        threadId,
+        turnId: activeTurnId,
+        steer: (text: string) =>
+          steerAppServerTurn({
+            text,
+            getThreadId: () => threadId,
+            getTurnId: () => activeTurnId,
+            isTurnCompleted: () => turnCompleted,
+            isAborted: () => Boolean(input.signal?.aborted),
+            sendRequest,
+          }),
+      });
     } catch (error) {
       abortChild();
       throw error;
@@ -412,6 +479,7 @@ export class CodexRunner {
       exitCode: cancelled || (turnCompleted && !turnError) ? 0 : exit.code,
       signal: exit.signal,
       cancelled,
+      summary: finalizeRunSummary(summary),
     };
   }
 
@@ -571,7 +639,7 @@ export class CodexRunner {
       abortChild();
       await Promise.race([
         closePromise,
-        new Promise((resolve) => setTimeout(resolve, 250)),
+        delay(250),
       ]);
       if (forceKillTimer && (child.exitCode !== null || child.signalCode !== null)) {
         clearTimeout(forceKillTimer);
@@ -761,6 +829,130 @@ function describeAppServerStartedItem(item: Record<string, unknown> | null): str
   return "Codex 正在执行下一步。";
 }
 
+function createEmptyRunSummary(): CodexRunSummary {
+  return {
+    changedFiles: [],
+    fileChangeCount: 0,
+    commands: [],
+  };
+}
+
+function finalizeRunSummary(summary: CodexRunSummary): CodexRunSummary {
+  return {
+    ...summary,
+    diff: summary.diff ? truncateLargeText(summary.diff, 60_000) : undefined,
+    changedFiles: [...new Set(summary.changedFiles)].slice(0, 200),
+    commands: summary.commands.slice(-20).map((command) => ({
+      ...command,
+      outputPreview: command.outputPreview
+        ? truncateOutputPreview(command.outputPreview)
+        : undefined,
+    })),
+  };
+}
+
+function recordCompletedItem(
+  summary: CodexRunSummary,
+  item: Record<string, unknown> | null,
+  commandOutputBuffers: Map<string, string>,
+): void {
+  const itemType = getString(item, "type");
+  if (itemType === "commandExecution") {
+    const command = getString(item, "command");
+    if (!command) {
+      return;
+    }
+    const itemId = getString(item, "id");
+    const bufferedOutput = itemId ? commandOutputBuffers.get(itemId) : undefined;
+    summary.commands.push({
+      command,
+      cwd: getString(item, "cwd"),
+      status: getString(item, "status"),
+      exitCode: getNullableNumber(item, "exitCode"),
+      durationMs: getNumber(item, "durationMs"),
+      outputPreview: truncateOutputPreview(
+        getString(item, "aggregatedOutput") ?? bufferedOutput ?? "",
+      ),
+    });
+    return;
+  }
+
+  if (itemType === "fileChange") {
+    recordFileChanges(summary, Array.isArray(item?.changes) ? item.changes : []);
+  }
+}
+
+function recordFileChanges(summary: CodexRunSummary, changes: unknown[]): void {
+  const files = changes.flatMap((change) => {
+    const record = asRecord(change);
+    const filePath = getString(record, "path");
+    return filePath ? [filePath] : [];
+  });
+  if (files.length) {
+    summary.fileChangeCount += files.length;
+    addChangedFiles(summary, files);
+  }
+}
+
+function addChangedFiles(summary: CodexRunSummary, files: string[]): void {
+  const seen = new Set(summary.changedFiles);
+  for (const file of files) {
+    if (!file || seen.has(file)) {
+      continue;
+    }
+    seen.add(file);
+    summary.changedFiles.push(file);
+  }
+}
+
+function filesFromUnifiedDiff(diff: string): string[] {
+  const files: string[] = [];
+  for (const line of diff.split("\n")) {
+    const match = line.match(/^diff --git a\/(.+?) b\/(.+)$/u);
+    if (match?.[2]) {
+      files.push(match[2]);
+      continue;
+    }
+    const plus = line.match(/^\+\+\+ b\/(.+)$/u);
+    if (plus?.[1] && plus[1] !== "/dev/null") {
+      files.push(plus[1]);
+    }
+  }
+  return [...new Set(files)];
+}
+
+function summarizeUnifiedDiff(diff: string): string | undefined {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      additions += 1;
+    } else if (line.startsWith("-")) {
+      deletions += 1;
+    }
+  }
+  const fileCount = filesFromUnifiedDiff(diff).length;
+  if (fileCount === 0 && additions === 0 && deletions === 0) {
+    return undefined;
+  }
+  return `${fileCount} file(s), +${additions} -${deletions}`;
+}
+
+function truncateOutputPreview(value: string): string | undefined {
+  const normalized = value.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  return truncateLargeText(normalized, 4_000);
+}
+
+function truncateLargeText(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 32)}\n... [truncated]` : value;
+}
+
 function getItemName(item: CodexJsonEvent["item"]): string | undefined {
   const raw = item?.name ?? item?.tool_name ?? item?.command ?? item?.title;
   if (!raw) {
@@ -947,6 +1139,64 @@ function extractTurnId(result: unknown): string | undefined {
   return getString(asRecord(asRecord(result)?.turn), "id");
 }
 
+interface SteerAppServerTurnInput {
+  text: string;
+  getThreadId: () => string | undefined;
+  getTurnId: () => string | undefined;
+  isTurnCompleted: () => boolean;
+  isAborted: () => boolean;
+  sendRequest: (method: string, params: unknown) => Promise<unknown>;
+}
+
+async function steerAppServerTurn(input: SteerAppServerTurnInput): Promise<void> {
+  let lastTransientError: Error | null = null;
+  for (const retryDelayMs of appServerSteerRetryDelaysMs) {
+    if (retryDelayMs > 0) {
+      await delay(retryDelayMs);
+    }
+    if (input.isAborted()) {
+      throw new Error("Codex turn is no longer running.");
+    }
+    if (input.isTurnCompleted()) {
+      throw new Error("Codex turn has already completed.");
+    }
+    const threadId = input.getThreadId();
+    const turnId = input.getTurnId();
+    if (!threadId || !turnId) {
+      throw new Error("Codex turn is not steerable.");
+    }
+    try {
+      await input.sendRequest("turn/steer", {
+        threadId,
+        expectedTurnId: turnId,
+        input: [
+          {
+            type: "text",
+            text: input.text,
+            text_elements: [],
+          },
+        ],
+      });
+      return;
+    } catch (error) {
+      if (!isNoActiveTurnToSteerError(error)) {
+        throw error;
+      }
+      lastTransientError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  throw lastTransientError ?? new Error("Codex turn is not ready to receive steering.");
+}
+
+function isNoActiveTurnToSteerError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no active turn to steer/i.test(message);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function approvalRequestKey(id: unknown): string {
   return typeof id === "string" || typeof id === "number" ? String(id) : JSON.stringify(id);
 }
@@ -982,6 +1232,17 @@ function getNullableString(
 
 function getNumber(record: Record<string, unknown> | null | undefined, key: string): number | undefined {
   const value = record?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function getNullableNumber(
+  record: Record<string, unknown> | null | undefined,
+  key: string,
+): number | null | undefined {
+  const value = record?.[key];
+  if (value === null) {
+    return null;
+  }
   return typeof value === "number" ? value : undefined;
 }
 

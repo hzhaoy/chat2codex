@@ -8,6 +8,7 @@ export const selectProjectCardAction = "select_project";
 export const resumeThreadCardAction = "resume_thread";
 export const pageProjectsCardAction = "page_projects";
 export const pageSessionsCardAction = "page_sessions";
+export const showRunDetailCardAction = "show_run_detail";
 export const stopRunCardActionValue = Object.freeze({
   app: runCardActionApp,
   action: stopRunCardAction,
@@ -24,8 +25,10 @@ export type RunCardActionKind =
   | typeof selectProjectCardAction
   | typeof resumeThreadCardAction
   | typeof pageProjectsCardAction
-  | typeof pageSessionsCardAction;
+  | typeof pageSessionsCardAction
+  | typeof showRunDetailCardAction;
 export type CardActionToastType = "success" | "warning" | "error" | "info";
+export type RunDetailKind = "summary" | "files" | "diff" | "logs";
 
 export interface IncomingCardAction {
   action: RunCardActionKind;
@@ -34,6 +37,7 @@ export interface IncomingCardAction {
   sender: SenderIdentity;
   approvalId?: string;
   decisionIndex?: number;
+  detailKind?: RunDetailKind;
   projectIndex?: number;
   threadIndex?: number;
   page?: number;
@@ -104,6 +108,7 @@ export function adaptLarkCardActionEvent(event: unknown): IncomingCardAction | n
     },
     approvalId: getString(value, "approvalId"),
     decisionIndex: getNumber(value, "decisionIndex"),
+    detailKind: getRunDetailKind(value),
     projectIndex: getNumber(value, "projectIndex"),
     threadIndex: getNumber(value, "threadIndex"),
     page: getNumber(value, "page"),
@@ -132,11 +137,20 @@ function getRunCardActionKind(value: unknown): RunCardActionKind | null {
     action === selectProjectCardAction ||
     action === resumeThreadCardAction ||
     action === pageProjectsCardAction ||
-    action === pageSessionsCardAction
+    action === pageSessionsCardAction ||
+    action === showRunDetailCardAction
   ) {
     return action;
   }
   return null;
+}
+
+function getRunDetailKind(record: Record<string, unknown> | null): RunDetailKind | undefined {
+  const value = getString(record, "detailKind");
+  if (value === "summary" || value === "files" || value === "diff" || value === "logs") {
+    return value;
+  }
+  return undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

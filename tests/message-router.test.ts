@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import type {
   CodexApprovalDecision,
   CodexApprovalRequest,
+  CodexRunControl,
   CodexProgressUpdate,
   CodexRunInput,
   CodexRunResult,
@@ -118,6 +119,20 @@ class DelayedApprovalCardSender extends CardCollectingSender {
     this.createStarted.resolve();
     await this.releaseCreate.promise;
     return super.createApprovalCard(chatId, input);
+  }
+}
+
+class DelayedStatusCardSender extends CardCollectingSender {
+  readonly createStarted = deferred<void>();
+  readonly releaseCreate = deferred<void>();
+
+  override async createStatusCard(
+    chatId: string,
+    input: RunStatusCardInput,
+  ): Promise<StatusCardHandle> {
+    this.createStarted.resolve();
+    await this.releaseCreate.promise;
+    return super.createStatusCard(chatId, input);
   }
 }
 
@@ -334,6 +349,137 @@ class FailingCodex implements CodexClient {
   }
 }
 
+class RichResultCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    return {
+      threadId: "thread_result",
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+      summary: {
+        durationMs: 1234,
+        diff: "diff --git a/src/app.ts b/src/app.ts\n+++ b/src/app.ts\n@@\n+hello\n",
+        diffStat: "1 file(s), +1 -0",
+        changedFiles: [path.join(input.cwd, "src/app.ts"), "src/app.ts"],
+        fileChangeCount: 1,
+        commands: [
+          {
+            command: "bun test",
+            cwd: "/repo",
+            status: "completed",
+            exitCode: 0,
+            durationMs: 42,
+            outputPreview: "1 pass",
+          },
+        ],
+      },
+    };
+  }
+}
+
+class SteerableCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly steers: string[] = [];
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const control: CodexRunControl = {
+      threadId: "thread_steer",
+      turnId: "turn_steer",
+      steer: async (text: string) => {
+        this.steers.push(text);
+      },
+    };
+    input.onRunControl?.(control);
+    return new Promise((resolve) => {
+      const finishCancelled = () => {
+        resolve({
+          threadId: "thread_steer",
+          finalText: "",
+          stderr: "",
+          exitCode: null,
+          cancelled: true,
+        });
+      };
+      if (input.signal?.aborted) {
+        finishCancelled();
+        return;
+      }
+      input.signal?.addEventListener("abort", finishCancelled, { once: true });
+    });
+  }
+}
+
+class FailingSteerCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    input.onRunControl?.({
+      threadId: "thread_steer",
+      turnId: "turn_steer",
+      steer: async () => {
+        throw new Error("no active turn to steer");
+      },
+    });
+    return new Promise((resolve) => {
+      const finishCancelled = () => {
+        resolve({
+          threadId: "thread_steer",
+          finalText: "",
+          stderr: "",
+          exitCode: null,
+          cancelled: true,
+        });
+      };
+      if (input.signal?.aborted) {
+        finishCancelled();
+        return;
+      }
+      input.signal?.addEventListener("abort", finishCancelled, { once: true });
+    });
+  }
+}
+
+class DelayedSteerableCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly steers: string[] = [];
+
+  constructor(private readonly controlDelayMs = 20) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    setTimeout(() => {
+      input.onRunControl?.({
+        threadId: "thread_steer",
+        turnId: "turn_steer",
+        steer: async (text: string) => {
+          this.steers.push(text);
+        },
+      });
+    }, this.controlDelayMs);
+    return new Promise((resolve) => {
+      const finishCancelled = () => {
+        resolve({
+          threadId: "thread_steer",
+          finalText: "",
+          stderr: "",
+          exitCode: null,
+          cancelled: true,
+        });
+      };
+      if (input.signal?.aborted) {
+        finishCancelled();
+        return;
+      }
+      input.signal?.addEventListener("abort", finishCancelled, { once: true });
+    });
+  }
+}
+
 class ThrowingCodex implements CodexClient {
   readonly runs: CodexRunInput[] = [];
 
@@ -428,6 +574,37 @@ describe("MessageRouter access control", () => {
       expect(sender.messages[0]?.text).toContain("approval_wait: (none)");
       expect(sender.messages[0]?.text).toContain("recent_failures: (none)");
     });
+  });
+
+  test("host sends a health card with mobile safety warnings", async () => {
+    const sender = new CardCollectingSender();
+    await withRouterAndSender(
+      {
+        CODEX_BIN: process.execPath,
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        CODEX_APPROVAL_POLICY: "never",
+        CODEX_RUN_TIMEOUT_MS: "0",
+      },
+      new FakeCodex(),
+      sender,
+      async ({ router }) => {
+        await router.enqueue({
+          messageId: "m_host",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: "@_user_1 /host",
+        });
+
+        expect(sender.interactiveCards).toHaveLength(1);
+        const serialized = JSON.stringify(sender.interactiveCards[0]?.card);
+        expect(serialized).toContain("Host 健康卡");
+        expect(serialized).toContain("queue");
+        expect(serialized).toContain("群聊已开启");
+        expect(serialized).toContain("任务无限等待");
+      },
+    );
   });
 
   test("status bypasses the queue and reports active run metadata", async () => {
@@ -749,7 +926,7 @@ describe("MessageRouter access control", () => {
           },
         },
       });
-      expect(JSON.stringify(response)).toContain("Selected session: A older");
+      expect(JSON.stringify(response)).toContain("已选择会话：A older");
       expect(JSON.stringify(response)).not.toContain("resume_thread");
       expect(sender.interactiveCards.at(-1)?.card.header.title.content).toBe("当前项目会话");
       expect(sender.interactiveCardUpdates).toHaveLength(0);
@@ -1243,6 +1420,208 @@ describe("MessageRouter access control", () => {
       });
       expect(sender.messages.map((message) => message.kind)).toEqual(["markdown"]);
       expect(sender.messages[0]?.text).toBe("done");
+    });
+  });
+
+  test("records rich run results and serves detail commands", async () => {
+    const codex = new RichResultCodex();
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "make a small edit",
+      });
+
+      expect(sender.cardUpdates.at(-1)?.input).toMatchObject({
+        status: "success",
+        result: {
+          filesPreview: ["src/app.ts"],
+          changedFileCount: 1,
+          commandCount: 1,
+          diffAvailable: true,
+          logsAvailable: true,
+        },
+      });
+
+      for (const [command, expected] of [
+        ["/summary", "状态：success"],
+        ["/files", "src/app.ts"],
+        ["/diff", "diff --git a/src/app.ts b/src/app.ts"],
+        ["/logs", "bun test"],
+      ] as const) {
+        await router.enqueue({
+          messageId: `m_${command.slice(1)}`,
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: command,
+        });
+        expect(sender.messages.at(-1)?.text).toContain(expected);
+        if (command === "/files") {
+          expect(sender.messages.at(-1)?.text).not.toContain(path.join(config.codexWorkdir, "src/app.ts"));
+        }
+      }
+
+      const response = await router.handleCardAction({
+        action: "show_run_detail",
+        detailKind: "diff",
+        chatId: "oc_chat",
+        messageId: sender.cards[0]?.handle.messageId,
+        sender: { openId: "ou_user" },
+      });
+      expect(response).toMatchObject({
+        toast: {
+          type: "success",
+        },
+      });
+      expect(sender.messages.at(-1)?.text).toContain("diff --git a/src/app.ts b/src/app.ts");
+    });
+  });
+
+  test("steer bypasses the queue and sends guidance to the active run", async () => {
+    const codex = new SteerableCodex();
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      const running = router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "long running task",
+      });
+      await waitFor(() => codex.runs.length === 1);
+
+      await router.enqueue({
+        messageId: "m_steer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/steer focus on tests",
+      });
+
+      expect(codex.steers).toEqual(["focus on tests"]);
+      expect(sender.messages.at(-1)?.text).toContain("已把补充指令发送给当前 Codex 任务");
+
+      await router.enqueue({
+        messageId: "m_stop",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/stop",
+      });
+      await running;
+    });
+  });
+
+  test("steer queues guidance when the active run control is not ready yet", async () => {
+    const codex = new DelayedSteerableCodex(50);
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      const running = router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "long running task",
+      });
+      await waitFor(() => codex.runs.length === 1);
+
+      await router.enqueue({
+        messageId: "m_steer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/steer focus on tests",
+      });
+
+      expect(sender.messages.at(-1)?.text).toContain("已暂存这条补充指令");
+      await waitFor(() => codex.steers.length === 1);
+      expect(codex.steers).toEqual(["focus on tests"]);
+      expect(sender.messages.at(-1)?.text).toContain("已把暂存的补充指令发送给当前 Codex 任务");
+
+      await router.enqueue({
+        messageId: "m_stop",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/stop",
+      });
+      await running;
+    });
+  });
+
+  test("steer queues guidance while a run is starting but not active yet", async () => {
+    const codex = new DelayedSteerableCodex(20);
+    const sender = new DelayedStatusCardSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "long running task",
+      });
+      await sender.createStarted.promise;
+
+      await router.enqueue({
+        messageId: "m_steer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/steer focus on tests",
+      });
+
+      expect(sender.messages.at(-1)?.text).toContain("正在排队或启动");
+      expect(codex.steers).toEqual([]);
+
+      sender.releaseCreate.resolve();
+      await waitFor(() => codex.steers.length === 1);
+      expect(codex.steers).toEqual(["focus on tests"]);
+      expect(sender.messages.at(-1)?.text).toContain("已把暂存的补充指令发送给当前 Codex 任务");
+
+      await router.enqueue({
+        messageId: "m_stop",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/stop",
+      });
+      await running;
+    });
+  });
+
+  test("steer hides transient app-server wording when steering is rejected", async () => {
+    const codex = new FailingSteerCodex();
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      const running = router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "long running task",
+      });
+      await waitFor(() => codex.runs.length === 1);
+
+      await router.enqueue({
+        messageId: "m_steer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/steer focus on tests",
+      });
+
+      expect(sender.messages.at(-1)?.text).toContain("当前 Codex 任务暂时不能接收补充指令");
+      expect(sender.messages.at(-1)?.text).not.toContain("no active turn to steer");
+
+      await router.enqueue({
+        messageId: "m_stop",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/stop",
+      });
+      await running;
     });
   });
 

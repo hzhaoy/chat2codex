@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   buildApprovalCard,
+  buildHostHealthCard,
   buildProjectListCard,
   buildRunStatusCard,
   buildSessionListCard,
@@ -103,6 +104,68 @@ describe("Lark run status cards", () => {
 
     expect(serialized).not.toContain("stop_run");
     expect(serialized).not.toContain("retry_run");
+  });
+
+  test("includes result summary and detail actions on completed cards", () => {
+    const serialized = JSON.stringify(
+      buildRunStatusCard({
+        status: "success",
+        detail: "done",
+        cwd: "/tmp/chat2codex",
+        prompt: "prompt",
+        startedAt: "2026-06-29T12:00:00.000Z",
+        result: {
+          durationMs: 1234,
+          changedFileCount: 2,
+          commandCount: 1,
+          diffAvailable: true,
+          logsAvailable: true,
+          filesPreview: ["src/app.ts", "tests/app.test.ts"],
+          statusNote: "ok",
+        },
+      }),
+    );
+
+    expect(serialized).toContain("本轮结果");
+    expect(serialized).toContain("files: 2");
+    expect(serialized).toContain("diff: available");
+    expect(serialized).toContain("changed:");
+    expect(serialized).toContain("摘要");
+    expect(serialized).toContain("文件");
+    expect(serialized).toContain("Diff");
+    expect(serialized).toContain("日志");
+    expect(serialized).toContain("show_run_detail");
+  });
+
+  test("builds host health cards", () => {
+    const card = buildHostHealthCard({
+      title: "桥接服务在线，Codex CLI 可用。",
+      status: "warn",
+      host: "test-host",
+      platform: "darwin arm64",
+      uptime: "1m",
+      queueDepth: 0,
+      activeRun: "(none)",
+      approvalWait: "(none)",
+      codexBin: "/usr/local/bin/codex",
+      codexVersion: "codex 1.2.3",
+      defaultCwd: "/tmp/chat2codex",
+      sandbox: "workspace-write",
+      approvalPolicy: "on-request",
+      runTimeout: "10m",
+      approvalTimeout: "5m",
+      access: "direct:on groups:off allowed_chats=0 allowed_users=0",
+      statePath: "/tmp/chat2codex/state.json",
+      attachmentDir: "/tmp/chat2codex/attachments",
+      warnings: ["CODEX_BIN is relative"],
+    });
+
+    const serialized = JSON.stringify(card);
+    expect(card.header.template).toBe("yellow");
+    expect(serialized).toContain("Host 健康卡");
+    expect(serialized).toContain("codex 1\\\\.2\\\\.3");
+    expect(serialized).toContain("queue");
+    expect(serialized).toContain("CODEX\\\\_BIN is relative");
   });
 
   test("builds approval buttons from Codex decisions", () => {
@@ -256,7 +319,7 @@ describe("Lark run status cards", () => {
     const selectedSerialized = JSON.stringify(selectedCard);
     expect(selectedCard.header.title.content).toBe("Codex 项目已选择");
     expect(selectedCard.header.template).toBe("green");
-    expect(selectedSerialized).toContain("Selected project: /repo/6");
+    expect(selectedSerialized).toContain("已选择项目：/repo/6");
     expect(selectedSerialized).not.toContain("select_project");
     expect(selectedSerialized).not.toContain("page_projects");
   });
@@ -361,7 +424,7 @@ describe("Lark run status cards", () => {
     const selectedSerialized = JSON.stringify(selectedCard);
     expect(selectedCard.header.title.content).toBe("Codex 会话已选择");
     expect(selectedCard.header.template).toBe("green");
-    expect(selectedSerialized).toContain("Selected session: Session 6");
+    expect(selectedSerialized).toContain("已选择会话：Session 6");
     expect(selectedSerialized).not.toContain("resume_thread");
     expect(selectedSerialized).not.toContain("page_sessions");
   });

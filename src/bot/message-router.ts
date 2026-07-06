@@ -1,13 +1,18 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import {
   type CodexApprovalDecision,
   type CodexApprovalRequest,
+  type CodexCommandSummary,
   CodexRunner,
   type CodexProgressUpdate,
+  type CodexRunControl,
   type CodexRunInput,
   type CodexRunResult,
+  type CodexRunSummary,
   type CodexThread,
   type CodexThreadListInput,
   type CodexThreadListResult,
@@ -19,6 +24,10 @@ import {
   type EventDiagnosticOutcome,
   type EventDiagnosticSnapshot,
   type FailureDiagnosticCategory,
+  type LastRunCommandSummary,
+  type LastRunReviewSummary,
+  type LastRunStatus,
+  type LastRunSummary,
   type ProjectSelection,
   type RecentFailureDiagnostic,
   type ThreadSelection,
@@ -42,21 +51,29 @@ import {
   resumeThreadCardAction,
   resolveApprovalCardAction,
   selectProjectCardAction,
+  showRunDetailCardAction,
   stopRunCardAction,
   type CardActionResponse,
   type IncomingCardAction,
+  type RunDetailKind,
 } from "./lark-card-action.js";
 import {
   buildApprovalCard,
+  buildHostHealthCard,
   buildProjectListCard,
   buildSessionListCard,
   type ApprovalCardInput,
+  type HostHealthCardInput,
   type LarkInteractiveCard,
+  type RunResultCardInput,
   type RunStatusCardInput,
 } from "./lark-card.js";
 
 const minProgressIntervalMs = 15_000;
 const maxRememberedStatusCards = 100;
+const pendingRunSteerTtlMs = 30_000;
+const maxPendingSteers = 5;
+const pendingSteerLimitMessage = "已有 5 条补充指令等待发送，请先等当前 Codex 任务接收后再试。";
 
 export interface IncomingTextMessage {
   messageId: string;
@@ -136,6 +153,9 @@ interface ActiveRunState {
   cwd: string;
   prompt: string;
   threadId?: string;
+  turnId?: string;
+  steer?: CodexRunControl["steer"];
+  pendingSteers: PendingSteer[];
   startedAt: string;
   startedAtMs: number;
   lastProgressAt?: string;
@@ -145,11 +165,22 @@ interface ActiveRunState {
   timedOut?: boolean;
 }
 
+interface PendingSteer {
+  text: string;
+}
+
+interface PendingRunSteers {
+  items: PendingSteer[];
+  timeoutTimer: NodeJS.Timeout;
+}
+
 export class MessageRouter {
   private state: BridgeState | null = null;
+  private readonly bridgeStartedAtMs = Date.now();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly queueDepths = new Map<string, number>();
   private readonly activeRuns = new Map<string, ActiveRunState>();
+  private readonly pendingRunSteers = new Map<string, PendingRunSteers>();
   private readonly activeApprovals = new Map<string, PendingApproval>();
   private readonly statusCardRuns = new Map<string, { chatId: string; prompt: string }>();
   private readonly codex: CodexClient;
@@ -200,9 +231,24 @@ export class MessageRouter {
         this.logger.error("Immediate stop command failed", error);
       });
     }
+    if (!message.attachments?.length && isSteerCommand(message)) {
+      return this.handleImmediateSteer(message).catch((error) => {
+        this.logger.error("Immediate steer command failed", error);
+      });
+    }
     if (!message.attachments?.length && isStatusCommand(message)) {
       return this.handleImmediateStatus(message).catch((error) => {
         this.logger.error("Immediate status command failed", error);
+      });
+    }
+    if (!message.attachments?.length && isHostCommand(message)) {
+      return this.handleImmediateHost(message).catch((error) => {
+        this.logger.error("Immediate host command failed", error);
+      });
+    }
+    if (!message.attachments?.length && detailCommandKind(message)) {
+      return this.handleImmediateRunDetail(message).catch((error) => {
+        this.logger.error("Immediate run detail command failed", error);
       });
     }
 
@@ -225,6 +271,9 @@ export class MessageRouter {
 
     if (action.action === retryRunCardAction) {
       return this.handleRetryCardAction(action);
+    }
+    if (action.action === showRunDetailCardAction) {
+      return this.handleRunDetailCardAction(action);
     }
 
     if (action.action === resolveApprovalCardAction) {
@@ -308,6 +357,18 @@ export class MessageRouter {
 
     if (!hasAttachments && text === "/status") {
       await this.sendStatus(message.chatId);
+      return;
+    }
+    if (!hasAttachments && text === "/host") {
+      await this.sendHostHealth(message.chatId);
+      return;
+    }
+    if (!hasAttachments && (text === "/diff" || text === "/logs" || text === "/files" || text === "/summary")) {
+      await this.sendRunDetail(message.chatId, commandDetailKind(text));
+      return;
+    }
+    if (!hasAttachments && (text === "/steer" || text.startsWith("/steer "))) {
+      await this.steerActiveRun(message.chatId, text.slice("/steer".length).trim());
       return;
     }
     if (!hasAttachments && text === "/stop") {
@@ -397,6 +458,7 @@ export class MessageRouter {
       cwd: session.cwd,
       prompt,
       threadId: session.threadId,
+      pendingSteers: this.takePendingRunSteers(chatId),
       startedAt,
       startedAtMs,
     };
@@ -437,6 +499,12 @@ export class MessageRouter {
             prompt,
             startedAt,
           ),
+        onRunControl: (control) => {
+          runState.threadId = control.threadId ?? runState.threadId;
+          runState.turnId = control.turnId;
+          runState.steer = control.steer;
+          void this.flushPendingSteers(chatId, runState);
+        },
       });
 
       if (result.cancelled || controller.signal.aborted) {
@@ -444,6 +512,18 @@ export class MessageRouter {
           await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt);
           return;
         }
+        const completedAt = new Date().toISOString();
+        session.lastRun = buildLastRunSummary({
+          status: "stopped",
+          cwd: session.cwd,
+          threadId: result.threadId ?? session.threadId,
+          prompt,
+          startedAt,
+          completedAt,
+          summary: result.summary,
+        });
+        session.updatedAt = completedAt;
+        await this.store.save(state);
         this.logger.info("Codex run stopped", { chatId });
         await this.updateStatusCard(statusCard, {
           status: "stopped",
@@ -451,7 +531,8 @@ export class MessageRouter {
           cwd: session.cwd,
           prompt,
           startedAt,
-          updatedAt: new Date().toISOString(),
+          updatedAt: completedAt,
+          result: runResultCardInput(session.lastRun),
         });
         return;
       }
@@ -459,10 +540,21 @@ export class MessageRouter {
       if (result.threadId) {
         session.threadId = result.threadId;
       }
-      session.updatedAt = new Date().toISOString();
-      await this.store.save(state);
+      const completedAt = new Date().toISOString();
+      session.updatedAt = completedAt;
 
       if (result.exitCode !== 0) {
+        session.lastRun = buildLastRunSummary({
+          status: "failed",
+          cwd: session.cwd,
+          threadId: session.threadId,
+          prompt,
+          startedAt,
+          completedAt,
+          summary: result.summary,
+          errorText: [result.finalText, result.stderr].filter(Boolean).join("\n"),
+        });
+        await this.store.save(state);
         const failure = formatCodexFailure(result, session.cwd);
         await this.recordRecentFailure(chatId, {
           category: inferCodexResultFailureCategory(result),
@@ -480,7 +572,8 @@ export class MessageRouter {
           cwd: session.cwd,
           prompt,
           startedAt,
-          updatedAt: new Date().toISOString(),
+          updatedAt: completedAt,
+          result: runResultCardInput(session.lastRun),
         });
         for (const chunk of splitForChat(failure)) {
           await this.sender.sendText(chatId, chunk);
@@ -488,13 +581,25 @@ export class MessageRouter {
         return;
       }
 
+      session.lastRun = buildLastRunSummary({
+        status: "success",
+        cwd: session.cwd,
+        threadId: session.threadId,
+        prompt,
+        startedAt,
+        completedAt,
+        summary: result.summary,
+        finalText: result.finalText,
+      });
+      await this.store.save(state);
       await this.updateStatusCard(statusCard, {
         status: "success",
         detail: "Codex 已完成，正在发送最终回答。",
         cwd: session.cwd,
         prompt,
         startedAt,
-        updatedAt: new Date().toISOString(),
+        updatedAt: completedAt,
+        result: runResultCardInput(session.lastRun),
       });
       for (const chunk of splitForChat(result.finalText)) {
         await this.sendMarkdown(chatId, chunk);
@@ -541,13 +646,26 @@ export class MessageRouter {
           hint: inferStartupFailureHint(getErrorCode(error), this.config.codexBin) ?? undefined,
         });
       }
+      const completedAt = new Date().toISOString();
+      session.lastRun = buildLastRunSummary({
+        status: "failed",
+        cwd: session.cwd,
+        threadId: session.threadId,
+        prompt,
+        startedAt,
+        completedAt,
+        errorText: formatError(error),
+      });
+      session.updatedAt = completedAt;
+      await this.store.save(state);
       await this.updateStatusCard(statusCard, {
         status: "failed",
         detail: "Codex 启动失败，错误摘要已发送。",
         cwd: session.cwd,
         prompt,
         startedAt,
-        updatedAt: new Date().toISOString(),
+        updatedAt: completedAt,
+        result: runResultCardInput(session.lastRun),
       });
       for (const chunk of splitForChat(failure)) {
         await this.sender.sendText(chatId, chunk);
@@ -558,6 +676,7 @@ export class MessageRouter {
       }
       await this.cancelApprovalsForChat(chatId);
       if (this.activeRuns.get(chatId) === runState) {
+        await this.reportUnsentPendingSteers(chatId, runState);
         this.activeRuns.delete(chatId);
       }
     }
@@ -584,13 +703,28 @@ export class MessageRouter {
       detail: `Run exceeded CODEX_RUN_TIMEOUT_MS=${this.config.codexRunTimeoutMs}.`,
       hint: runTimeoutHint(this.config.codexRunTimeoutMs),
     });
+    const state = this.requireState();
+    const session = this.ensureSession(chatId, state);
+    const completedAt = new Date().toISOString();
+    session.lastRun = buildLastRunSummary({
+      status: "failed",
+      cwd,
+      threadId,
+      prompt,
+      startedAt,
+      completedAt,
+      errorText: `Run exceeded CODEX_RUN_TIMEOUT_MS=${this.config.codexRunTimeoutMs}.`,
+    });
+    session.updatedAt = completedAt;
+    await this.store.save(state);
     await this.updateStatusCard(statusCard, {
       status: "failed",
       detail: "Codex 运行超时，已停止当前任务。",
       cwd,
       prompt,
       startedAt,
-      updatedAt: new Date().toISOString(),
+      updatedAt: completedAt,
+      result: runResultCardInput(session.lastRun),
     });
     for (const chunk of splitForChat(failure)) {
       await this.sender.sendText(chatId, chunk);
@@ -670,24 +804,33 @@ export class MessageRouter {
   }
 
   private async handleImmediateStop(message: IncomingTextMessage): Promise<void> {
-    const state = this.requireState();
-    if (state.processedMessageIds.includes(message.messageId)) {
-      this.logger.debug("Skipping duplicate message", { messageId: message.messageId });
-      return;
-    }
-    state.processedMessageIds.push(message.messageId);
-    await this.store.save(state);
-
-    const decision = decideAccess(this.config.access, toAccessContext(message));
-    if (!decision.allowed) {
-      await this.rejectUnauthorized(message, decision);
-      return;
-    }
-
-    await this.stopCodex(message.chatId);
+    await this.handleImmediateCommand(message, () => this.stopCodex(message.chatId));
   }
 
   private async handleImmediateStatus(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.sendStatus(message.chatId));
+  }
+
+  private async handleImmediateHost(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.sendHostHealth(message.chatId));
+  }
+
+  private async handleImmediateRunDetail(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () =>
+      this.sendRunDetail(message.chatId, detailCommandKind(message) ?? "summary"),
+    );
+  }
+
+  private async handleImmediateSteer(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () =>
+      this.steerActiveRun(message.chatId, routedText(message).slice("/steer".length).trim()),
+    );
+  }
+
+  private async handleImmediateCommand(
+    message: IncomingTextMessage,
+    action: () => Promise<unknown>,
+  ): Promise<void> {
     const state = this.requireState();
     if (state.processedMessageIds.includes(message.messageId)) {
       this.logger.debug("Skipping duplicate message", { messageId: message.messageId });
@@ -702,7 +845,7 @@ export class MessageRouter {
       return;
     }
 
-    await this.sendStatus(message.chatId);
+    await action();
   }
 
   private async sendStatus(chatId: string): Promise<void> {
@@ -711,13 +854,13 @@ export class MessageRouter {
     if (!session) {
       await this.sender.sendText(
         chatId,
-          [
-            "当前 chat 还没有 Codex session。",
-            `默认 cwd: ${this.config.codexWorkdir}`,
-            ...this.formatRuntimeStatusLines(chatId, state),
-            ...this.formatDiagnosticStatusLines(state),
-          ].join("\n"),
-        );
+        [
+          "当前 chat 还没有 Codex session。",
+          `默认 cwd: ${this.config.codexWorkdir}`,
+          ...this.formatRuntimeStatusLines(chatId, state),
+          ...this.formatDiagnosticStatusLines(state),
+        ].join("\n"),
+      );
       return;
     }
 
@@ -732,6 +875,204 @@ export class MessageRouter {
         ...this.formatDiagnosticStatusLines(state),
       ].join("\n"),
     );
+  }
+
+  private async sendHostHealth(chatId: string): Promise<void> {
+    const state = this.requireState();
+    const input = this.buildHostHealthInput(state);
+    const fallback = formatHostHealth(input);
+    if (this.sender.sendInteractiveCard) {
+      try {
+        await this.sender.sendInteractiveCard(chatId, buildHostHealthCard(input));
+        return;
+      } catch (error) {
+        this.logger.warn("Host health card send failed; falling back to markdown", error);
+      }
+    }
+    await this.sendMarkdown(chatId, fallback);
+  }
+
+  private async sendRunDetail(chatId: string, kind: RunDetailKind): Promise<void> {
+    const lastRun = this.requireState().chats[chatId]?.lastRun;
+    if (!lastRun) {
+      await this.sender.sendText(chatId, "当前 chat 还没有可查看的最近运行结果。");
+      return;
+    }
+    const detail = formatRunDetail(lastRun, kind);
+    for (const chunk of splitForChat(detail)) {
+      await this.sendMarkdown(chatId, chunk);
+    }
+  }
+
+  private async steerActiveRun(chatId: string, text: string): Promise<void> {
+    if (!text) {
+      await this.sender.sendText(chatId, "用法：/steer <补充指令>");
+      return;
+    }
+    const run = this.activeRuns.get(chatId);
+    if (!run || run.controller.signal.aborted) {
+      if (this.queues.has(chatId)) {
+        await this.queuePendingRunSteer(chatId, text);
+        return;
+      }
+      await this.sender.sendText(chatId, "当前 chat 没有正在运行、可补充指令的 Codex 任务。");
+      return;
+    }
+    if (!run.steer) {
+      if (!this.addPendingSteer(run.pendingSteers, text)) {
+        await this.sender.sendText(chatId, pendingSteerLimitMessage);
+        return;
+      }
+      await this.sender.sendText(chatId, "当前 Codex 任务正在启动补充指令通道；已暂存这条补充指令，准备好后会自动发送。");
+      return;
+    }
+    await this.sendSteer(chatId, run, text, "sent");
+  }
+
+  private async queuePendingRunSteer(chatId: string, text: string): Promise<void> {
+    const existing = this.pendingRunSteers.get(chatId);
+    if (existing) {
+      if (!this.addPendingSteer(existing.items, text)) {
+        await this.sender.sendText(chatId, pendingSteerLimitMessage);
+        return;
+      }
+      await this.sender.sendText(chatId, "当前 Codex 任务正在排队或启动；已暂存这条补充指令，准备好后会自动发送。");
+      return;
+    }
+
+    const pending: PendingRunSteers = {
+      items: [{ text }],
+      timeoutTimer: setTimeout(() => {
+        void this.expirePendingRunSteers(chatId);
+      }, pendingRunSteerTtlMs),
+    };
+    pending.timeoutTimer.unref?.();
+    this.pendingRunSteers.set(chatId, pending);
+    await this.sender.sendText(chatId, "当前 Codex 任务正在排队或启动；已暂存这条补充指令，准备好后会自动发送。");
+  }
+
+  private addPendingSteer(items: PendingSteer[], text: string): boolean {
+    if (items.length >= maxPendingSteers) {
+      return false;
+    }
+    items.push({ text });
+    return true;
+  }
+
+  private takePendingRunSteers(chatId: string): PendingSteer[] {
+    const pending = this.pendingRunSteers.get(chatId);
+    if (!pending) {
+      return [];
+    }
+    this.pendingRunSteers.delete(chatId);
+    clearTimeout(pending.timeoutTimer);
+    return pending.items.splice(0);
+  }
+
+  private async expirePendingRunSteers(chatId: string): Promise<void> {
+    const pending = this.pendingRunSteers.get(chatId);
+    if (!pending) {
+      return;
+    }
+    this.pendingRunSteers.delete(chatId);
+    const count = pending.items.length;
+    if (!count) {
+      return;
+    }
+    try {
+      await this.sender.sendText(
+        chatId,
+        count === 1
+          ? "暂存的补充指令没有等到可接收的 Codex 任务，已取消。"
+          : `${count} 条暂存的补充指令没有等到可接收的 Codex 任务，已取消。`,
+      );
+    } catch (error) {
+      this.logger.warn("Pending steer expiry notification failed", error);
+    }
+  }
+
+  private async flushPendingSteers(
+    chatId: string,
+    run: ActiveRunState,
+  ): Promise<void> {
+    if (this.activeRuns.get(chatId) !== run || run.controller.signal.aborted || !run.steer) {
+      return;
+    }
+    const pending = run.pendingSteers.splice(0);
+    for (const item of pending) {
+      if (this.activeRuns.get(chatId) !== run || run.controller.signal.aborted) {
+        return;
+      }
+      await this.sendSteer(chatId, run, item.text, "flushed");
+    }
+  }
+
+  private async sendSteer(
+    chatId: string,
+    run: ActiveRunState,
+    text: string,
+    mode: "sent" | "flushed",
+  ): Promise<void> {
+    if (!run.steer) {
+      await this.sender.sendText(chatId, "当前 Codex 任务暂时还不能接收补充指令，请稍后重试。");
+      return;
+    }
+    try {
+      await run.steer(text);
+      await this.sender.sendText(
+        chatId,
+        mode === "sent"
+          ? "已把补充指令发送给当前 Codex 任务。"
+          : "已把暂存的补充指令发送给当前 Codex 任务。",
+      );
+    } catch (error) {
+      await this.sender.sendText(chatId, `补充指令发送失败：${formatSteerFailure(error)}`);
+    }
+  }
+
+  private async reportUnsentPendingSteers(chatId: string, run: ActiveRunState): Promise<void> {
+    const count = run.pendingSteers.length;
+    if (!count) {
+      return;
+    }
+    run.pendingSteers.splice(0);
+    await this.sender.sendText(
+      chatId,
+      count === 1
+        ? "当前 Codex 任务已结束，暂存的补充指令未发送。"
+        : `当前 Codex 任务已结束，${count} 条暂存的补充指令未发送。`,
+    );
+  }
+
+  private buildHostHealthInput(state: BridgeState): HostHealthCardInput {
+    const codex = probeCodexVersion(this.config.codexBin);
+    const warnings = mobileSafetyWarnings(this.config);
+    const status = codex.ok && warnings.length === 0 ? "ok" : codex.ok ? "warn" : "error";
+    return {
+      title: codex.ok ? "桥接服务在线，Codex CLI 可用。" : "桥接服务在线，但 Codex CLI 检查失败。",
+      status,
+      host: os.hostname(),
+      platform: `${os.platform()} ${os.arch()}`,
+      uptime: formatDuration(Date.now() - this.bridgeStartedAtMs),
+      queueDepth: [...this.queueDepths.values()].reduce((total, depth) => total + depth, 0),
+      activeRun: `${this.activeRuns.size}`,
+      approvalWait: `${this.activeApprovals.size}`,
+      codexBin: this.config.codexBin,
+      codexVersion: codex.version,
+      defaultCwd: this.config.codexWorkdir,
+      sandbox: this.config.codexSandbox,
+      approvalPolicy: this.config.codexApprovalPolicy,
+      runTimeout: formatTimeout(this.config.codexRunTimeoutMs),
+      approvalTimeout: formatTimeout(this.config.codexApprovalTimeoutMs),
+      access: formatAccessSummary(this.config),
+      statePath: this.config.bridgeStatePath,
+      attachmentDir: this.config.attachmentDownloadDir,
+      lastEvent: formatEventDiagnostic(state.diagnostics.lastEvent),
+      lastFailure: state.diagnostics.recentFailures?.at(-1)
+        ? formatRecentFailureLine(state.diagnostics.recentFailures.at(-1)!)
+        : undefined,
+      warnings,
+    };
   }
 
   private formatRuntimeStatusLines(chatId: string, state: BridgeState): string[] {
@@ -1070,6 +1411,12 @@ export class MessageRouter {
       },
     );
     return cardActionToast("success", "已把这次任务重新加入当前 chat 的 Codex 队列。");
+  }
+
+  private async handleRunDetailCardAction(action: IncomingCardAction): Promise<CardActionResponse> {
+    const kind = action.detailKind ?? "summary";
+    await this.sendRunDetail(action.chatId, kind);
+    return cardActionToast("success", "已发送最近一轮运行详情。");
   }
 
   private async handleProjectPageCardAction(
@@ -1666,11 +2013,300 @@ interface ProjectAggregate extends ProjectSelection {
   sortUpdatedMs: number;
 }
 
+interface LastRunBuildInput {
+  status: LastRunStatus;
+  cwd: string;
+  threadId?: string;
+  prompt: string;
+  startedAt: string;
+  completedAt: string;
+  summary?: CodexRunSummary;
+  finalText?: string;
+  errorText?: string;
+}
+
+function buildLastRunSummary(input: LastRunBuildInput): LastRunSummary {
+  const durationMs =
+    input.summary?.durationMs ?? Math.max(0, Date.parse(input.completedAt) - Date.parse(input.startedAt));
+  return {
+    id: `${Date.parse(input.completedAt) || Date.now()}`,
+    status: input.status,
+    cwd: input.cwd,
+    threadId: input.threadId,
+    promptPreview: truncateInline(input.prompt, 180),
+    startedAt: input.startedAt,
+    completedAt: input.completedAt,
+    durationMs,
+    finalTextPreview: input.finalText ? truncateDetail(input.finalText, 600) : undefined,
+    errorPreview: input.errorText ? truncateDetail(input.errorText, 600) : undefined,
+    review: toLastRunReviewSummary(input.summary, input.cwd),
+  };
+}
+
+function toLastRunReviewSummary(summary: CodexRunSummary | undefined, cwd: string): LastRunReviewSummary {
+  const changedFiles = normalizeChangedFiles(cwd, summary?.changedFiles ?? []);
+  return {
+    changedFiles,
+    diff: summary?.diff ? truncateDetail(summary.diff, 60_000) : undefined,
+    diffStat: summary?.diffStat,
+    fileChangeCount: summary?.fileChangeCount ?? 0,
+    commands: summary?.commands.map(toLastRunCommandSummary) ?? [],
+  };
+}
+
+function toLastRunCommandSummary(command: CodexCommandSummary): LastRunCommandSummary {
+  return {
+    command: truncateDetail(command.command, 800),
+    cwd: command.cwd,
+    status: command.status,
+    exitCode: command.exitCode,
+    durationMs: command.durationMs,
+    outputPreview: command.outputPreview ? truncateDetail(command.outputPreview, 4000) : undefined,
+  };
+}
+
+function runResultCardInput(lastRun: LastRunSummary): RunResultCardInput {
+  const changedFiles = normalizeChangedFiles(lastRun.cwd, lastRun.review.changedFiles);
+  const failedCommands = lastRun.review.commands.filter((command) =>
+    command.exitCode !== undefined && command.exitCode !== null
+      ? command.exitCode !== 0
+      : command.status === "failed",
+  );
+  return {
+    threadId: lastRun.threadId,
+    durationMs: lastRun.durationMs,
+    changedFileCount: changedFiles.length,
+    commandCount: lastRun.review.commands.length,
+    failedCommandCount: failedCommands.length,
+    diffAvailable: Boolean(lastRun.review.diff),
+    logsAvailable: lastRun.review.commands.length > 0,
+    filesPreview: changedFiles.slice(0, 3),
+    statusNote: lastRun.errorPreview ? truncateInline(lastRun.errorPreview, 80) : undefined,
+  };
+}
+
+function formatRunDetail(lastRun: LastRunSummary, kind: RunDetailKind): string {
+  if (kind === "files") {
+    const changedFiles = normalizeChangedFiles(lastRun.cwd, lastRun.review.changedFiles);
+    if (!changedFiles.length) {
+      return "最近一轮没有可展示的文件变更记录。";
+    }
+    return [
+      "**最近一轮变更文件**",
+      `状态：${lastRun.status}`,
+      `cwd：\`${lastRun.cwd}\``,
+      "",
+      ...changedFiles.map((file) => `- \`${file}\``),
+    ].join("\n");
+  }
+  if (kind === "diff") {
+    if (!lastRun.review.diff) {
+      return "最近一轮没有可展示的 diff。";
+    }
+    return [
+      "**最近一轮 diff**",
+      lastRun.review.diffStat ? `_${lastRun.review.diffStat}_` : null,
+      "",
+      "```diff",
+      lastRun.review.diff,
+      "```",
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n");
+  }
+  if (kind === "logs") {
+    if (!lastRun.review.commands.length) {
+      return "最近一轮没有可展示的命令日志。";
+    }
+    return [
+      "**最近一轮命令日志**",
+      ...lastRun.review.commands.map(formatRunCommandDetail),
+    ].join("\n\n");
+  }
+  return [
+    "**最近一轮运行摘要**",
+    `状态：${lastRun.status}`,
+    `cwd：\`${lastRun.cwd}\``,
+    lastRun.threadId ? `thread：\`${lastRun.threadId}\`` : null,
+    `耗时：${lastRun.durationMs !== undefined ? formatDuration(lastRun.durationMs) : "(unknown)"}`,
+    `完成：${lastRun.completedAt}`,
+    `prompt：${lastRun.promptPreview}`,
+    `文件：${normalizeChangedFiles(lastRun.cwd, lastRun.review.changedFiles).length}`,
+    `命令：${lastRun.review.commands.length}`,
+    lastRun.review.diffStat ? `diff：${lastRun.review.diffStat}` : null,
+    lastRun.errorPreview ? `错误：${lastRun.errorPreview}` : null,
+    lastRun.finalTextPreview ? `最终回复预览：${lastRun.finalTextPreview}` : null,
+  ]
+    .filter((line): line is string => line !== null)
+    .join("\n");
+}
+
+function normalizeChangedFiles(cwd: string, files: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const file of files) {
+    const displayPath = normalizeChangedFilePath(cwd, file);
+    if (!displayPath) {
+      continue;
+    }
+    const key = path.normalize(displayPath);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    normalized.push(displayPath);
+  }
+  return normalized.slice(0, 200);
+}
+
+function normalizeChangedFilePath(cwd: string, file: string): string {
+  const trimmed = file.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (!path.isAbsolute(trimmed)) {
+    return trimmed;
+  }
+  const relative = path.relative(cwd, trimmed);
+  if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+    return relative;
+  }
+  return trimmed;
+}
+
+function formatRunCommandDetail(command: LastRunCommandSummary, index: number): string {
+  const meta = [
+    command.cwd ? `cwd=${command.cwd}` : null,
+    command.status ? `status=${command.status}` : null,
+    command.exitCode !== undefined ? `exit=${command.exitCode ?? "null"}` : null,
+    command.durationMs !== undefined ? `duration=${formatDuration(command.durationMs)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return [
+    `**${index + 1}.** \`${command.command}\``,
+    meta || null,
+    command.outputPreview ? ["```text", command.outputPreview, "```"].join("\n") : null,
+  ]
+    .filter((line): line is string => line !== null)
+    .join("\n");
+}
+
+function formatHostHealth(input: HostHealthCardInput): string {
+  return [
+    "**Chat2Codex Host 健康卡**",
+    input.title,
+    "",
+    `host: ${input.host}`,
+    `platform: ${input.platform}`,
+    `uptime: ${input.uptime}`,
+    `queue: ${input.queueDepth}`,
+    `active_run: ${input.activeRun}`,
+    `approval_wait: ${input.approvalWait}`,
+    `codex: ${input.codexVersion}`,
+    `codex_bin: ${input.codexBin}`,
+    `default_cwd: ${input.defaultCwd}`,
+    `sandbox: ${input.sandbox}`,
+    `approval: ${input.approvalPolicy}`,
+    `run_timeout: ${input.runTimeout}`,
+    `approval_timeout: ${input.approvalTimeout}`,
+    `access: ${input.access}`,
+    `state: ${input.statePath}`,
+    `attachments: ${input.attachmentDir}`,
+    input.lastEvent ? `last_event: ${input.lastEvent}` : null,
+    input.lastFailure ? `last_failure: ${input.lastFailure}` : null,
+    ...input.warnings.map((warning) => `warning: ${warning}`),
+  ]
+    .filter((line): line is string => line !== null)
+    .join("\n");
+}
+
+function probeCodexVersion(codexBin: string): { ok: boolean; version: string } {
+  const result = spawnSync(codexBin, ["--version"], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  if (result.status === 0) {
+    return {
+      ok: true,
+      version: (result.stdout || result.stderr).trim() || "available",
+    };
+  }
+  return {
+    ok: false,
+    version: result.error?.message ?? ((result.stderr || result.stdout).trim() || "unavailable"),
+  };
+}
+
+function mobileSafetyWarnings(config: BridgeConfig): string[] {
+  const warnings: string[] = [];
+  if (config.access.allowGroups && config.access.allowedUserIds.length === 0) {
+    warnings.push("群聊已开启，但 ALLOWED_USER_IDS 为空；建议限制可操作审批和按钮的用户。");
+  }
+  if (config.access.allowGroups && config.codexApprovalPolicy === "never") {
+    warnings.push("群聊中使用 CODEX_APPROVAL_POLICY=never 风险较高，建议改为 on-request。");
+  }
+  if (config.access.allowGroups && config.codexRunTimeoutMs === 0) {
+    warnings.push("群聊中 CODEX_RUN_TIMEOUT_MS=0 会让任务无限等待，建议设置正整数。");
+  }
+  if (config.access.allowGroups && config.codexApprovalTimeoutMs === 0) {
+    warnings.push("群聊中 CODEX_APPROVAL_TIMEOUT_MS=0 会让审批无限等待，建议设置正整数。");
+  }
+  if (config.codexSandbox === "danger-full-access") {
+    warnings.push("当前 sandbox 是 danger-full-access；远程聊天入口建议使用 workspace-write。");
+  }
+  if (!path.isAbsolute(config.codexBin)) {
+    warnings.push("CODEX_BIN 不是绝对路径；后台服务环境可能找不到 Codex。");
+  }
+  return warnings;
+}
+
+function formatTimeout(value: number): string {
+  return value === 0 ? "disabled" : formatDuration(value);
+}
+
+function formatAccessSummary(config: BridgeConfig): string {
+  return [
+    config.access.allowDirectMessages ? "direct:on" : "direct:off",
+    config.access.allowGroups ? "groups:on" : "groups:off",
+    `allowed_chats=${config.access.allowedChatIds.length}`,
+    `allowed_users=${config.access.allowedUserIds.length}`,
+  ].join(" ");
+}
+
+function formatRecentFailureLine(failure: RecentFailureDiagnostic): string {
+  return [
+    failure.at,
+    failure.category,
+    failure.cwd ? `cwd=${failure.cwd}` : null,
+    failure.threadId ? `thread=${failure.threadId}` : null,
+    `detail=${failure.detail}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function truncateDetail(value: string, maxLength: number): string {
+  const normalized = value.trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 32).trimEnd()}\n... [truncated]`;
+}
+
 function formatError(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
   return String(error);
+}
+
+function formatSteerFailure(error: unknown): string {
+  const message = formatError(error);
+  if (/no active turn to steer|turn is not steerable|turn is no longer running|turn has already completed/i.test(message)) {
+    return "当前 Codex 任务暂时不能接收补充指令，可能还没进入可补充阶段或已经结束。";
+  }
+  return message;
 }
 
 function formatThreadUnavailable(selection: ThreadSelection): string {
@@ -1958,6 +2594,39 @@ function isStopCommand(message: IncomingTextMessage): boolean {
 
 function isStatusCommand(message: IncomingTextMessage): boolean {
   return routedText(message) === "/status";
+}
+
+function isHostCommand(message: IncomingTextMessage): boolean {
+  return routedText(message) === "/host" || routedText(message) === "/health";
+}
+
+function isSteerCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/steer" || text.startsWith("/steer ");
+}
+
+function detailCommandKind(message: IncomingTextMessage): RunDetailKind | null {
+  return parseDetailCommandKind(routedText(message));
+}
+
+function commandDetailKind(text: string): RunDetailKind {
+  return parseDetailCommandKind(text) ?? "summary";
+}
+
+function parseDetailCommandKind(text: string): RunDetailKind | null {
+  if (text === "/summary") {
+    return "summary";
+  }
+  if (text === "/files") {
+    return "files";
+  }
+  if (text === "/diff") {
+    return "diff";
+  }
+  if (text === "/logs") {
+    return "logs";
+  }
+  return null;
 }
 
 function defaultAttachmentPrompt(attachments: DownloadedAttachment[]): string {

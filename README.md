@@ -75,6 +75,9 @@ During a run, Chat2Codex sends a status card, updates that card at most once
 every 15 seconds, and sends the final Codex response as a rendered rich-text
 post. Click the card's stop button or send `/stop` to abort the active run.
 Failed and stopped cards include a retry button for re-running the same prompt.
+Completed cards include a compact run result and detail buttons for summary,
+changed files, diff, and command logs. The same details are available with
+`/summary`, `/files`, `/diff`, and `/logs`.
 If card creation or updates fail, it falls back to text progress replies.
 
 ### CLI Commands
@@ -84,7 +87,7 @@ If card creation or updates fail, it falls back to text progress replies.
 | `chat2codex` / `chat2codex start` | Start the Feishu/Lark bridge. |
 | `chat2codex setup --workdir <path>` | Create/connect a Feishu/Lark app and write `.env`. |
 | `chat2codex init --workdir <path>` | Create a starter `.env` when you already have an app. |
-| `chat2codex doctor` | Check `.env`, Node.js, Codex CLI, and workspace paths. |
+| `chat2codex doctor` | Check `.env`, Node.js, Codex CLI, workspace paths, and mobile/team-bot safety warnings. |
 | `chat2codex smoke [--mode turn\|approval]` | Verify the Codex app-server protocol locally. |
 | `chat2codex service print\|install\|uninstall` | Manage a user-level launchd/systemd service. |
 
@@ -96,13 +99,14 @@ when you need a separate bot instance.
 
 - Feishu/Lark long-connection bot, no public webhook server required.
 - One Codex session per chat.
-- `/status`, `/projects`, `/project <index|path>`, `/threads`, `/resume`,
-  `/new`, `/cd <path>`, `/stop`, and `/whoami` commands.
+- `/status`, `/host`, `/projects`, `/project <index|path>`, `/threads`,
+  `/resume`, `/new`, `/cd <path>`, `/stop`, `/steer`, `/summary`, `/files`,
+  `/diff`, `/logs`, and `/whoami` commands.
 - Local state in JSON.
 - Codex app-server JSON-RPC for machine-readable progress, final output, and
   approval callbacks.
 - Throttled run-status card updates while Codex is running, with stop/retry
-  buttons and text fallback.
+  buttons, completed-run detail buttons, and text fallback.
 - Feishu/Lark approval cards for Codex command/file-change approval requests.
   Buttons are generated from Codex's current approval decisions, including
   Approve, Approve session, Deny, and Cancel turn when those options are
@@ -112,6 +116,10 @@ when you need a separate bot instance.
 - Event diagnostics in logs and `/status` for recent routed/dropped messages.
 - Operational `/status` details for queue depth, active run age, approval wait
   age, and recent failures.
+- `/host` health card for the bridge host, Codex binary, default cwd, queue,
+  active run count, approval wait count, and mobile/team-bot safety warnings.
+- Runtime steering with `/steer <instruction>` for sending follow-up guidance to
+  the active Codex turn without waiting behind the chat queue.
 - Optional run and approval timeouts for unattended team bot deployments.
 - Team-bot friendly error summaries when Codex fails or cannot start.
 - Final Codex replies rendered as Feishu/Lark rich-text posts.
@@ -256,6 +264,7 @@ chat2codex service uninstall
 | Command | Effect |
 | --- | --- |
 | `/status` | Show current chat session, cwd, queue depth, active run age, approval wait age, recent failures, attachment directory, and recent event diagnostics. |
+| `/host` | Send a Host health card with Codex CLI availability, service paths, queue/approval counts, and mobile/team-bot safety warnings. `/health` is an alias. |
 | `/projects` | List projects discovered from Codex app-server threads, grouped by cwd. |
 | `/project <index\|path>` | Enter a listed project by number, or switch to a directory path, and start with no selected thread. |
 | `/threads` | List recent Codex conversations for the current project. `/sessions` is an alias. |
@@ -263,6 +272,11 @@ chat2codex service uninstall
 | `/new` | Start a fresh Codex conversation in the current project. |
 | `/cd <path>` | Change the current chat cwd and start a fresh Codex thread. |
 | `/stop` | Stop the active Codex run for the current chat. The running status card also has a stop button. |
+| `/steer <instruction>` | Send extra guidance to the active Codex run immediately, bypassing queued chat work. |
+| `/summary` | Show the most recent run summary for this chat. |
+| `/files` | Show changed files from the most recent run. |
+| `/diff` | Show the latest captured diff from the most recent run. |
+| `/logs` | Show command summaries and captured output previews from the most recent run. |
 | `/whoami` | Show the current `chat_id`, chat type, sender ids, and access decision. |
 
 ## Safety Defaults
@@ -278,6 +292,10 @@ only be handled by users listed in `ALLOWED_USER_IDS`.
 timeouts. For long-running background bots, set positive millisecond values so a
 stuck Codex turn or unattended approval request is cancelled and recorded in
 `/status` as a recent failure with a recovery hint.
+
+`chat2codex doctor` and `/host` both surface mobile/team-bot safety warnings,
+including relative `CODEX_BIN`, group chats without `ALLOWED_USER_IDS`,
+disabled run/approval timeouts, and high-risk sandbox settings.
 
 Direct messages are enabled by default. Group messages must mention the bot,
 and group chats are disabled by default until enabled with `ALLOW_GROUPS=true`

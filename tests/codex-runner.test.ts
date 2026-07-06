@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -316,6 +316,216 @@ process.on("SIGTERM", () => process.exit(0));
     }
   });
 
+  test("collects app-server run summaries and exposes steering control", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const fakeCodex = path.join(tempDir, "fake-codex.cjs");
+    const receivedPath = path.join(tempDir, "received.jsonl");
+    await writeFile(
+      fakeCodex,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const receivedPath = process.env.RECEIVED_PATH;
+const rl = readline.createInterface({ input: process.stdin });
+function send(message) { console.log(JSON.stringify(message)); }
+function remember(message) {
+  if (receivedPath) fs.appendFileSync(receivedPath, JSON.stringify(message) + "\\n");
+}
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  remember(message);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+    return;
+  }
+  if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+    return;
+  }
+  if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+    send({
+      method: "item/commandExecution/outputDelta",
+      params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "cmd_1", delta: "ok\\n" }
+    });
+    send({
+      method: "item/completed",
+      params: {
+        threadId: "thread_fake",
+        turnId: "turn_fake",
+        item: { type: "commandExecution", id: "cmd_1", command: "bun test", cwd: "/repo", status: "completed", exitCode: 0, durationMs: 42 }
+      }
+    });
+    send({
+      method: "item/fileChange/patchUpdated",
+      params: { threadId: "thread_fake", turnId: "turn_fake", changes: [{ path: "src/app.ts" }] }
+    });
+    send({
+      method: "turn/diff/updated",
+      params: { threadId: "thread_fake", turnId: "turn_fake", diff: "diff --git a/src/app.ts b/src/app.ts\\n+++ b/src/app.ts\\n@@\\n+hello\\n-old\\n" }
+    });
+    setTimeout(() => {
+      send({ method: "item/completed", params: { threadId: "thread_fake", turnId: "turn_fake", item: { type: "agentMessage", id: "msg_1", text: "done", phase: "final_answer", memoryCitation: null } } });
+      send({ method: "turn/completed", params: { threadId: "thread_fake", turn: { id: "turn_fake", items: [], itemsView: "full", status: "completed", error: null, startedAt: 1, completedAt: 2, durationMs: 100 } } });
+    }, 30);
+    return;
+  }
+  if (message.method === "turn/steer") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+});
+process.on("SIGTERM", () => process.exit(0));
+`,
+    );
+    await chmod(fakeCodex, 0o755);
+
+    const originalReceivedPath = process.env.RECEIVED_PATH;
+    try {
+      process.env.RECEIVED_PATH = receivedPath;
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "run command",
+        cwd: tempDir,
+        onRunControl: (control) => {
+          expect(control).toMatchObject({
+            threadId: "thread_fake",
+            turnId: "turn_fake",
+          });
+          void control.steer("please continue");
+        },
+      });
+
+      expect(result).toMatchObject({
+        threadId: "thread_fake",
+        finalText: "done",
+        exitCode: 0,
+        summary: {
+          durationMs: 100,
+          diffStat: "1 file(s), +1 -1",
+          changedFiles: ["src/app.ts"],
+          fileChangeCount: 1,
+          commands: [
+            {
+              command: "bun test",
+              cwd: "/repo",
+              status: "completed",
+              exitCode: 0,
+              durationMs: 42,
+              outputPreview: "ok",
+            },
+          ],
+        },
+      });
+      const received = await readJsonl(receivedPath);
+      expect(received).toContainEqual(
+        expect.objectContaining({
+          method: "turn/steer",
+          params: expect.objectContaining({
+            threadId: "thread_fake",
+            expectedTurnId: "turn_fake",
+          }),
+        }),
+      );
+    } finally {
+      if (originalReceivedPath === undefined) {
+        delete process.env.RECEIVED_PATH;
+      } else {
+        process.env.RECEIVED_PATH = originalReceivedPath;
+      }
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("retries app-server steering while the active turn is still settling", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const fakeCodex = path.join(tempDir, "fake-codex.cjs");
+    const receivedPath = path.join(tempDir, "received.jsonl");
+    await writeFile(
+      fakeCodex,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const receivedPath = process.env.RECEIVED_PATH;
+const rl = readline.createInterface({ input: process.stdin });
+let steerAttempts = 0;
+function send(message) { console.log(JSON.stringify(message)); }
+function remember(message) {
+  if (receivedPath) fs.appendFileSync(receivedPath, JSON.stringify(message) + "\\n");
+}
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  remember(message);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+    return;
+  }
+  if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+    return;
+  }
+  if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+    return;
+  }
+  if (message.method === "turn/steer") {
+    steerAttempts += 1;
+    if (steerAttempts === 1) {
+      send({ id: message.id, error: { code: -32000, message: "no active turn to steer" } });
+      return;
+    }
+    send({ id: message.id, result: {} });
+    send({ method: "item/completed", params: { threadId: "thread_fake", turnId: "turn_fake", item: { type: "agentMessage", id: "msg_1", text: "done", phase: "final_answer", memoryCitation: null } } });
+    send({ method: "turn/completed", params: { threadId: "thread_fake", turn: { id: "turn_fake", items: [], itemsView: "full", status: "completed", error: null, startedAt: 1, completedAt: 2, durationMs: 100 } } });
+    return;
+  }
+});
+process.on("SIGTERM", () => process.exit(0));
+`,
+    );
+    await chmod(fakeCodex, 0o755);
+
+    const originalReceivedPath = process.env.RECEIVED_PATH;
+    try {
+      process.env.RECEIVED_PATH = receivedPath;
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let steerPromise: Promise<void> | undefined;
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "run command",
+        cwd: tempDir,
+        onRunControl: (control) => {
+          steerPromise = control.steer("please continue");
+        },
+      });
+
+      await expect(steerPromise).resolves.toBeUndefined();
+      expect(result).toMatchObject({
+        threadId: "thread_fake",
+        finalText: "done",
+        exitCode: 0,
+      });
+      const received = await readJsonl(receivedPath);
+      expect(received.filter((message) => message.method === "turn/steer")).toHaveLength(2);
+    } finally {
+      if (originalReceivedPath === undefined) {
+        delete process.env.RECEIVED_PATH;
+      } else {
+        process.env.RECEIVED_PATH = originalReceivedPath;
+      }
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("treats a cancelled app-server approval as a cancelled run", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
     const fakeCodex = path.join(tempDir, "fake-codex.cjs");
@@ -385,3 +595,11 @@ process.on("SIGTERM", () => process.exit(0));
     }
   });
 });
+
+async function readJsonl(filePath: string): Promise<unknown[]> {
+  const content = await readFile(filePath, "utf8").catch(() => "");
+  return content
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as unknown);
+}

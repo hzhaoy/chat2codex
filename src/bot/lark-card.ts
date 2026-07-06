@@ -10,7 +10,9 @@ import {
   runCardActionApp,
   resumeThreadCardAction,
   selectProjectCardAction,
+  showRunDetailCardAction,
   stopRunCardActionValue,
+  type RunDetailKind,
 } from "./lark-card-action.js";
 
 export type RunStatusCardStatus = "running" | "success" | "failed" | "stopped";
@@ -23,6 +25,19 @@ export interface RunStatusCardInput {
   prompt: string;
   startedAt: string;
   updatedAt?: string;
+  result?: RunResultCardInput;
+}
+
+export interface RunResultCardInput {
+  threadId?: string;
+  durationMs?: number;
+  changedFileCount?: number;
+  commandCount?: number;
+  failedCommandCount?: number;
+  diffAvailable?: boolean;
+  logsAvailable?: boolean;
+  filesPreview?: string[];
+  statusNote?: string;
 }
 
 export interface ApprovalCardInput {
@@ -129,10 +144,17 @@ export function buildRunStatusCard(input: RunStatusCardInput): LarkInteractiveCa
     },
   ];
 
+  if (input.result) {
+    elements.push(resultSummaryElement(input.result));
+  }
+
   if (input.status === "running") {
     elements.push(stopActionElement());
   } else if (input.status === "failed" || input.status === "stopped") {
     elements.push(retryActionElement());
+  }
+  if (input.status !== "running" && input.result) {
+    elements.push(runDetailActionElement(input.result));
   }
 
   elements.push({
@@ -158,6 +180,92 @@ export function buildRunStatusCard(input: RunStatusCardInput): LarkInteractiveCa
       title: {
         tag: "plain_text",
         content: meta.title,
+      },
+    },
+    elements,
+  };
+}
+
+export interface HostHealthCardInput {
+  title: string;
+  status: "ok" | "warn" | "error";
+  host: string;
+  platform: string;
+  uptime: string;
+  queueDepth: number;
+  activeRun: string;
+  approvalWait: string;
+  codexBin: string;
+  codexVersion: string;
+  defaultCwd: string;
+  sandbox: string;
+  approvalPolicy: string;
+  runTimeout: string;
+  approvalTimeout: string;
+  access: string;
+  statePath: string;
+  attachmentDir: string;
+  lastEvent?: string;
+  lastFailure?: string;
+  warnings: string[];
+}
+
+export function buildHostHealthCard(input: HostHealthCardInput): LarkInteractiveCard {
+  const template = input.status === "ok" ? "green" : input.status === "warn" ? "yellow" : "red";
+  const elements: Array<Record<string, unknown>> = [
+    {
+      tag: "div",
+      text: plain(input.title, 500),
+    },
+    {
+      tag: "div",
+      fields: [
+        field("host", input.host, 120),
+        field("platform", input.platform, 120),
+        field("uptime", input.uptime, 80),
+        field("queue", String(input.queueDepth), 40),
+        field("active_run", input.activeRun, 160),
+        field("approval_wait", input.approvalWait, 160),
+        field("codex", input.codexVersion, 160),
+        field("codex_bin", input.codexBin, 180),
+        field("default_cwd", input.defaultCwd, 220),
+        field("sandbox", input.sandbox, 90),
+        field("approval", input.approvalPolicy, 90),
+        field("run_timeout", input.runTimeout, 90),
+        field("approval_timeout", input.approvalTimeout, 90),
+        field("access", input.access, 180),
+        field("state", input.statePath, 220),
+        field("attachments", input.attachmentDir, 220),
+      ],
+    },
+  ];
+
+  if (input.lastEvent || input.lastFailure || input.warnings.length) {
+    elements.push({ tag: "hr" });
+    elements.push({
+      tag: "div",
+      text: markdown(
+        [
+          input.lastEvent ? `**last_event** ${escapeLarkMarkdown(input.lastEvent)}` : null,
+          input.lastFailure ? `**last_failure** ${escapeLarkMarkdown(input.lastFailure)}` : null,
+          ...input.warnings.map((warning) => `**warning** ${escapeLarkMarkdown(warning)}`),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      ),
+    });
+  }
+
+  return {
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      template,
+      title: {
+        tag: "plain_text",
+        content: "Chat2Codex Host 健康卡",
       },
     },
     elements,
@@ -239,7 +347,7 @@ export function buildProjectListCard(input: ProjectListCardInput): LarkInteracti
       elements: [
         {
           tag: "plain_text",
-          content: `Selected project: ${compactPath(selectedProject.cwd, 90)}`,
+          content: `已选择项目：${compactPath(selectedProject.cwd, 90)}`,
         },
       ],
     });
@@ -333,7 +441,7 @@ export function buildSessionListCard(input: SessionListCardInput): LarkInteracti
       elements: [
         {
           tag: "plain_text",
-          content: `Selected session: ${truncate(selectedSession.title ?? selectedSession.threadId, 120)}`,
+          content: `已选择会话：${truncate(selectedSession.title ?? selectedSession.threadId, 120)}`,
         },
       ],
     });
@@ -455,6 +563,49 @@ function retryActionElement(): Record<string, unknown> {
         },
       },
     ],
+  };
+}
+
+function resultSummaryElement(result: RunResultCardInput): Record<string, unknown> {
+  const lines = [
+    result.threadId ? `thread: ${shortThreadId(result.threadId)}` : null,
+    result.durationMs !== undefined ? `duration: ${formatDuration(result.durationMs)}` : null,
+    `files: ${result.changedFileCount ?? 0}`,
+    `commands: ${result.commandCount ?? 0}`,
+    result.failedCommandCount ? `failed_commands: ${result.failedCommandCount}` : null,
+    result.diffAvailable ? "diff: available" : null,
+    result.statusNote ? `note: ${result.statusNote}` : null,
+    result.filesPreview?.length ? `changed: ${result.filesPreview.map((file) => `\`${compactPath(file, 48)}\``).join(", ")}` : null,
+  ].filter(Boolean);
+  return {
+    tag: "div",
+    text: markdown(["**本轮结果**", ...lines.map((line) => String(line))].join("\n")),
+  };
+}
+
+function runDetailActionElement(result: RunResultCardInput): Record<string, unknown> {
+  const detailActions: Array<{ kind: RunDetailKind; label: string; disabled?: boolean }> = [
+    { kind: "summary", label: "摘要" },
+    { kind: "files", label: "文件", disabled: !result.changedFileCount },
+    { kind: "diff", label: "Diff", disabled: !result.diffAvailable },
+    { kind: "logs", label: "日志", disabled: !result.logsAvailable },
+  ];
+  return {
+    tag: "action",
+    actions: detailActions
+      .filter((action) => !action.disabled)
+      .map((action) => ({
+        tag: "button",
+        text: {
+          tag: "plain_text",
+          content: action.label,
+        },
+        value: {
+          app: runCardActionApp,
+          action: showRunDetailCardAction,
+          detailKind: action.kind,
+        },
+      })),
   };
 }
 
@@ -893,6 +1044,19 @@ function truncate(value: string, maxLength: number): string {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) {
+    return `${ms}ms`;
+  }
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
 }
 
 function escapeLarkMarkdown(value: string): string {

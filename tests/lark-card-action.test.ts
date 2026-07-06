@@ -91,6 +91,35 @@ describe("Lark card action adaptation", () => {
     });
   });
 
+  test("adapts run detail button callbacks", () => {
+    const action = adaptLarkCardActionEvent({
+      context: {
+        open_chat_id: "oc_chat",
+        open_message_id: "om_result",
+      },
+      operator: {
+        open_id: "ou_sender",
+      },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: "show_run_detail",
+          detailKind: "diff",
+        },
+      },
+    });
+
+    expect(action).toMatchObject({
+      action: "show_run_detail",
+      chatId: "oc_chat",
+      messageId: "om_result",
+      detailKind: "diff",
+      sender: {
+        openId: "ou_sender",
+      },
+    });
+  });
+
   test("adapts approval button callbacks", () => {
     const action = adaptLarkCardActionEvent({
       context: {
