@@ -1,0 +1,49 @@
+CHANGELOG.md
+  s_068a42a4e802b0::t_22adebbdb056d5 8-17
+CONTRIBUTING.md
+  s_068a42a4e802b0::t_cbafd39687dcfd 3-4,6-14,24-137,140-155,166-192,197-200
+README.md
+  s_068a42a4e802b0::t_5b96776b952949 78-80,90,102-104,109,119-122,267,275-279,296-299
+README.zh-CN.md
+  s_068a42a4e802b0::t_d2f52b43f42565 56,65,75,78,83-84,200,208-212,223-224
+src/agent/codex-runner.ts
+  s_068a42a4e802b0::t_d290156092cdff 7-8,16,26-50,243-244,320,341-363,432-444,482,642,832-955,1142-1199,1238-1248
+src/bot/lark-card-action.ts
+  s_068a42a4e802b0::t_ea1c9fef843d0b 11,28-29,31,40,111,140-141,148-155
+src/bot/lark-card.ts
+  s_068a42a4e802b0::t_cdba0510a80312 13,15,28-40,147-150,156-158,189-274,350,444,569-611,1049-1061
+src/bot/message-router.ts
+  s_068a42a4e802b0::t_55efe12c13d9eb 1,3,9,12,15,27-30,54,58,62,66,68,74-76,156-158,168-176,179,183,234-238,244-253,275-277,362-373,461,502-507,515-526,534-535,543-544,547-557,575-576,584-594,601-602,649-660,667-668,679,706-719,726-727,807-808,810-812,814-815,818-833,848,857-863,880-1077,1416-1421,2016-2296,2304-2311,2599-2631
+src/cli.ts
+  s_068a42a4e802b0::t_c90d72866603f3 213,216-217,236,428-481
+src/state/types.ts
+  s_068a42a4e802b0::t_8d4454e03edf7a 8,30-62
+tests/cli.test.ts
+  s_068a42a4e802b0::t_26d1aac0e09320 72-139
+tests/codex-runner.test.ts
+  s_068a42a4e802b0::t_8e1faf26f5d847 2,319-528,598-605
+tests/lark-card-action.test.ts
+  s_068a42a4e802b0::t_97867f6cd236cd 94-122
+tests/lark-card.test.ts
+  s_068a42a4e802b0::t_a61122f63716bd 5,109-170,322,427
+tests/message-router.test.ts
+  s_068a42a4e802b0::t_80f82675d9cde5 10,125-138,352-482,579-609,929,1426-1627
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "1cf1ecd31bcaad656a673de6a3e012a3ec8ea12a",
+  "prompts": {},
+  "sessions": {
+    "s_068a42a4e802b0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3540-5afc-7c60-9044-6fcac4d7f256",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
