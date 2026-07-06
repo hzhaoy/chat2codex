@@ -7,6 +7,8 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-06
+
 ### Added
 
 - Completed run cards now include compact run results and detail buttons for
