@@ -1,0 +1,21 @@
+package.json
+  s_068a42a4e802b0::t_e9ca1cdcc935b2 45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "be9640b8f2ee1f7ffc04cccfa38d0d61b7cbdbd9",
+  "prompts": {},
+  "sessions": {
+    "s_068a42a4e802b0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3540-5afc-7c60-9044-6fcac4d7f256",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
