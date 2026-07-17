@@ -7,6 +7,8 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.4.0 - 2026-07-17
+
 ### Added
 
 - New chat commands: `/history`, `/search <term>`, `/fork`, and `/compact` for
