@@ -3,9 +3,11 @@
 This checklist is for maintainers publishing Chat2Codex to npm and GitHub.
 
 Publishing is triggered by pushing a `v*` git tag. The GitHub Actions workflow
-verifies that the tag name matches `package.json` exactly, publishes the npm
-package, and then creates the corresponding GitHub Release as the latest
-release.
+verifies that the tag name matches `package.json` exactly, requires a matching
+non-empty `CHANGELOG.md` version section, publishes the npm package, and then
+creates the corresponding GitHub Release as the latest release. Release notes
+use the changelog's Added, Changed, and Fixed sections and retain a full compare
+link to the previous version.
 
 ## Prepare the release
 
@@ -32,7 +34,9 @@ release.
    create git release metadata before the changelog and release checks are done.
 
 4. Move the relevant `CHANGELOG.md` entries from `Unreleased` to the new version
-   heading.
+   heading. This version section becomes the GitHub Release body, so keep it
+   non-empty and organize the user-visible changes under headings such as
+   `Added`, `Changed`, and `Fixed`.
 
    ```md
    ## Unreleased
@@ -77,7 +81,8 @@ release.
    ```
 
 2. Watch the `Publish to npm` workflow. It publishes the npm package first and
-   then creates the GitHub Release from the same verified tag.
+   then creates the GitHub Release from the same verified tag and matching
+   changelog section.
 
    ```sh
    gh run list --limit 5
@@ -99,7 +104,9 @@ release.
   reuse the version. Create the missing release from the existing tag instead:
 
   ```sh
-  gh release create v<version> --verify-tag --generate-notes --latest
+  node scripts/render-release-notes.mjs v<version> > /tmp/chat2codex-release-notes.md
+  gh release create v<version> --verify-tag --title v<version> \
+    --notes-file /tmp/chat2codex-release-notes.md --latest
   ```
 
 - If npm publication itself failed before the version was accepted, fix the

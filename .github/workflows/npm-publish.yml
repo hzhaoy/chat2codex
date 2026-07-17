@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -35,6 +37,9 @@ jobs:
         run: |
           node -e "const p=require('./package.json'); const expected='v'+p.version; const actual=process.env.GITHUB_REF_NAME; if (actual !== expected) { throw new Error('Tag '+actual+' does not match package version '+expected); }"
 
+      - name: Prepare GitHub Release notes
+        run: node scripts/render-release-notes.mjs "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
+
       - name: Run checks
         run: bun run check
 
@@ -47,4 +52,4 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --latest
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" --latest

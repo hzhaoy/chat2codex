@@ -7,6 +7,12 @@ numbers once releases are published.
 
 ## Unreleased
 
+### Changed
+
+- GitHub Releases now use the matching `CHANGELOG.md` version section for
+  structured Added, Changed, and Fixed notes while retaining the full compare
+  link.
+
 ## 0.4.0 - 2026-07-17
 
 ### Added
