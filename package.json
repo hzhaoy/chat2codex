@@ -59,7 +59,7 @@
     "@types/node": "^26.0.1",
     "@types/proper-lockfile": "^4.1.4",
     "@types/qrcode-terminal": "^0.12.2",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "overrides": {
     "axios": "^1.16.0"
