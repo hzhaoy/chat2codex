@@ -3,6 +3,7 @@ import readline from "node:readline";
 
 import type { BridgeConfig } from "../config/env.js";
 import type { Logger } from "../util/logger.js";
+import { buildCodexChildEnv } from "./codex-environment.js";
 
 const appServerSteerRetryDelaysMs = [0, 100, 250, 500, 1000, 1500];
 
@@ -125,6 +126,80 @@ export interface CodexThreadListResult {
   backwardsCursor?: string | null;
 }
 
+export interface CodexThreadSearchInput {
+  searchTerm: string;
+  limit?: number;
+  cursor?: string;
+  archived?: boolean | null;
+  sortKey?: "created_at" | "updated_at";
+  sortDirection?: "asc" | "desc";
+}
+
+export interface CodexThreadSearchResultItem {
+  thread: CodexThread;
+  snippet?: string;
+}
+
+export interface CodexThreadSearchResult {
+  results: CodexThreadSearchResultItem[];
+  nextCursor?: string | null;
+  backwardsCursor?: string | null;
+}
+
+export interface CodexThreadTurnListInput {
+  threadId: string;
+  limit?: number;
+  cursor?: string;
+  sortDirection?: "asc" | "desc";
+  itemsView?: "notLoaded" | "summary" | "full";
+}
+
+export interface CodexThreadTurnListResult {
+  turns: CodexThreadTurn[];
+  nextCursor?: string | null;
+  backwardsCursor?: string | null;
+}
+
+export interface CodexThreadTurnItemListInput {
+  threadId: string;
+  turnId: string;
+  limit?: number;
+  cursor?: string;
+  sortDirection?: "asc" | "desc";
+}
+
+export interface CodexThreadTurnItemListResult {
+  items: CodexThreadItem[];
+  nextCursor?: string | null;
+  backwardsCursor?: string | null;
+}
+
+export interface CodexThreadTurn {
+  id: string;
+  status: string;
+  startedAt?: number | null;
+  completedAt?: number | null;
+  durationMs?: number | null;
+  items: CodexThreadItem[];
+}
+
+export interface CodexThreadItem {
+  id: string;
+  type: string;
+  text?: string;
+  command?: string;
+  cwd?: string;
+  status?: string;
+  exitCode?: number | null;
+  durationMs?: number | null;
+  files?: string[];
+}
+
+export interface CodexForkThreadInput {
+  threadId: string;
+  cwd?: string;
+}
+
 interface JsonRpcRequest {
   [key: string]: unknown;
   id: unknown;
@@ -186,6 +261,99 @@ export class CodexRunner {
     return thread ? markThreadResumability(thread, this.appServerCliVersion) : null;
   }
 
+  async searchThreads(input: CodexThreadSearchInput): Promise<CodexThreadSearchResult> {
+    const result = await this.requestAppServer("thread/search", {
+      searchTerm: input.searchTerm,
+      limit: input.limit ?? 20,
+      sortKey: input.sortKey ?? "updated_at",
+      sortDirection: input.sortDirection ?? "desc",
+      sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"],
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+      ...(input.archived !== undefined ? { archived: input.archived } : {}),
+    });
+    const record = asRecord(result);
+    return {
+      results: parseThreadSearchResults(record?.data).map((item) => ({
+        ...item,
+        thread: markThreadResumability(item.thread, this.appServerCliVersion),
+      })),
+      nextCursor: getString(record, "nextCursor") ?? null,
+      backwardsCursor: getString(record, "backwardsCursor") ?? null,
+    };
+  }
+
+  async listThreadTurns(input: CodexThreadTurnListInput): Promise<CodexThreadTurnListResult> {
+    const result = await this.requestAppServer("thread/turns/list", {
+      threadId: input.threadId,
+      limit: input.limit ?? 10,
+      sortDirection: input.sortDirection ?? "desc",
+      itemsView: input.itemsView ?? "summary",
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+    });
+    const record = asRecord(result);
+    return {
+      turns: parseThreadTurns(record?.data),
+      nextCursor: getString(record, "nextCursor") ?? null,
+      backwardsCursor: getString(record, "backwardsCursor") ?? null,
+    };
+  }
+
+  async listTurnItems(input: CodexThreadTurnItemListInput): Promise<CodexThreadTurnItemListResult> {
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+
+    while (true) {
+      const result = await this.requestAppServer("thread/turns/list", {
+        threadId: input.threadId,
+        limit: 100,
+        sortDirection: "desc",
+        itemsView: "full",
+        ...(cursor ? { cursor } : {}),
+      });
+      const record = asRecord(result);
+      const turn = parseThreadTurns(record?.data).find((item) => item.id === input.turnId);
+      if (turn) {
+        return {
+          items: turn.items,
+          nextCursor: null,
+          backwardsCursor: null,
+        };
+      }
+
+      const nextCursor = getString(record, "nextCursor");
+      if (!nextCursor || seenCursors.has(nextCursor)) {
+        return {
+          items: [],
+          nextCursor: null,
+          backwardsCursor: null,
+        };
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+  }
+
+  async forkThread(input: CodexForkThreadInput): Promise<CodexThread> {
+    const result = await this.requestAppServer("thread/fork", {
+      threadId: input.threadId,
+      excludeTurns: true,
+      cwd: input.cwd ?? null,
+      approvalPolicy: this.config.codexApprovalPolicy,
+      approvalsReviewer: "user",
+      sandbox: this.config.codexSandbox,
+      ...(this.config.codexModel ? { model: this.config.codexModel } : {}),
+    });
+    const thread = parseCodexThread(asRecord(result)?.thread);
+    if (!thread) {
+      throw new Error("Codex app-server did not return a forked thread.");
+    }
+    return markThreadResumability(thread, this.appServerCliVersion);
+  }
+
+  async compactThread(threadId: string): Promise<void> {
+    await this.requestAppServer("thread/compact/start", { threadId });
+  }
+
   async run(input: CodexRunInput): Promise<CodexRunResult> {
     if (input.signal?.aborted) {
       return {
@@ -210,7 +378,7 @@ export class CodexRunner {
     const child = spawn(this.config.codexBin, args, {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: buildCodexChildEnv(),
     });
 
     let forceKillTimer: NodeJS.Timeout | null = null;
@@ -327,7 +495,10 @@ export class CodexRunner {
         }
       }
       if (message.method === "error") {
-        turnError = getString(message.params, "message") ?? "Codex reported an error.";
+        if (message.params?.willRetry !== true) {
+          turnError =
+            getString(asRecord(message.params?.error), "message") ?? "Codex reported an error.";
+        }
         this.logger.warn("Codex emitted an error notification", message);
       }
       if (message.method === "item/completed") {
@@ -517,7 +688,7 @@ export class CodexRunner {
     const child = spawn(this.config.codexBin, buildCodexAppServerArgs(), {
       cwd: this.config.codexWorkdir,
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: buildCodexChildEnv(),
     });
     const stdoutReader = readline.createInterface({ input: child.stdout });
     let stderr = "";
@@ -1034,6 +1205,25 @@ function parseCodexThreads(value: unknown): CodexThread[] {
   });
 }
 
+function parseThreadSearchResults(value: unknown): CodexThreadSearchResultItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    const record = asRecord(item);
+    const thread = parseCodexThread(record?.thread);
+    if (!thread) {
+      return [];
+    }
+    return [
+      {
+        thread,
+        snippet: getString(record, "snippet"),
+      },
+    ];
+  });
+}
+
 function parseCodexThread(value: unknown): CodexThread | null {
   const record = asRecord(value);
   const id = getString(record, "id");
@@ -1054,6 +1244,120 @@ function parseCodexThread(value: unknown): CodexThread | null {
     path: getNullableString(record, "path"),
     cliVersion: getString(record, "cliVersion"),
   };
+}
+
+function parseThreadTurns(value: unknown): CodexThreadTurn[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    const turn = parseThreadTurn(item);
+    return turn ? [turn] : [];
+  });
+}
+
+function parseThreadTurn(value: unknown): CodexThreadTurn | null {
+  const record = asRecord(value);
+  const id = getString(record, "id");
+  const status = getString(record, "status");
+  if (!id || !status) {
+    return null;
+  }
+  return {
+    id,
+    status,
+    startedAt: getNullableNumber(record, "startedAt"),
+    completedAt: getNullableNumber(record, "completedAt"),
+    durationMs: getNullableNumber(record, "durationMs"),
+    items: parseThreadItems(record?.items),
+  };
+}
+
+function parseThreadItems(value: unknown): CodexThreadItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    const parsed = parseThreadItem(item);
+    return parsed ? [parsed] : [];
+  });
+}
+
+function parseThreadItem(value: unknown): CodexThreadItem | null {
+  const record = asRecord(value);
+  const id = getString(record, "id");
+  const type = getString(record, "type");
+  if (!record || !id || !type) {
+    return null;
+  }
+  return {
+    id,
+    type,
+    text: threadItemText(record, type),
+    command: getString(record, "command"),
+    cwd: getString(record, "cwd"),
+    status: getString(record, "status"),
+    exitCode: getNullableNumber(record, "exitCode"),
+    durationMs: getNullableNumber(record, "durationMs"),
+    files: threadItemFiles(record),
+  };
+}
+
+function threadItemText(record: Record<string, unknown>, type: string): string | undefined {
+  if (type === "userMessage") {
+    return userInputText(record.content);
+  }
+  return getString(record, "text") ?? stringArrayText(record.summary) ?? stringArrayText(record.content);
+}
+
+function userInputText(value: unknown): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const parts = value.flatMap((item) => {
+    const record = asRecord(item);
+    const type = getString(record, "type");
+    if (type === "text") {
+      const text = getString(record, "text");
+      return text ? [text] : [];
+    }
+    if (type === "localImage") {
+      const imagePath = getString(record, "path");
+      return imagePath ? [`[image] ${imagePath}`] : ["[image]"];
+    }
+    if (type === "image") {
+      const url = getString(record, "url");
+      return url ? [`[image] ${url}`] : ["[image]"];
+    }
+    if (type === "skill" || type === "mention") {
+      const name = getString(record, "name");
+      return name ? [`[${type}] ${name}`] : [`[${type}]`];
+    }
+    return [];
+  });
+  return cleanJoinedText(parts);
+}
+
+function stringArrayText(value: unknown): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return cleanJoinedText(value.filter((item): item is string => typeof item === "string"));
+}
+
+function cleanJoinedText(parts: string[]): string | undefined {
+  const normalized = parts.join("\n").replace(/\n{3,}/gu, "\n\n").trim();
+  return normalized || undefined;
+}
+
+function threadItemFiles(record: Record<string, unknown>): string[] | undefined {
+  const changes = Array.isArray(record.changes) ? record.changes : [];
+  const files = changes.flatMap((change) => {
+    const item = asRecord(change);
+    const filePath = getString(item, "path");
+    return filePath ? [filePath] : [];
+  });
+  return files.length ? [...new Set(files)] : undefined;
 }
 
 function markThreadResumability(

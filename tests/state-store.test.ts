@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -10,8 +10,14 @@ describe("JsonStateStore", () => {
   test("loads empty state when no file exists and persists state atomically", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
     try {
-      const store = new JsonStateStore(path.join(tempDir, "nested", "state.json"));
-      expect(await store.load()).toEqual({ chats: {}, processedMessageIds: [], diagnostics: {} });
+      const stateDirectory = path.join(tempDir, "nested");
+      const store = new JsonStateStore(path.join(stateDirectory, "state.json"));
+      expect(await store.load()).toEqual({
+        chats: {},
+        pendingMessages: {},
+        processedMessageIds: [],
+        diagnostics: {},
+      });
 
       await store.save({
         chats: {
@@ -21,6 +27,7 @@ describe("JsonStateStore", () => {
             threadId: "thread_1",
           },
         },
+        pendingMessages: {},
         processedMessageIds: Array.from({ length: 510 }, (_, index) => `m${index}`),
         diagnostics: {
           lastEvent: {
@@ -54,6 +61,64 @@ describe("JsonStateStore", () => {
       expect(loaded.diagnostics.recentFailures).toHaveLength(5);
       expect(loaded.diagnostics.recentFailures?.[0]?.detail).toBe("failure 2");
       expect(loaded.diagnostics.recentFailures?.at(-1)?.detail).toBe("failure 6");
+
+      if (process.platform !== "win32") {
+        expect((await stat(stateDirectory)).mode & 0o777).toBe(0o700);
+        expect((await stat(path.join(stateDirectory, "state.json"))).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not change permissions on an existing parent directory", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const stateDirectory = path.join(tempDir, "existing");
+    try {
+      await mkdir(stateDirectory, { mode: 0o755 });
+      await chmod(stateDirectory, 0o755);
+      const store = new JsonStateStore(path.join(stateDirectory, "state.json"));
+      await store.save({
+        chats: {},
+        pendingMessages: {},
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      if (process.platform !== "win32") {
+        expect((await stat(stateDirectory)).mode & 0o777).toBe(0o755);
+        expect((await stat(path.join(stateDirectory, "state.json"))).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes concurrent saves targeting the same state file", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const statePath = path.join(tempDir, "nested", "state.json");
+    try {
+      const stores = [new JsonStateStore(statePath), new JsonStateStore(statePath)];
+      const saves = Array.from({ length: 50 }, (_, index) =>
+        stores[index % stores.length]!.save({
+          chats: {
+            oc_chat: {
+              cwd: tempDir,
+              updatedAt: `2026-06-29T00:00:${String(index).padStart(2, "0")}.000Z`,
+              threadId: `thread_${index}`,
+            },
+          },
+          pendingMessages: {},
+          processedMessageIds: [`m${index}`],
+          diagnostics: {},
+        }),
+      );
+
+      await Promise.all(saves);
+
+      const loaded = await stores[0]!.load();
+      expect(loaded.chats.oc_chat?.threadId).toBe("thread_49");
+      expect(loaded.processedMessageIds).toEqual(["m49"]);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

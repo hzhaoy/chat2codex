@@ -5,8 +5,10 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
+import { buildCodexChildEnv } from "../agent/codex-environment.js";
+
 type SmokeMode = "handshake" | "turn" | "approval";
-type ApprovalPolicy = "untrusted" | "on-request" | "on-failure" | "never";
+type ApprovalPolicy = "untrusted" | "on-request" | "never";
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 
@@ -225,7 +227,7 @@ class AppServerSmokeSession {
   async start(): Promise<void> {
     this.child = spawn(this.codexBin, ["app-server", "--stdio"], {
       cwd: this.cwd,
-      env: process.env,
+      env: buildCodexChildEnv(),
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.reader = readline.createInterface({ input: this.child.stdout });
@@ -456,7 +458,7 @@ function parseArgs(argv: string[]): SmokeOptions {
     if (arg === "--approval-policy") {
       const approvalPolicy = parseApprovalPolicy(requireValue(argv, ++index, arg));
       if (!approvalPolicy) {
-        throw new Error("--approval-policy must be untrusted, on-request, on-failure, or never.");
+        throw new Error("--approval-policy must be untrusted, on-request, or never.");
       }
       options.approvalPolicy = approvalPolicy;
       continue;
@@ -529,7 +531,7 @@ function parseMode(value: string | undefined): SmokeMode | null {
 }
 
 function parseApprovalPolicy(value: string | undefined): ApprovalPolicy | null {
-  if (value === "untrusted" || value === "on-request" || value === "on-failure" || value === "never") {
+  if (value === "untrusted" || value === "on-request" || value === "never") {
     return value;
   }
   return null;
@@ -563,7 +565,10 @@ function parsePositiveInt(value: string | undefined): number | null {
 }
 
 function commandOutput(command: string, args: string[]): string {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    env: buildCodexChildEnv(),
+  });
   if (result.status !== 0) {
     throw new Error(
       `Failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout || "unknown error"}`,

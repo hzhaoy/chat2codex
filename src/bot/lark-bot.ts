@@ -112,11 +112,13 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
         config.attachmentDownloadDir,
         sanitizePathSegment(message.messageId),
       );
-      await fs.mkdir(directory, { recursive: true });
+      await ensurePrivateDirectory(config.attachmentDownloadDir);
+      await ensurePrivateDirectory(directory);
 
       const fileName = buildAttachmentFileName(attachment, response.headers);
       const filePath = path.join(directory, fileName);
       await response.writeFile(filePath);
+      await fs.chmod(filePath, 0o600);
       return {
         kind: attachment.kind,
         name: attachment.name ?? fileName,
@@ -212,7 +214,7 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
 
       await router.recordEventDiagnostic("routed", diagnostic);
       logRoutedEvent(logger, diagnostic);
-      router.enqueue(incoming);
+      await router.accept(incoming);
     },
     "card.action.trigger": async (event: unknown) => {
       const action = adaptLarkCardActionEvent(event);
@@ -243,6 +245,13 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
     botIdentityResolved: Boolean(botIdentity.openId),
   });
   wsClient.start({ eventDispatcher });
+}
+
+async function ensurePrivateDirectory(directory: string): Promise<void> {
+  const createdDirectory = await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  if (createdDirectory) {
+    await fs.chmod(directory, 0o700);
+  }
 }
 
 function buildAttachmentFileName(attachment: IncomingAttachment, headers: unknown): string {

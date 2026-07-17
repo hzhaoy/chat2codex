@@ -5,6 +5,7 @@ export interface ChatSession {
   updatedAt: string;
   lastProjects?: ProjectSelection[];
   lastThreads?: ThreadSelection[];
+  lastTurns?: TurnSelection[];
   lastRun?: LastRunSummary;
 }
 
@@ -25,6 +26,16 @@ export interface ThreadSelection {
   updatedAt?: string;
   resumable?: boolean;
   unavailableReason?: string;
+}
+
+export interface TurnSelection {
+  threadId: string;
+  turnId: string;
+  status: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  summary?: string;
 }
 
 export type LastRunStatus = "success" | "failed" | "stopped";
@@ -77,14 +88,19 @@ export interface EventDiagnosticSnapshot {
   botIdentityResolved: boolean;
 }
 
-export interface BridgeDiagnostics {
+export interface ChatDiagnostics {
   lastEvent?: EventDiagnosticSnapshot;
   lastDroppedEvent?: EventDiagnosticSnapshot;
   recentFailures?: RecentFailureDiagnostic[];
 }
 
+export interface BridgeDiagnostics extends ChatDiagnostics {
+  byChat?: Record<string, ChatDiagnostics>;
+}
+
 export type FailureDiagnosticCategory =
   | "codex_missing"
+  | "cwd_missing"
   | "app_server_timeout"
   | "approval_timeout"
   | "run_timeout"
@@ -104,14 +120,36 @@ export interface RecentFailureDiagnostic {
   hint?: string;
 }
 
+export interface PendingMessageDelivery {
+  messageId: string;
+  chatId: string;
+  chatType: "direct" | "group";
+  sender: {
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+  };
+  text: string;
+  attachments?: Array<{
+    kind: "image" | "file";
+    key: string;
+    name?: string;
+  }>;
+  acceptedAt: string;
+  attempts: number;
+  lastError?: string;
+}
+
 export interface BridgeState {
   chats: Record<string, ChatSession>;
+  pendingMessages: Record<string, PendingMessageDelivery>;
   processedMessageIds: string[];
   diagnostics: BridgeDiagnostics;
 }
 
 export const emptyState = (): BridgeState => ({
   chats: {},
+  pendingMessages: {},
   processedMessageIds: [],
   diagnostics: {},
 });

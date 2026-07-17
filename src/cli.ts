@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 import { config as loadDotenv } from "dotenv";
 import { ZodError } from "zod";
 
+import { buildCodexChildEnv } from "./agent/codex-environment.js";
 import { runBridge } from "./bot/lark-bot.js";
 import { loadConfig } from "./config/env.js";
 import { defaultChat2CodexHome, defaultEnvPath } from "./config/paths.js";
+import { acquireBridgeInstanceLock } from "./state/instance-lock.js";
 import { ConsoleLogger } from "./util/logger.js";
 
 type CliCommand =
@@ -139,7 +141,16 @@ Options:
     process.exitCode = 1;
   });
 
-  await runBridge(config, logger);
+  const instanceLock = await acquireBridgeInstanceLock(config.bridgeStatePath, (error) => {
+    logger.error("Chat2Codex instance lock was compromised; stopping the bridge", error);
+    process.exit(1);
+  });
+  try {
+    await runBridge(config, logger);
+  } catch (error) {
+    await instanceLock.release();
+    throw error;
+  }
 }
 
 async function runSetup(args: string[]): Promise<void> {
@@ -147,7 +158,8 @@ async function runSetup(args: string[]): Promise<void> {
     console.log(`Usage: chat2codex setup [options]
 
 Creates and connects a Feishu/Lark app through the official QR-code flow, then
-writes FEISHU_APP_ID, FEISHU_APP_SECRET, LARK_DOMAIN, and CODEX_WORKDIR to .env.
+writes FEISHU_APP_ID, FEISHU_APP_SECRET, LARK_DOMAIN, CODEX_WORKDIR, and when
+available FEISHU_BOT_OPEN_ID and the scanning user's ALLOWED_USER_IDS to .env.
 
 Options:
   --env <path>       File to create or update (default: .env)
@@ -189,6 +201,7 @@ Options:
   );
   await fs.mkdir(path.dirname(envFile), { recursive: true });
   await fs.writeFile(envFile, `${next.trimEnd()}\n`, { mode: 0o600 });
+  await fs.chmod(envFile, 0o600);
   console.log(`Created ${envFile}`);
   console.log("Next: edit FEISHU_APP_ID and FEISHU_APP_SECRET, then run chat2codex doctor.");
 }
@@ -410,7 +423,10 @@ function checkNodeVersion(version: string): DoctorCheck {
 }
 
 function checkCommand(command: string, args: string[], label: string): DoctorCheck {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    env: buildCodexChildEnv(),
+  });
   if (result.status === 0) {
     return {
       label,
@@ -434,11 +450,22 @@ function checkMobileSafeConfig(config: ReturnType<typeof loadConfig>): DoctorChe
       detail: "CODEX_BIN is not absolute; background services may not load your interactive shell PATH",
     });
   }
+  if (
+    config.access.allowDirectMessages &&
+    config.access.allowedUserIds.length === 0 &&
+    config.access.allowedChatIds.length === 0
+  ) {
+    checks.push({
+      label: "mobile-safe direct allowlist",
+      status: "warn",
+      detail: "direct messages require ALLOWED_USER_IDS or ALLOWED_CHAT_IDS; use /whoami to discover them",
+    });
+  }
   if (config.access.allowGroups && config.access.allowedUserIds.length === 0) {
     checks.push({
       label: "mobile-safe group users",
       status: "warn",
-      detail: "ALLOW_GROUPS is true but ALLOWED_USER_IDS is empty; restrict who can click control and approval buttons",
+      detail: "ALLOW_GROUPS is true but ALLOWED_USER_IDS is empty; group messages and card actions will be denied",
     });
   }
   if (config.access.allowGroups && config.codexApprovalPolicy === "never") {

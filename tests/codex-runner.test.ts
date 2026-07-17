@@ -236,6 +236,187 @@ process.on("SIGTERM", () => process.exit(0));
     }
   });
 
+  test("wraps app-server thread control requests", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const fakeCodex = path.join(tempDir, "fake-codex.cjs");
+    await writeFile(
+      fakeCodex,
+      `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+function send(message) { console.log(JSON.stringify(message)); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "Codex Desktop/0.144.5 test", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+    return;
+  }
+  if (message.method === "thread/search") {
+    send({ id: message.id, result: { data: [{ snippet: "matched text", thread: { id: "thread_search", cwd: "/repo/a", name: "Search hit", cliVersion: "0.144.5" } }] } });
+    return;
+  }
+  if (message.method === "thread/turns/list") {
+    if (message.params.itemsView === "full") {
+      if (message.params.cursor === "page-2") {
+        send({ id: message.id, result: { data: [{ id: "turn_1", status: "completed", itemsView: "full", items: [{ id: "item_cmd", type: "commandExecution", command: "bun test", cwd: "/repo/a", status: "completed", exitCode: 0, commandActions: [] }] }], nextCursor: null, backwardsCursor: null } });
+      } else {
+        send({ id: message.id, result: { data: [{ id: "turn_other", status: "completed", itemsView: "full", items: [] }], nextCursor: "page-2", backwardsCursor: null } });
+      }
+    } else {
+      send({ id: message.id, result: { data: [{ id: "turn_1", status: "completed", startedAt: 4000, itemsView: "summary", items: [{ id: "item_user", type: "userMessage", content: [{ type: "text", text: "hello" }] }] }] } });
+    }
+    return;
+  }
+  if (message.method === "thread/fork") {
+    send({ id: message.id, result: { thread: { id: "thread_fork", cwd: message.params.cwd, name: "Forked", cliVersion: "0.144.5" } } });
+    return;
+  }
+  if (message.method === "thread/compact/start") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  send({ id: message.id, error: { code: -32601, message: "unexpected method: " + message.method } });
+});
+process.on("SIGTERM", () => process.exit(0));
+`,
+    );
+    await chmod(fakeCodex, 0o755);
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const runner = new CodexRunner(config, new ConsoleLogger("error"));
+
+      const search = await runner.searchThreads({ searchTerm: "Search", limit: 5 });
+      expect(search.results[0]?.thread).toMatchObject({ id: "thread_search", resumable: true });
+      expect(search.results[0]?.snippet).toBe("matched text");
+
+      const turns = await runner.listThreadTurns({ threadId: "thread_search" });
+      expect(turns.turns[0]).toMatchObject({
+        id: "turn_1",
+        status: "completed",
+        items: [{ id: "item_user", type: "userMessage", text: "hello" }],
+      });
+
+      const items = await runner.listTurnItems({ threadId: "thread_search", turnId: "turn_1" });
+      expect(items.items[0]).toMatchObject({
+        id: "item_cmd",
+        type: "commandExecution",
+        command: "bun test",
+        exitCode: 0,
+      });
+
+      const forked = await runner.forkThread({ threadId: "thread_search", cwd: "/repo/a" });
+      expect(forked).toMatchObject({ id: "thread_fork", cwd: "/repo/a", resumable: true });
+
+      await expect(runner.compactThread("thread_fork")).resolves.toBeUndefined();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("reads messages from schema-shaped app-server error notifications", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const fakeCodex = path.join(tempDir, "fake-codex.cjs");
+    await writeFile(
+      fakeCodex,
+      `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+function send(message) { console.log(JSON.stringify(message)); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "Codex Desktop/0.144.5 test", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+    return;
+  }
+  if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+    return;
+  }
+  if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+    send({ method: "error", params: { threadId: "thread_fake", turnId: "turn_fake", willRetry: false, error: { message: "schema-shaped failure", codexErrorInfo: null, additionalDetails: null } } });
+    send({ method: "turn/completed", params: { threadId: "thread_fake", turn: { id: "turn_fake", items: [], itemsView: "full", status: "interrupted", error: null, startedAt: 1, completedAt: 2, durationMs: 100 } } });
+  }
+});
+process.on("SIGTERM", () => process.exit(0));
+`,
+    );
+    await chmod(fakeCodex, 0o755);
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "trigger an error",
+        cwd: tempDir,
+      });
+
+      expect(result.finalText).toBe("schema-shaped failure");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not retain retryable app-server errors after the turn succeeds", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const fakeCodex = path.join(tempDir, "fake-codex.cjs");
+    await writeFile(
+      fakeCodex,
+      `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+function send(message) { console.log(JSON.stringify(message)); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "Codex Desktop/0.144.5 test", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+    return;
+  }
+  if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+    return;
+  }
+  if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+    send({ method: "error", params: { threadId: "thread_fake", turnId: "turn_fake", willRetry: true, error: { message: "temporary failure", codexErrorInfo: null, additionalDetails: null } } });
+    send({ method: "item/completed", params: { threadId: "thread_fake", turnId: "turn_fake", item: { id: "agent_1", type: "agentMessage", text: "recovered", phase: "final_answer" } } });
+    send({ method: "turn/completed", params: { threadId: "thread_fake", turn: { id: "turn_fake", items: [], itemsView: "full", status: "completed", error: null, startedAt: 1, completedAt: 2, durationMs: 100 } } });
+  }
+});
+process.on("SIGTERM", () => process.exit(0));
+`,
+    );
+    await chmod(fakeCodex, 0o755);
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "recover from a retryable error",
+        cwd: tempDir,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.finalText).toBe("recovered");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("runs through app-server approval requests", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
     const fakeCodex = path.join(tempDir, "fake-codex.cjs");

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -12,8 +12,17 @@ import type {
   CodexRunInput,
   CodexRunResult,
   CodexThread,
+  CodexThreadItem,
   CodexThreadListInput,
   CodexThreadListResult,
+  CodexThreadSearchInput,
+  CodexThreadSearchResult,
+  CodexThreadSearchResultItem,
+  CodexThreadTurn,
+  CodexThreadTurnItemListInput,
+  CodexThreadTurnItemListResult,
+  CodexThreadTurnListInput,
+  CodexThreadTurnListResult,
 } from "../src/agent/codex-runner.js";
 import type {
   ApprovalCardInput,
@@ -51,6 +60,16 @@ class CollectingSender implements ChatSender {
 
   async sendMarkdown(chatId: string, markdown: string): Promise<void> {
     this.messages.push({ chatId, text: markdown, kind: "markdown" });
+  }
+}
+
+class FailingDeliverySender implements ChatSender {
+  async sendText(): Promise<void> {
+    throw new Error("simulated delivery failure");
+  }
+
+  async sendMarkdown(): Promise<void> {
+    throw new Error("simulated delivery failure");
   }
 }
 
@@ -174,8 +193,21 @@ class FakeCodex implements CodexClient {
 class ListingCodex extends FakeCodex {
   readonly listInputs: CodexThreadListInput[] = [];
   readonly readIds: string[] = [];
+  readonly searchInputs: CodexThreadSearchInput[] = [];
+  readonly turnListInputs: CodexThreadTurnListInput[] = [];
+  readonly turnItemInputs: CodexThreadTurnItemListInput[] = [];
+  readonly forkInputs: Array<{ threadId: string; cwd?: string }> = [];
+  readonly compactIds: string[] = [];
 
-  constructor(private readonly threads: CodexThread[]) {
+  constructor(
+    private readonly threads: CodexThread[],
+    private readonly extra: {
+      searchResults?: CodexThreadSearchResultItem[];
+      turns?: CodexThreadTurn[];
+      itemsByTurn?: Record<string, CodexThreadItem[]>;
+      forkedThread?: CodexThread;
+    } = {},
+  ) {
     super();
   }
 
@@ -196,6 +228,60 @@ class ListingCodex extends FakeCodex {
   async readThread(threadId: string): Promise<CodexThread | null> {
     this.readIds.push(threadId);
     return this.threads.find((thread) => thread.id === threadId) ?? null;
+  }
+
+  async searchThreads(input: CodexThreadSearchInput): Promise<CodexThreadSearchResult> {
+    this.searchInputs.push(input);
+    const results = this.extra.searchResults ?? this.threads.map((thread) => ({
+      thread,
+      snippet: thread.preview ?? thread.name ?? thread.cwd,
+    }));
+    const query = input.searchTerm.toLowerCase();
+    const filtered = results.filter((result) =>
+      [
+        result.thread.name,
+        result.thread.preview,
+        result.thread.cwd,
+        result.thread.id,
+        result.snippet,
+      ]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query)),
+    );
+    return {
+      results: filtered.slice(0, input.limit ?? filtered.length),
+    };
+  }
+
+  async listThreadTurns(input: CodexThreadTurnListInput): Promise<CodexThreadTurnListResult> {
+    this.turnListInputs.push(input);
+    return {
+      turns: (this.extra.turns ?? []).slice(0, input.limit ?? this.extra.turns?.length ?? 0),
+    };
+  }
+
+  async listTurnItems(input: CodexThreadTurnItemListInput): Promise<CodexThreadTurnItemListResult> {
+    this.turnItemInputs.push(input);
+    return {
+      items: this.extra.itemsByTurn?.[input.turnId] ?? [],
+    };
+  }
+
+  async forkThread(input: { threadId: string; cwd?: string }): Promise<CodexThread> {
+    this.forkInputs.push(input);
+    const source = this.threads.find((thread) => thread.id === input.threadId);
+    return (
+      this.extra.forkedThread ?? {
+        id: `fork_${input.threadId}`,
+        cwd: input.cwd ?? source?.cwd ?? "/repo/forked",
+        name: `Fork of ${input.threadId}`,
+        updatedAt: 5_000,
+      }
+    );
+  }
+
+  async compactThread(threadId: string): Promise<void> {
+    this.compactIds.push(threadId);
   }
 }
 
@@ -258,6 +344,40 @@ class BlockingCodex implements CodexClient {
       }
       input.signal?.addEventListener("abort", finishCancelled, { once: true });
     });
+  }
+}
+
+class ControlledCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly completions: Array<ReturnType<typeof deferred<CodexRunResult>>> = [];
+
+  run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const completion = deferred<CodexRunResult>();
+    this.completions.push(completion);
+    return completion.promise;
+  }
+
+  complete(index: number, threadId: string): void {
+    this.completions[index]?.resolve({
+      threadId,
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    });
+  }
+}
+
+class ControlledListingCodex extends ControlledCodex {
+  constructor(readonly threads: CodexThread[]) {
+    super();
+  }
+
+  async listThreads(input: CodexThreadListInput = {}): Promise<CodexThreadListResult> {
+    const threads = [...this.threads].sort(
+      (left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0),
+    );
+    return { threads: threads.slice(0, input.limit ?? threads.length) };
   }
 }
 
@@ -492,6 +612,282 @@ class ThrowingCodex implements CodexClient {
 }
 
 describe("MessageRouter access control", () => {
+  test("persists accepted events without waiting for a long Codex run", async () => {
+    const codex = new BlockingCodex();
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      const accepted = {
+        messageId: "m_durable",
+        chatId: "oc_chat",
+        chatType: "direct" as const,
+        sender: { openId: "ou_user" },
+        text: "long task",
+      };
+
+      await router.accept(accepted);
+      await waitFor(() => codex.runs.length === 1);
+
+      const store = new JsonStateStore(config.bridgeStatePath);
+      const pending = await store.load();
+      expect(pending.pendingMessages.m_durable?.text).toBe("long task");
+      expect(pending.processedMessageIds).not.toContain("m_durable");
+
+      await router.enqueue({
+        messageId: "m_stop_durable",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/stop",
+      });
+      await waitForState(store, (state) => state.processedMessageIds.includes("m_durable"));
+
+      const completed = await store.load();
+      expect(completed.pendingMessages.m_durable).toBeUndefined();
+      expect(completed.processedMessageIds).toContain("m_durable");
+    });
+  });
+
+  test("serializes Codex runs from different chats that target the same workspace", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex({}, codex, async ({ router }) => {
+      const first = router.enqueue({
+        messageId: "m_workspace_1",
+        chatId: "oc_chat_1",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "first task",
+      });
+      const second = router.enqueue({
+        messageId: "m_workspace_2",
+        chatId: "oc_chat_2",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "second task",
+      });
+
+      await waitFor(() => codex.runs.length >= 1);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(codex.runs).toHaveLength(1);
+
+      codex.complete(0, "thread_workspace_1");
+      await first;
+      await waitFor(() => codex.runs.length === 2);
+
+      codex.complete(1, "thread_workspace_2");
+      await second;
+      expect(codex.runs.map((run) => run.prompt)).toEqual(["first task", "second task"]);
+    });
+  });
+
+  test("lets stop cancel a task waiting for the workspace lock", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex({}, codex, async ({ router, sender, config }) => {
+      const first = router.enqueue({
+        messageId: "m_workspace_blocker",
+        chatId: "oc_chat_1",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "block the workspace",
+      });
+      await router.accept({
+        messageId: "m_workspace_waiting",
+        chatId: "oc_chat_2",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "should be cancelled",
+      });
+      await waitFor(() => codex.runs.length === 1);
+
+      await router.enqueue({
+        messageId: "m_workspace_status",
+        chatId: "oc_chat_2",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/status",
+      });
+      expect(sender.messages.at(-1)?.text).toContain("queue_depth: 1");
+      expect(sender.messages.at(-1)?.text).toContain("state=waiting_for_workspace");
+
+      await router.enqueue({
+        messageId: "m_workspace_stop",
+        chatId: "oc_chat_2",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/stop",
+      });
+      expect(sender.messages.at(-1)?.text).toBe("已取消当前 chat 排队中的 Codex 任务。");
+
+      const store = new JsonStateStore(config.bridgeStatePath);
+      const cancelled = await store.load();
+      expect(cancelled.pendingMessages.m_workspace_waiting).toBeUndefined();
+      expect(cancelled.processedMessageIds).toContain("m_workspace_waiting");
+
+      let nextCommandCompleted = false;
+      const nextCommand = router
+        .enqueue({
+          messageId: "m_after_workspace_stop",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/new",
+        })
+        .then(() => {
+          nextCommandCompleted = true;
+        });
+      await waitFor(() => nextCommandCompleted);
+
+      codex.complete(0, "thread_workspace_blocker");
+      await Promise.all([first, nextCommand]);
+      expect(codex.runs.map((run) => run.prompt)).toEqual(["block the workspace"]);
+    });
+  });
+
+  test("keeps a queued run bound to its original workspace and blocks card switching", async () => {
+    await withRouterAndSender(
+      {},
+      new ControlledListingCodex([]),
+      new CardCollectingSender(),
+      async ({ router, sender, codex, config }) => {
+        const otherWorkspace = path.join(config.codexWorkdir, "other-workspace");
+        await mkdir(otherWorkspace);
+        codex.threads.push(
+          { id: "thread_other", cwd: otherWorkspace, name: "Other", updatedAt: 2_000 },
+          { id: "thread_current", cwd: config.codexWorkdir, name: "Current", updatedAt: 1_000 },
+        );
+        await router.enqueue({
+          messageId: "m_projects_before_queue",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/projects",
+        });
+
+        const first = router.enqueue({
+          messageId: "m_bound_blocker",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "first bound task",
+        });
+        const second = router.enqueue({
+          messageId: "m_bound_waiter",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "second bound task",
+        });
+        await waitFor(() => codex.runs.length === 1);
+
+        const response = await router.handleCardAction({
+          action: "select_project",
+          chatId: "oc_chat_2",
+          messageId: "om_projects",
+          projectIndex: 1,
+          sender: { openId: "ou_user" },
+        });
+        expect(expectToast(response).toast.content).toContain("任务排队或运行中");
+
+        codex.complete(0, "thread_bound_1");
+        await first;
+        await waitFor(() => codex.runs.length === 2);
+        expect(codex.runs[1]?.cwd).toBe(config.codexWorkdir);
+        codex.complete(1, "thread_bound_2");
+        await second;
+        expect(sender.messages.some((message) => message.text.includes("错误工作区"))).toBe(false);
+      },
+    );
+  });
+
+  test("allows Codex runs in different workspaces to proceed concurrently", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      const secondWorkspace = path.join(config.codexWorkdir, "second-workspace");
+      await mkdir(secondWorkspace);
+      await router.enqueue({
+        messageId: "m_cd_workspace_2",
+        chatId: "oc_chat_2",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/cd ${secondWorkspace}`,
+      });
+
+      const first = router.enqueue({
+        messageId: "m_parallel_1",
+        chatId: "oc_chat_1",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "first parallel task",
+      });
+      const second = router.enqueue({
+        messageId: "m_parallel_2",
+        chatId: "oc_chat_2",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "second parallel task",
+      });
+
+      await waitFor(() => codex.runs.length === 2);
+      expect(new Set(codex.runs.map((run) => run.cwd))).toEqual(
+        new Set([config.codexWorkdir, await realpath(secondWorkspace)]),
+      );
+
+      codex.complete(0, "thread_parallel_1");
+      codex.complete(1, "thread_parallel_2");
+      await Promise.all([first, second]);
+    });
+  });
+
+  test("keeps failed deliveries pending and replays them after restart", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-delivery-"));
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      const failedRouter = new MessageRouter(
+        config,
+        store,
+        new FailingDeliverySender(),
+        silentLogger,
+        new FakeCodex(),
+      );
+      await failedRouter.start();
+      await failedRouter.accept({
+        messageId: "m_replay",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "retry after restart",
+      });
+
+      await waitForState(store, (state) => state.pendingMessages.m_replay?.attempts === 1);
+      const failed = await store.load();
+      expect(failed.pendingMessages.m_replay?.lastError).toContain("simulated delivery failure");
+      expect(failed.processedMessageIds).not.toContain("m_replay");
+
+      const replayCodex = new FakeCodex();
+      const replayRouter = new MessageRouter(
+        config,
+        new JsonStateStore(config.bridgeStatePath),
+        new CollectingSender(),
+        silentLogger,
+        replayCodex,
+      );
+      await replayRouter.start();
+      await waitFor(() => replayCodex.runs.length === 1);
+      await waitForState(store, (state) => state.processedMessageIds.includes("m_replay"));
+
+      const replayed = await store.load();
+      expect(replayed.pendingMessages.m_replay).toBeUndefined();
+      expect(replayed.processedMessageIds).toContain("m_replay");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("does not run Codex or reply for unauthorized group messages", async () => {
     await withRouter({}, async ({ router, sender, codex }) => {
       await router.enqueue({
@@ -520,7 +916,28 @@ describe("MessageRouter access control", () => {
       expect(codex.runs).toHaveLength(0);
       expect(sender.messages).toHaveLength(1);
       expect(sender.messages[0]?.text).toContain("chat_id: oc_group");
+      expect(sender.messages[0]?.text).not.toContain("sender.open_id:");
+      expect(sender.messages[0]?.text).not.toContain("sender.user_id:");
+      expect(sender.messages[0]?.text).not.toContain("sender.union_id:");
       expect(sender.messages[0]?.text).toContain("access: denied (groups_disabled)");
+    });
+  });
+
+  test("includes available sender ids in direct-message whoami", async () => {
+    await withRouter({}, async ({ router, sender, codex }) => {
+      await router.enqueue({
+        messageId: "m1",
+        chatId: "oc_direct",
+        chatType: "direct",
+        sender: { openId: "ou_user", userId: "u_user", unionId: "on_user" },
+        text: "/whoami",
+      });
+
+      expect(codex.runs).toHaveLength(0);
+      expect(sender.messages).toHaveLength(1);
+      expect(sender.messages[0]?.text).toContain("sender.open_id: ou_user");
+      expect(sender.messages[0]?.text).toContain("sender.user_id: u_user");
+      expect(sender.messages[0]?.text).toContain("sender.union_id: on_user");
     });
   });
 
@@ -576,6 +993,68 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("keeps status and host diagnostics scoped to the requesting chat", async () => {
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, new FailingCodex(), sender, async ({ router }) => {
+      await router.recordEventDiagnostic("dropped", {
+        reason: "secret-chat-drop",
+        messageId: "m_secret_chat",
+        chatId: "oc_secret_chat",
+        chatType: "direct",
+        messageType: "text",
+        mentionCount: 0,
+        startsWithMention: false,
+        attachmentCount: 0,
+        textLength: 12,
+        botIdentityResolved: true,
+      });
+      await router.enqueue({
+        messageId: "m_secret_run",
+        chatId: "oc_secret_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "secret prompt from another chat",
+      });
+
+      sender.messages.length = 0;
+      await router.recordEventDiagnostic("routed", {
+        messageId: "m_visible_chat",
+        chatId: "oc_visible_chat",
+        chatType: "direct",
+        messageType: "text",
+        mentionCount: 0,
+        startsWithMention: false,
+        attachmentCount: 0,
+        textLength: 7,
+        botIdentityResolved: true,
+      });
+      await router.enqueue({
+        messageId: "m_status_visible",
+        chatId: "oc_visible_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/status",
+      });
+
+      const status = sender.messages.at(-1)?.text ?? "";
+      expect(status).toContain("m_visible_chat");
+      expect(status).not.toContain("m_secret_chat");
+      expect(status).not.toContain("secret prompt from another chat");
+
+      await router.enqueue({
+        messageId: "m_host_visible",
+        chatId: "oc_visible_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/host",
+      });
+      const host = JSON.stringify(sender.interactiveCards.at(-1)?.card ?? {});
+      expect(host).toContain("visible");
+      expect(host).not.toContain("m_secret_chat");
+      expect(host).not.toContain("secret prompt from another chat");
+    });
+  });
+
   test("host sends a health card with mobile safety warnings", async () => {
     const sender = new CardCollectingSender();
     await withRouterAndSender(
@@ -601,7 +1080,7 @@ describe("MessageRouter access control", () => {
         const serialized = JSON.stringify(sender.interactiveCards[0]?.card);
         expect(serialized).toContain("Host 健康卡");
         expect(serialized).toContain("queue");
-        expect(serialized).toContain("群聊已开启");
+        expect(serialized).toContain("风险较高");
         expect(serialized).toContain("任务无限等待");
       },
     );
@@ -1058,6 +1537,215 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("searches conversations and reuses results for resume", async () => {
+    const codex = new ListingCodex([
+      {
+        id: "thread_search_1",
+        cwd: "/repo/a",
+        name: "Release notes",
+        preview: "Prepare mobile control release",
+        updatedAt: 4_000,
+      },
+      {
+        id: "thread_other",
+        cwd: "/repo/b",
+        name: "Other",
+        preview: "Unrelated",
+        updatedAt: 3_000,
+      },
+    ]);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_search",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/search mobile",
+      });
+      await router.enqueue({
+        messageId: "m_resume",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume 1",
+      });
+      await router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "continue searched thread",
+      });
+
+      expect(codex.searchInputs[0]).toMatchObject({
+        searchTerm: "mobile",
+        limit: 20,
+        sortKey: "updated_at",
+      });
+      expect(sender.interactiveCards[0]?.card.header.title.content).toBe("Codex 搜索结果");
+      expect(JSON.stringify(sender.interactiveCards[0]?.card)).toContain("Release notes");
+      expect(JSON.stringify(sender.interactiveCards[0]?.card)).toContain("Prepare mobile control release");
+      expect(codex.runs[0]?.cwd).toBe("/repo/a");
+      expect(codex.runs[0]?.threadId).toBe("thread_search_1");
+    });
+  });
+
+  test("lists conversation history and renders selected turn detail", async () => {
+    const codex = new ListingCodex(
+      [
+        {
+          id: "thread_a1",
+          cwd: "/repo/a",
+          name: "A recent",
+          updatedAt: 4_000,
+        },
+      ],
+      {
+        turns: [
+          {
+            id: "turn_2",
+            status: "completed",
+            startedAt: 4_000,
+            completedAt: 4_001,
+            durationMs: 1_000,
+            items: [
+              { id: "item_user", type: "userMessage", text: "please add history" },
+              { id: "item_agent", type: "agentMessage", text: "history added" },
+            ],
+          },
+        ],
+        itemsByTurn: {
+          turn_2: [
+            { id: "item_user", type: "userMessage", text: "please add history" },
+            {
+              id: "item_cmd",
+              type: "commandExecution",
+              command: "bun test",
+              cwd: "/repo/a",
+              status: "completed",
+              exitCode: 0,
+            },
+            { id: "item_file", type: "fileChange", files: ["src/app.ts"], status: "completed" },
+          ],
+        },
+      },
+    );
+
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m_resume",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume thread_a1",
+      });
+      await router.enqueue({
+        messageId: "m_history",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/history",
+      });
+      await router.enqueue({
+        messageId: "m_history_detail",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/history 1",
+      });
+
+      expect(codex.turnListInputs[0]).toMatchObject({
+        threadId: "thread_a1",
+        limit: 12,
+        itemsView: "summary",
+      });
+      expect(codex.turnItemInputs[0]).toMatchObject({
+        threadId: "thread_a1",
+        turnId: "turn_2",
+      });
+      expect(sender.messages[1]?.text).toContain("**当前会话历史**");
+      expect(sender.messages[1]?.text).toContain("please add history");
+      expect(sender.messages[2]?.text).toContain("**历史轮次详情**");
+      expect(sender.messages[2]?.text).toContain("bun test");
+      expect(sender.messages[2]?.text).toContain("src/app.ts");
+    });
+  });
+
+  test("forks the current conversation and continues the forked thread", async () => {
+    const codex = new ListingCodex([
+      {
+        id: "thread_a1",
+        cwd: "/repo/a",
+        name: "A recent",
+        updatedAt: 4_000,
+      },
+    ]);
+
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m_resume",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume thread_a1",
+      });
+      await router.enqueue({
+        messageId: "m_fork",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/fork",
+      });
+      await router.enqueue({
+        messageId: "m_run",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "continue fork",
+      });
+
+      expect(codex.forkInputs).toEqual([{ threadId: "thread_a1", cwd: "/repo/a" }]);
+      expect(sender.messages[1]?.text).toContain("**已分叉 Codex 会话**");
+      expect(sender.messages[1]?.text).toContain("fork_thread_a1");
+      expect(codex.runs[0]?.threadId).toBe("fork_thread_a1");
+      expect(codex.runs[0]?.cwd).toBe("/repo/a");
+    });
+  });
+
+  test("compacts the selected conversation", async () => {
+    const codex = new ListingCodex([
+      {
+        id: "thread_a1",
+        cwd: "/repo/a",
+        name: "A recent",
+        updatedAt: 4_000,
+      },
+    ]);
+
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m_resume",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume thread_a1",
+      });
+      await router.enqueue({
+        messageId: "m_compact",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/compact",
+      });
+
+      expect(codex.compactIds).toEqual(["thread_a1"]);
+      expect(sender.messages[1]?.text).toContain("**已请求压缩当前 Codex 会话**");
+      expect(sender.messages[1]?.text).toContain("thread_a1");
+    });
+  });
+
   test("refuses to resume an unavailable listed conversation", async () => {
     const codex = new ListingCodex([
       {
@@ -1307,7 +1995,7 @@ describe("MessageRouter access control", () => {
         text: "run outside default workdir",
       });
 
-      expect(codex.runs[0]?.cwd).toBe(path.resolve("/tmp"));
+      expect(codex.runs[0]?.cwd).toBe(await realpath("/tmp"));
     });
   });
 
@@ -1342,7 +2030,28 @@ describe("MessageRouter access control", () => {
 
         expect(sender.messages[0]?.text).toContain("当前群聊不能使用这个目录");
         expect(codex.runs).toHaveLength(1);
-        expect(codex.runs[0]?.cwd).toBe(allowedProject);
+        expect(codex.runs[0]?.cwd).toBe(await realpath(allowedProject));
+      },
+    );
+  });
+
+  test("rejects group cwd changes that escape an allowed root through a symlink", async () => {
+    await withRouter(
+      { ALLOW_GROUPS: "true", ALLOWED_CHAT_IDS: "oc_group" },
+      async ({ router, sender, codex, config }) => {
+        const escapeLink = path.join(config.codexWorkdir, "escape-link");
+        await symlink(os.tmpdir(), escapeLink);
+
+        await router.enqueue({
+          messageId: "m_symlink",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: `@_user_1 /cd ${escapeLink}`,
+        });
+
+        expect(codex.runs).toHaveLength(0);
+        expect(sender.messages.at(-1)?.text).toContain("当前群聊不能使用这个目录");
       },
     );
   });
@@ -1780,6 +2489,47 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("resets a deleted session cwd without running the task in another workspace", async () => {
+    const codex = new ThrowingCodex();
+    await withRouterAndCodex({}, codex, async ({ router, sender, config }) => {
+      const temporaryCwd = path.join(config.codexWorkdir, "temporary-workspace");
+      await mkdir(temporaryCwd);
+      const storedCwd = await realpath(temporaryCwd);
+      await router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/cd ${temporaryCwd}`,
+      });
+      await rm(temporaryCwd, { recursive: true, force: true });
+      sender.messages.length = 0;
+
+      await router.enqueue({
+        messageId: "m2",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "do not run in the wrong workspace",
+      });
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.runs[0]?.cwd).toBe(storedCwd);
+      expect(sender.messages.at(-1)?.text).toContain(
+        `当前 cwd 不存在：${storedCwd}`,
+      );
+      expect(sender.messages.at(-1)?.text).toContain(
+        `已切回默认 cwd：${config.codexWorkdir}`,
+      );
+
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(persisted.chats.oc_chat?.cwd).toBe(config.codexWorkdir);
+      expect(persisted.diagnostics.byChat?.oc_chat?.recentFailures?.at(-1)?.category).toBe(
+        "cwd_missing",
+      );
+    });
+  });
+
   test("reports when stop is requested without an active run", async () => {
     await withRouter({}, async ({ router, sender, codex }) => {
       await router.enqueue({
@@ -1929,6 +2679,15 @@ describe("MessageRouter access control", () => {
 
   test("card stop action reports when there is no active run", async () => {
     await withRouter({}, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "quick task",
+      });
+      sender.messages.length = 0;
+
       const response = await router.handleCardAction({
         action: "stop_run",
         chatId: "oc_chat",
@@ -2132,7 +2891,7 @@ describe("MessageRouter access control", () => {
     );
   });
 
-  test("group approval card action requires an allowed user list", async () => {
+  test("group messages require an allowed user before an approval can start", async () => {
     const codex = new ApprovalCodex({
       id: "approval_1",
       kind: "command",
@@ -2141,7 +2900,7 @@ describe("MessageRouter access control", () => {
     });
     const sender = new CardCollectingSender();
     await withRouterAndSender(
-      { ALLOW_GROUPS: "true", ALLOWED_CHAT_IDS: "oc_group" },
+      { ALLOW_GROUPS: "true", ALLOWED_CHAT_IDS: "oc_group", ALLOWED_USER_IDS: "" },
       codex,
       sender,
       async ({ router }) => {
@@ -2152,29 +2911,11 @@ describe("MessageRouter access control", () => {
           sender: { openId: "ou_user" },
           text: "@_user_1 run command",
         });
-        await waitFor(() => sender.approvalCards.length === 1);
-
-        const rejected = await router.handleCardAction({
-          action: "resolve_approval",
-          chatId: "oc_group",
-          messageId: sender.approvalCards[0]?.handle.messageId,
-          approvalId: "approval_1",
-          decisionIndex: 0,
-          sender: { openId: "ou_user" },
-        });
-
-        expect(expectToast(rejected).toast.type).toBe("error");
-        expect(codex.decision).toBeUndefined();
-
-        await router.enqueue({
-          messageId: "m_stop",
-          chatId: "oc_group",
-          chatType: "group",
-          sender: { openId: "ou_user" },
-          text: "@_user_1 /stop",
-        });
         await running;
-        expect(codex.decision).toBe("cancel");
+
+        expect(sender.approvalCards).toHaveLength(0);
+        expect(codex.runs).toHaveLength(0);
+        expect(codex.decision).toBeUndefined();
       },
     );
   });
@@ -2391,6 +3132,15 @@ describe("MessageRouter access control", () => {
 
   test("card retry action reports missing status card context", async () => {
     await withRouter({}, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "quick task",
+      });
+      sender.messages.length = 0;
+
       const response = await router.handleCardAction({
         action: "retry_run",
         chatId: "oc_chat",
@@ -2452,6 +3202,7 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
       FEISHU_APP_SECRET: "secret",
       CODEX_WORKDIR: tempDir,
       BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+      ALLOWED_USER_IDS: "ou_user",
       ...env,
     });
     const router = new MessageRouter(
@@ -2485,6 +3236,19 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   while (!predicate()) {
     if (Date.now() - startedAt > 1000) {
       throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+async function waitForState(
+  store: JsonStateStore,
+  predicate: (state: Awaited<ReturnType<JsonStateStore["load"]>>) => boolean,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate(await store.load())) {
+    if (Date.now() - startedAt > 1000) {
+      throw new Error("Timed out waiting for persisted state");
     }
     await new Promise((resolve) => setTimeout(resolve, 1));
   }

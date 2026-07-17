@@ -94,6 +94,12 @@ export async function runFeishuSetup(argv: string[] = []): Promise<void> {
       updates.CODEX_WORKDIR = workdir;
     }
 
+    const setupUserOpenId = result.user_info?.open_id?.trim();
+    if (setupUserOpenId) {
+      const existingAllowedUsers = await readExistingEnvValue(envPath, "ALLOWED_USER_IDS");
+      updates.ALLOWED_USER_IDS = mergeCsvValue(existingAllowedUsers, setupUserOpenId);
+    }
+
     const bot = await probeBot(result.client_id, result.client_secret, domain);
     if (bot?.botOpenId) {
       updates.FEISHU_BOT_OPEN_ID = bot.botOpenId;
@@ -206,6 +212,7 @@ async function updateEnvFile(filePath: string, updates: Record<string, string>):
 
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(filePath, `${next.join("\n")}\n`, { mode: 0o600 });
+  await fs.chmod(filePath, 0o600);
 }
 
 async function readBaseEnv(envPath: string): Promise<string> {
@@ -238,6 +245,10 @@ function stripEnvQuotes(value: string): string {
     return trimmed.slice(1, -1);
   }
   return value;
+}
+
+function mergeCsvValue(existing: string | null, value: string): string {
+  return [...new Set([...(existing ?? "").split(","), value].map((item) => item.trim()).filter(Boolean))].join(",");
 }
 
 function formatEnvValue(value: string): string {

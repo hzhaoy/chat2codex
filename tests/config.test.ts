@@ -85,4 +85,15 @@ describe("loadConfig", () => {
       }),
     ).toThrow();
   });
+
+  test("rejects the approval policy removed by Codex 0.144.5", () => {
+    expect(() =>
+      loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: "/tmp/chat2codex",
+        CODEX_APPROVAL_POLICY: "on-failure",
+      }),
+    ).toThrow();
+  });
 });

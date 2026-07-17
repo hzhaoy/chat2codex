@@ -60,7 +60,7 @@ export function defaultServiceTarget(platform: NodeJS.Platform = process.platfor
 export function createServiceOptions(args: ServiceCliArgs = {}): ServiceOptions {
   const target = args.target ?? defaultServiceTarget();
   const projectDir = path.resolve(args.projectDir ?? defaultChat2CodexHome());
-  const logsDir = path.join(projectDir, ".data", "logs");
+  const logsDir = path.join(defaultChat2CodexHome(), ".data", "logs");
   return {
     target,
     projectDir,
@@ -120,6 +120,8 @@ export function renderLaunchdPlist(options: ServiceOptions): string {
   <string>${escapeXml(options.projectDir)}</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>CHAT2CODEX_ENV</key>
+    <string>${escapeXml(options.envFile)}</string>
     <key>NODE_ENV</key>
     <string>production</string>
     <key>PATH</key>
@@ -185,8 +187,8 @@ async function installLaunchd(options: ServiceOptions): Promise<void> {
 
   const domain = launchdDomain();
   run("launchctl", ["bootout", domain, plistPath], { allowFailure: true });
-  run("launchctl", ["bootstrap", domain, plistPath]);
   run("launchctl", ["enable", `${domain}/${options.launchdLabel}`]);
+  run("launchctl", ["bootstrap", domain, plistPath]);
   run("launchctl", ["kickstart", "-k", `${domain}/${options.launchdLabel}`]);
 
   console.log(`Installed launchd service: ${options.launchdLabel}`);
@@ -431,7 +433,9 @@ Options:
                                   Defaults to a stable service PATH
   --launchd-label <label>        Defaults to com.chat2codex.bridge
   --systemd-name <name>          Defaults to chat2codex
-  --stdout <path>                launchd stdout log path
-  --stderr <path>                launchd stderr log path
+  --stdout <path>                launchd stdout log path; defaults under
+                                  ~/.chat2codex/.data/logs
+  --stderr <path>                launchd stderr log path; defaults under
+                                  ~/.chat2codex/.data/logs
 `);
 }

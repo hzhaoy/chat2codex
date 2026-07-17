@@ -23,18 +23,17 @@ export function decideAccess(
   config: AccessControlConfig,
   context: AccessContext,
 ): AccessDecision {
-  if (
-    config.allowedUserIds.length > 0 &&
-    !senderMatchesAllowedUser(context.sender, config.allowedUserIds)
-  ) {
-    return { allowed: false, reason: "sender_not_allowed" };
-  }
-
   if (context.chatType === "direct") {
-    if (config.allowDirectMessages || config.allowedChatIds.includes(context.chatId)) {
+    if (!config.allowDirectMessages) {
+      return { allowed: false, reason: "direct_messages_disabled" };
+    }
+    if (
+      config.allowedChatIds.includes(context.chatId) ||
+      senderMatchesAllowedUser(context.sender, config.allowedUserIds)
+    ) {
       return { allowed: true };
     }
-    return { allowed: false, reason: "direct_messages_disabled" };
+    return { allowed: false, reason: "sender_not_allowed" };
   }
 
   if (!config.allowGroups) {
@@ -42,6 +41,9 @@ export function decideAccess(
   }
   if (!config.allowedChatIds.includes(context.chatId)) {
     return { allowed: false, reason: "chat_not_allowed" };
+  }
+  if (!senderMatchesAllowedUser(context.sender, config.allowedUserIds)) {
+    return { allowed: false, reason: "sender_not_allowed" };
   }
   return { allowed: true };
 }

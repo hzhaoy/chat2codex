@@ -51,11 +51,13 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.68.0",
     "dotenv": "^17.4.2",
+    "proper-lockfile": "^4.1.2",
     "qrcode-terminal": "^0.12.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",
+    "@types/proper-lockfile": "^4.1.4",
     "@types/qrcode-terminal": "^0.12.2",
     "typescript": "^6.0.3"
   },

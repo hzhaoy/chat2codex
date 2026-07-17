@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { buildCodexChildEnv } from "../agent/codex-environment.js";
+
 interface GenerateOptions {
   codexBin: string;
   outDir: string;
@@ -29,6 +31,7 @@ export async function generateAppServerSchema(argv: string[]): Promise<void> {
     const codexVersion = commandOutput(options.codexBin, ["--version"]);
     const generated = spawnSync(options.codexBin, generatorArgs, {
       encoding: "utf8",
+      env: buildCodexChildEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (generated.status !== 0) {
@@ -105,7 +108,10 @@ function requireValue(argv: string[], index: number, flag: string): string {
 }
 
 function commandOutput(command: string, args: string[]): string {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    env: buildCodexChildEnv(),
+  });
   if (result.status !== 0) {
     throw new Error(
       `Failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout || "unknown error"}`,

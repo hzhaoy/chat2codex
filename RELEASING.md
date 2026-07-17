@@ -1,9 +1,11 @@
 # Releasing
 
-This checklist is for maintainers publishing Chat2Codex to npm.
+This checklist is for maintainers publishing Chat2Codex to npm and GitHub.
 
 Publishing is triggered by pushing a `v*` git tag. The GitHub Actions workflow
-verifies that the tag name matches `package.json` exactly before publishing.
+verifies that the tag name matches `package.json` exactly, publishes the npm
+package, and then creates the corresponding GitHub Release as the latest
+release.
 
 ## Prepare the release
 
@@ -74,15 +76,17 @@ verifies that the tag name matches `package.json` exactly before publishing.
    git push origin v<version>
    ```
 
-2. Watch the `Publish to npm` workflow.
+2. Watch the `Publish to npm` workflow. It publishes the npm package first and
+   then creates the GitHub Release from the same verified tag.
 
    ```sh
    gh run list --limit 5
    ```
 
-3. Verify npm shows the new version.
+3. Verify both GitHub Releases and npm show the new version.
 
    ```sh
+   gh release view v<version>
    npm view chat2codex version
    ```
 
@@ -91,5 +95,13 @@ verifies that the tag name matches `package.json` exactly before publishing.
 - Before the tag is pushed, the release can be abandoned by reverting the local
   version and changelog changes.
 - After the tag is pushed, inspect the publish workflow before retrying. If npm
-  already accepted the version, do not reuse that version; prepare a new patch
-  release instead.
+  accepted the version but GitHub Release creation failed, do not republish or
+  reuse the version. Create the missing release from the existing tag instead:
+
+  ```sh
+  gh release create v<version> --verify-tag --generate-notes --latest
+  ```
+
+- If npm publication itself failed before the version was accepted, fix the
+  cause and rerun the existing tag workflow. Never move or replace a published
+  release tag.

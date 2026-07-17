@@ -68,6 +68,9 @@ export interface SessionListCardInput {
   cwd: string;
   currentThreadId?: string;
   sessions: SessionCardItem[];
+  title?: string;
+  contextLabel?: string;
+  note?: string;
   page?: number;
   pageSize?: number;
   selectedThreadIndex?: number;
@@ -420,7 +423,7 @@ export function buildSessionListCard(input: SessionListCardInput): LarkInteracti
   const elements: Array<Record<string, unknown>> = [
     {
       tag: "div",
-      text: markdown(`**项目**\n${codeLine(compactPath(input.cwd, 90))}`),
+      text: markdown(`**${escapeLarkMarkdown(input.contextLabel ?? "项目")}**\n${codeLine(compactPath(input.cwd, 90))}`),
     },
     {
       tag: "hr",
@@ -491,7 +494,7 @@ export function buildSessionListCard(input: SessionListCardInput): LarkInteracti
     elements: [
       {
         tag: "plain_text",
-        content: sessionListNote(input.sessions.length, page, pageSize, status),
+        content: input.note ?? sessionListNote(input.sessions.length, page, pageSize, status),
       },
     ],
   });
@@ -505,7 +508,7 @@ export function buildSessionListCard(input: SessionListCardInput): LarkInteracti
       template: status === "selected" ? "green" : "blue",
       title: {
         tag: "plain_text",
-        content: status === "selected" ? "Codex 会话已选择" : "当前项目会话",
+        content: status === "selected" ? "Codex 会话已选择" : input.title ?? "当前项目会话",
       },
     },
     elements,
@@ -686,6 +689,9 @@ function sessionSummaryElements(
   const lines = [
     `**${index + 1}. ${escapeLarkMarkdown(truncate(title, 86))}**`,
     escapeLarkMarkdown(meta),
+    session.preview && session.preview !== title
+      ? `预览：${escapeLarkMarkdown(truncate(session.preview, 120))}`
+      : null,
     session.resumable === false && session.unavailableReason
       ? `原因：${escapeLarkMarkdown(truncate(session.unavailableReason, 120))}`
       : null,

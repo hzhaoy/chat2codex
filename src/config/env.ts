@@ -11,7 +11,7 @@ export interface AccessControlConfig {
   allowedUserIds: string[];
 }
 
-const codexApprovalPolicies = ["untrusted", "on-request", "on-failure", "never"] as const;
+const codexApprovalPolicies = ["untrusted", "on-request", "never"] as const;
 
 const timeoutEnv = () =>
   z.preprocess((value) => {

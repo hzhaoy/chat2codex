@@ -21,11 +21,29 @@ const baseContext: AccessContext = {
 };
 
 describe("access control", () => {
-  test("allows direct messages by default", () => {
-    expect(decideAccess(baseConfig, baseContext)).toEqual({ allowed: true });
+  test("requires an explicit sender or chat allowlist for direct messages", () => {
+    expect(decideAccess(baseConfig, baseContext)).toEqual({
+      allowed: false,
+      reason: "sender_not_allowed",
+    });
+
+    expect(
+      decideAccess({ ...baseConfig, allowedChatIds: ["oc_chat"] }, baseContext),
+    ).toEqual({ allowed: true });
+
+    expect(
+      decideAccess({ ...baseConfig, allowedUserIds: ["ou_user"] }, baseContext),
+    ).toEqual({ allowed: true });
+
+    expect(
+      decideAccess(
+        { ...baseConfig, allowDirectMessages: false, allowedChatIds: ["oc_chat"] },
+        baseContext,
+      ),
+    ).toEqual({ allowed: false, reason: "direct_messages_disabled" });
   });
 
-  test("denies group messages unless group access and chat allowlist are both set", () => {
+  test("denies group messages unless the group, chat, and sender are all allowed", () => {
     expect(
       decideAccess(baseConfig, { ...baseContext, chatType: "group" }),
     ).toEqual({ allowed: false, reason: "groups_disabled" });
@@ -40,6 +58,18 @@ describe("access control", () => {
     expect(
       decideAccess(
         { ...baseConfig, allowGroups: true, allowedChatIds: ["oc_chat"] },
+        { ...baseContext, chatType: "group" },
+      ),
+    ).toEqual({ allowed: false, reason: "sender_not_allowed" });
+
+    expect(
+      decideAccess(
+        {
+          ...baseConfig,
+          allowGroups: true,
+          allowedChatIds: ["oc_chat"],
+          allowedUserIds: ["ou_user"],
+        },
         { ...baseContext, chatType: "group" },
       ),
     ).toEqual({ allowed: true });

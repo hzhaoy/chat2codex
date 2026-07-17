@@ -83,7 +83,9 @@ describe("CLI", () => {
       "BRIDGE_STATE_PATH",
       "ATTACHMENT_DOWNLOAD_DIR",
       "CODEX_BIN",
+      "CODEX_SANDBOX",
       "ALLOW_GROUPS",
+      "ALLOWED_USER_IDS",
       "CODEX_APPROVAL_POLICY",
       "CODEX_RUN_TIMEOUT_MS",
       "CODEX_APPROVAL_TIMEOUT_MS",
@@ -100,7 +102,9 @@ describe("CLI", () => {
       process.env.BRIDGE_STATE_PATH = path.join(stateDir, "state.json");
       process.env.ATTACHMENT_DOWNLOAD_DIR = attachmentDir;
       process.env.CODEX_BIN = process.execPath;
+      process.env.CODEX_SANDBOX = "workspace-write";
       process.env.ALLOW_GROUPS = "true";
+      process.env.ALLOWED_USER_IDS = "";
       process.env.CODEX_APPROVAL_POLICY = "never";
       process.env.CODEX_RUN_TIMEOUT_MS = "0";
       process.env.CODEX_APPROVAL_TIMEOUT_MS = "0";

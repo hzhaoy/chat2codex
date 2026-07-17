@@ -13,9 +13,10 @@ without exposing a public webhook server.
 
 - The shipped adapter is Feishu/Lark long connection. Slack, Discord, and other
   adapters are roadmap items.
-- Direct messages are enabled by default and can switch to any local directory.
-- Group chats are disabled by default, must be explicitly allowlisted, and can
-  be constrained to `CODEX_GROUP_ALLOWED_ROOTS`.
+- Direct-message routing is enabled by default, but every sender or direct chat
+  must be explicitly allowlisted except for `/whoami` discovery.
+- Group chats are disabled by default and require both chat and sender
+  allowlists. They can be constrained to `CODEX_GROUP_ALLOWED_ROOTS`.
 - The Codex app-server protocol is experimental. Run the smoke tests in
   [Codex App-Server Guardrails](#codex-app-server-guardrails) after Codex CLI
   upgrades.
@@ -47,10 +48,12 @@ chat2codex setup --workdir /absolute/path/to/your/repo
 
 The setup command renders a terminal QR code and keeps the authorization URL as
 a fallback. Scan it with Feishu/Lark, confirm the app creation, and it writes
-`FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `LARK_DOMAIN` to
+`FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `LARK_DOMAIN`, and the scanning user's
+`open_id` in `ALLOWED_USER_IDS` to
 `~/.chat2codex/.env`. You can still run
 `chat2codex init --workdir /absolute/path/to/your/repo` and edit that env file
-manually if you already have an app.
+manually if you already have an app. After the first start, `/whoami` remains
+available for discovering ids that need to be allowlisted.
 
 Check the local setup, then start the bridge:
 
@@ -100,8 +103,9 @@ when you need a separate bot instance.
 - Feishu/Lark long-connection bot, no public webhook server required.
 - One Codex session per chat.
 - `/status`, `/host`, `/projects`, `/project <index|path>`, `/threads`,
-  `/resume`, `/new`, `/cd <path>`, `/stop`, `/steer`, `/summary`, `/files`,
-  `/diff`, `/logs`, and `/whoami` commands.
+  `/history`, `/search`, `/resume`, `/fork`, `/compact`, `/new`, `/cd <path>`,
+  `/stop`, `/steer`, `/summary`, `/files`, `/diff`, `/logs`, and `/whoami`
+  commands.
 - Local state in JSON.
 - Codex app-server JSON-RPC for machine-readable progress, final output, and
   approval callbacks.
@@ -120,6 +124,8 @@ when you need a separate bot instance.
   active run count, approval wait count, and mobile/team-bot safety warnings.
 - Runtime steering with `/steer <instruction>` for sending follow-up guidance to
   the active Codex turn without waiting behind the chat queue.
+- Search, history, fork, and compact controls for Codex app-server threads from
+  chat, so mobile users can continue older work without returning to the host.
 - Optional run and approval timeouts for unattended team bot deployments.
 - Team-bot friendly error summaries when Codex fails or cannot start.
 - Final Codex replies rendered as Feishu/Lark rich-text posts.
@@ -199,6 +205,10 @@ ALLOW_GROUPS=true
 ALLOWED_CHAT_IDS=oc_xxx
 ```
 
+Group `/whoami` replies expose only `chat_id`, chat type, and the access
+decision. Sender ids are intentionally omitted from group history; use a direct
+message `/whoami` when an administrator needs the sender's available ids.
+
 ## Team Bot Deployment
 
 For a team group, keep the bot allowlisted and run it as a user-level background
@@ -249,7 +259,7 @@ Useful service commands:
 ```bash
 # macOS status and logs
 launchctl print gui/$(id -u)/com.chat2codex.bridge
-tail -f .data/logs/chat2codex.out.log .data/logs/chat2codex.err.log
+tail -f ~/.chat2codex/.data/logs/chat2codex.out.log ~/.chat2codex/.data/logs/chat2codex.err.log
 
 # Linux status and logs
 systemctl --user status chat2codex
@@ -257,6 +267,17 @@ journalctl --user -u chat2codex -f
 
 # Uninstall the user service
 chat2codex service uninstall
+```
+
+The default launchd log directory is `~/.chat2codex/.data/logs` for both npm
+installs and source checkouts. Foreground development with `bun run dev` logs to
+the terminal instead. A source checkout that intentionally wants project-local
+service logs can override them explicitly:
+
+```bash
+bun src/index.ts service install --env .env --project-dir . \
+  --stdout .data/logs/chat2codex.out.log \
+  --stderr .data/logs/chat2codex.err.log
 ```
 
 ## Chat Commands
@@ -268,7 +289,11 @@ chat2codex service uninstall
 | `/projects` | List projects discovered from Codex app-server threads, grouped by cwd. |
 | `/project <index\|path>` | Enter a listed project by number, or switch to a directory path, and start with no selected thread. |
 | `/threads` | List recent Codex conversations for the current project. `/sessions` is an alias. |
+| `/history [index\|turn_id]` | Show recent turns for the current conversation; pass a listed number or turn id to show turn details. |
+| `/search <term>` | Search Codex conversation history and save results for `/resume <index>` or `/fork <index>`. |
 | `/resume <index\|thread_id>` | Continue a listed conversation by number, or load one directly by Codex thread id. |
+| `/fork [index\|thread_id]` | Fork the current, listed, or specified Codex conversation and switch this chat to the new thread. |
+| `/compact` | Request compaction for the current Codex conversation. |
 | `/new` | Start a fresh Codex conversation in the current project. |
 | `/cd <path>` | Change the current chat cwd and start a fresh Codex thread. |
 | `/stop` | Stop the active Codex run for the current chat. The running status card also has a stop button. |
@@ -277,7 +302,7 @@ chat2codex service uninstall
 | `/files` | Show changed files from the most recent run. |
 | `/diff` | Show the latest captured diff from the most recent run. |
 | `/logs` | Show command summaries and captured output previews from the most recent run. |
-| `/whoami` | Show the current `chat_id`, chat type, sender ids, and access decision. |
+| `/whoami` | Show the current `chat_id`, chat type, and access decision; sender ids are included only in direct messages. |
 
 ## Safety Defaults
 
@@ -297,12 +322,34 @@ stuck Codex turn or unattended approval request is cancelled and recorded in
 including relative `CODEX_BIN`, group chats without `ALLOWED_USER_IDS`,
 disabled run/approval timeouts, and high-risk sandbox settings.
 
-Direct messages are enabled by default. Group messages must mention the bot,
-and group chats are disabled by default until enabled with `ALLOW_GROUPS=true`
-plus `ALLOWED_CHAT_IDS`. You can also set `ALLOWED_USER_IDS` to a
-comma-separated list of sender `open_id`, `user_id`, or `union_id` values.
-Direct messages can switch to any local directory. Group chats are constrained
-to `CODEX_GROUP_ALLOWED_ROOTS`, or to `CODEX_WORKDIR` when that list is empty.
+If a chat's selected cwd is deleted, an `ENOENT` startup failure is treated as
+a missing workspace rather than a missing Codex binary. Chat2Codex clears the
+selected thread, switches the chat back to `CODEX_WORKDIR` when that directory
+is still allowed, and asks the user to resend the task. If the default cwd is
+also unavailable, use `/cd <existing-directory>` before retrying.
+
+Direct-message routing is enabled by default, but messages other than `/whoami`
+must come from a sender in `ALLOWED_USER_IDS` or a direct chat in
+`ALLOWED_CHAT_IDS`. Group messages must mention the bot and require all three:
+`ALLOW_GROUPS=true`, an allowed chat, and a sender in `ALLOWED_USER_IDS`.
+Authorized direct messages can switch to any local directory. Group chats are
+constrained to canonical paths under `CODEX_GROUP_ALLOWED_ROOTS`, or under
+`CODEX_WORKDIR` when that list is empty; symlinks cannot bypass the boundary.
+
+Incoming events are persisted to a pending inbox before the long-connection
+handler returns. They become processed only after handling and reply delivery,
+and pending events are replayed after restart. Codex runs targeting the same
+workspace are serialized across chats, while different workspaces can run in
+parallel; `/status` and `/stop` also cover runs waiting for a workspace lock.
+Only one bridge process may use a given `BRIDGE_STATE_PATH`. Recovery is
+at-least-once: a rare interruption after Codex side
+effects but before reply delivery can replay the task, so keep approvals and Git
+review enabled for sensitive work.
+
+The instance lock is removed on normal shutdown. A `SIGKILL` or fatal runtime
+crash can leave `<BRIDGE_STATE_PATH>.lock`; after confirming that no bridge
+process is running, remove that lock directory before restarting. It is never
+reclaimed automatically because doing so can race with another startup.
 
 Do not run this bot in a group with untrusted people while using broad filesystem access. A chat bot that can drive a local coding agent is effectively a remote control surface for your machine.
 
@@ -337,5 +384,5 @@ chat or reporting a security issue.
 
 ## Next Features To Add
 
-1. Advanced thread controls beyond start/resume/reset, such as history, compact, fork, and rollback after app-server support is verified.
+1. Advanced thread rollback after app-server support and file-change safety are verified.
 2. A chat-adapter boundary before adding Slack, Discord, or other platforms.

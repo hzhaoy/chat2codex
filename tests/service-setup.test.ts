@@ -13,6 +13,7 @@ describe("service setup", () => {
     const options = createServiceOptions({
       target: "launchd",
       projectDir: "/tmp/chat&codex",
+      envFile: "/tmp/chat&codex/.env",
       nodeBin: "/opt/node/bin/node",
       pathEnv: "/opt/node/bin:/usr/bin",
       launchdLabel: "com.example.chat2codex",
@@ -25,9 +26,13 @@ describe("service setup", () => {
     expect(plist).toContain("<string>/tmp/chat&amp;codex/dist/index.js</string>");
     expect(plist).toContain("<key>WorkingDirectory</key>");
     expect(plist).toContain("<string>/tmp/chat&amp;codex</string>");
+    expect(plist).toContain("<key>CHAT2CODEX_ENV</key>");
+    expect(plist).toContain("<string>/tmp/chat&amp;codex/.env</string>");
     expect(plist).toContain("<key>PATH</key>");
     expect(plist).toContain("<string>/opt/node/bin:/usr/bin</string>");
     expect(plist).toContain("<key>KeepAlive</key>");
+    expect(options.stdoutPath).toEndWith("/.chat2codex/.data/logs/chat2codex.out.log");
+    expect(options.stderrPath).toEndWith("/.chat2codex/.data/logs/chat2codex.err.log");
   });
 
   test("renders a systemd user unit with quoted paths and env file", () => {

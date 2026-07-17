@@ -9,8 +9,8 @@ Chat2Codex 会把一个飞书/Lark 机器人变成本机 Codex CLI 的消息平�
 ## 当前状态
 
 - 当前已经实现的是飞书/Lark 长连接适配器。Slack、Discord 等其他聊天平台还在路线图中。
-- 私聊默认开启，并且可以切换到任意本机目录。
-- 群聊默认关闭，必须显式加入允许列表，并且可以用 `CODEX_GROUP_ALLOWED_ROOTS` 限制可访问目录。
+- 私聊路由默认开启，但除 `/whoami` 外，发送者或私聊 chat 必须显式加入允许列表；授权后的私聊可以切换到任意本机目录。
+- 群聊默认关闭，启用后必须同时允许 chat 和发送者，并且可以用 `CODEX_GROUP_ALLOWED_ROOTS` 限制可访问目录。
 - Codex app-server 协议仍是实验性能力。升级 Codex CLI 后，请按 [Codex App-Server 防护检查](#codex-app-server-防护检查) 运行 smoke test。
 
 ## 快速开始
@@ -35,7 +35,7 @@ npm install -g chat2codex
 chat2codex setup --workdir /absolute/path/to/your/repo
 ```
 
-setup 命令会在终端渲染二维码，并保留授权 URL 作为备用入口。用飞书/Lark 扫码，确认创建应用后，它会把 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `LARK_DOMAIN` 写入 `~/.chat2codex/.env`。如果你已经有应用，也可以运行 `chat2codex init --workdir /absolute/path/to/your/repo` 后手动编辑这份 env 文件。
+setup 命令会在终端渲染二维码，并保留授权 URL 作为备用入口。用飞书/Lark 扫码，确认创建应用后，它会把 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`LARK_DOMAIN` 和扫码用户的 `open_id`（写入 `ALLOWED_USER_IDS`）保存到 `~/.chat2codex/.env`。如果你已经有应用，也可以运行 `chat2codex init --workdir /absolute/path/to/your/repo` 后手动编辑这份 env 文件；首次启动后可以发送 `/whoami` 获取需要加入允许列表的 id。
 
 检查本地配置，然后启动桥接服务：
 
@@ -72,7 +72,7 @@ Summarize this repository.
 
 - 飞书/Lark 长连接机器人，不需要公网 webhook 服务。
 - 每个 chat 对应一个 Codex 会话。
-- 支持 `/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/resume`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
+- 支持 `/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/compact`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
 - 使用 JSON 保存本地状态。
 - 使用 Codex app-server JSON-RPC 获取机器可读的进度、最终输出和审批回调。
 - Codex 运行时会限频更新状态卡片，并提供停止/重试、本轮详情按钮；卡片不可用时自动回退为文本。
@@ -82,6 +82,7 @@ Summarize this repository.
 - `/status` 会显示队列深度、当前运行时长、审批等待时长和近期失败信息。
 - `/host` 会发送 Host 健康卡，展示桥接主机、Codex binary、默认 cwd、队列、运行中任务、审批等待和移动/群机器人安全提示。
 - 支持用 `/steer <补充指令>` 在当前 Codex 运行中追加指导，不会排在普通聊天任务队列后面。
+- 支持在聊天里搜索、查看、分叉和压缩 Codex app-server 会话，方便从手机继续历史工作。
 - 为无人值守团队机器人提供可选的运行超时和审批超时。
 - Codex 失败或无法启动时，会返回适合团队机器人场景的错误摘要。
 - 最终 Codex 回复会渲染为飞书/Lark 富文本消息。
@@ -139,6 +140,8 @@ ALLOW_GROUPS=true
 ALLOWED_CHAT_IDS=oc_xxx
 ```
 
+群聊中的 `/whoami` 只会显示 `chat_id`、chat 类型和访问判断，不会把发送者 id 写入群消息记录。管理员需要获取发送者可用 id 时，应让该用户私聊机器人发送 `/whoami`。
+
 ## 团队机器人部署
 
 如果要在团队群里使用，请保持机器人在允许列表内，并把它作为用户级后台服务运行，而不是长期把 `chat2codex start` 留在终端里。
@@ -182,7 +185,7 @@ ALLOWED_CHAT_IDS=oc_xxx
 ```bash
 # macOS 状态和日志
 launchctl print gui/$(id -u)/com.chat2codex.bridge
-tail -f .data/logs/chat2codex.out.log .data/logs/chat2codex.err.log
+tail -f ~/.chat2codex/.data/logs/chat2codex.out.log ~/.chat2codex/.data/logs/chat2codex.err.log
 
 # Linux 状态和日志
 systemctl --user status chat2codex
@@ -190,6 +193,14 @@ journalctl --user -u chat2codex -f
 
 # 卸载用户级服务
 chat2codex service uninstall
+```
+
+无论通过 npm 安装还是从源码安装用户服务，launchd 日志默认都写入 `~/.chat2codex/.data/logs`。前台执行 `bun run dev` 时，日志只输出到终端。如果源码开发时确实希望后台服务写入项目内目录，可以显式覆盖：
+
+```bash
+bun src/index.ts service install --env .env --project-dir . \
+  --stdout .data/logs/chat2codex.out.log \
+  --stderr .data/logs/chat2codex.err.log
 ```
 
 ## 聊天命令
@@ -201,7 +212,11 @@ chat2codex service uninstall
 | `/projects` | 按 cwd 分组列出 Codex app-server 发现的项目。 |
 | `/project <index\|path>` | 通过编号进入已列出的项目，或切换到指定目录，并清空当前选中的线程。 |
 | `/threads` | 列出当前项目最近的 Codex 对话。`/sessions` 是别名。 |
+| `/history [index\|turn_id]` | 查看当前会话最近历史轮次；带编号或 turn id 时查看该轮详情。 |
+| `/search <关键词>` | 搜索 Codex 历史对话，并把结果保存为可 `/resume <编号>` 或 `/fork <编号>` 操作的列表。 |
 | `/resume <index\|thread_id>` | 通过编号继续已列出的对话，或直接通过 Codex thread id 加载。 |
+| `/fork [index\|thread_id]` | 分叉当前、已列出或指定的 Codex 会话，并把当前 chat 切到新 thread。 |
+| `/compact` | 请求压缩当前 Codex 会话。 |
 | `/new` | 在当前项目开始一个新的 Codex 对话。 |
 | `/cd <path>` | 修改当前 chat 的 cwd，并开始一个新的 Codex thread。 |
 | `/stop` | 停止当前 chat 正在运行的 Codex。运行状态卡片里也有停止按钮。 |
@@ -210,7 +225,7 @@ chat2codex service uninstall
 | `/files` | 查看最近一轮变更文件。 |
 | `/diff` | 查看最近一轮捕获到的 diff。 |
 | `/logs` | 查看最近一轮命令摘要和输出预览。 |
-| `/whoami` | 显示当前 `chat_id`、chat 类型、发送者 id 和访问判断。 |
+| `/whoami` | 显示当前 `chat_id`、chat 类型和访问判断；仅在私聊中显示发送者 id。 |
 
 ## 安全默认值
 
@@ -222,7 +237,13 @@ Chat2Codex 默认使用 `CODEX_SANDBOX=workspace-write`，所以 Codex 可以编
 
 `chat2codex doctor` 和 `/host` 都会提示移动/群机器人常见风险，包括相对路径 `CODEX_BIN`、群聊开启但没有 `ALLOWED_USER_IDS`、关闭运行/审批超时，以及高风险 sandbox 配置。
 
-私聊默认开启。群聊消息必须提到机器人，并且群聊默认关闭，直到同时配置 `ALLOW_GROUPS=true` 和 `ALLOWED_CHAT_IDS`。你也可以把 `ALLOWED_USER_IDS` 设置为发送者 `open_id`、`user_id` 或 `union_id` 的逗号分隔列表。私聊可以切换到任意本机目录；群聊只能切换到 `CODEX_GROUP_ALLOWED_ROOTS`，如果没有配置这个变量，则只能使用 `CODEX_WORKDIR`。
+如果某个 chat 当前选择的 cwd 后来被删除，Chat2Codex 会把启动时的 `ENOENT` 判断为工作目录缺失，而不是误报 Codex binary 缺失。只要默认 `CODEX_WORKDIR` 仍存在且允许访问，它会清空当前 thread、切回默认 cwd，并提示用户重新发送任务；如果默认 cwd 也不可用，请先发送 `/cd <现有目录>`。
+
+私聊路由默认开启，但除 `/whoami` 外，必须由 `ALLOWED_USER_IDS` 中的发送者发出，或来自 `ALLOWED_CHAT_IDS` 中的私聊 chat。群聊消息必须提到机器人，并且只有同时配置 `ALLOW_GROUPS=true`、允许的 chat 和 `ALLOWED_USER_IDS` 中的发送者才会执行。`ALLOWED_USER_IDS` 接受逗号分隔的 `open_id`、`user_id` 或 `union_id`。授权后的私聊可以切换到任意本机目录；群聊只能切换到 `CODEX_GROUP_ALLOWED_ROOTS` 的真实路径，软链接不能绕过限制。
+
+飞书事件会先写入本地 pending inbox，再向长连接返回；处理完成并成功发送回复后才标记为 processed。服务重启会重放未完成消息。同一个工作区的 Codex 任务会跨 chat 串行执行，不同工作区仍可并行；等待工作区锁的任务也会显示在 `/status` 中，并可用 `/stop` 取消。同一份 `BRIDGE_STATE_PATH` 只允许一个桥接进程使用。该机制提供 at-least-once 恢复语义：极少数“Codex 已产生副作用、但回复发送前进程中断”的场景仍可能在重放时重复执行，应结合审批和 Git 检查使用。
+
+正常退出会自动删除实例锁。若进程被 `SIGKILL` 或运行时发生致命崩溃，可能遗留 `<BRIDGE_STATE_PATH>.lock`；确认没有 Chat2Codex 进程运行后，再手动删除这个锁目录并重启。为避免与另一次启动竞争，程序不会自动回收陈旧实例锁。
 
 不要在有不可信成员的群里，以宽泛文件系统权限运行这个机器人。一个能驱动本地 coding agent 的聊天机器人，本质上就是你机器的远程控制入口。
 
@@ -253,5 +274,5 @@ bun run check
 
 ## 后续功能
 
-1. 在 app-server 支持验证完成后，加入更高级的线程控制能力，例如 history、compact、fork 和 rollback。
+1. 在 app-server 支持验证完成后，加入更高级的线程控制能力，例如 rollback。
 2. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。
