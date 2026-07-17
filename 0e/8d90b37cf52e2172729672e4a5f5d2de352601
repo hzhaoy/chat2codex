@@ -1,0 +1,101 @@
+.env.example
+  s_5d7c7bea71a1f2::t_3610cdeab68317 15-16,29-31
+CHANGELOG.md
+  s_5d7c7bea71a1f2::t_0a2c468f3d451a 10-43
+README.md
+  s_5d7c7bea71a1f2::t_d78efeaa059599 16-19,51-52,55-56,106-108,127-128,208-211,262,272-282,292-293,295-296,305,325-352,387
+README.zh-CN.md
+  s_5d7c7bea71a1f2::t_4bd9525888b265 12-13,38,75,85,143-144,188,198-205,215-216,218-219,228,240-246,277
+SECURITY.md
+  s_5d7c7bea71a1f2::t_a824db2abdf285 24-29,31,39-46
+bun.lock
+  s_5d7c7bea71a1f2::t_ed3c5d15d14475 10,16,48-49,52-53,94-95,122-123,132-133,142-143
+docs/codex-app-server-protocol/codex_app_server_protocol.schemas.json
+  s_5d7c7bea71a1f2::t_c23160ba41b716 1044,1046,1049,1052,2365-2389,6528,6644-6665,6706-6712,6743-6746,6823-6833,7703-7708,8404-8410,9149,9208-9214,9260,9471,9473,9476,9510-9514,10791-10797,11411-11423,11444-11449,11582-11588,11619-11629,11639-11641,11719-11725,12323-12329,12378-12388,12553,12974-12985,13000-13005,13340-13350,13369-13377,13379,13471-13474,14067,14330,14882,14903,15308,15310,15905-15911,16246-16279,16332-16341,16393-16400,16918-16935,18150-18193,18741-18797,18807-18816,18820-18826,19356,20407-20416,20618-20632,20755-20781,22656-22661,22665-22670,22695-22704,22743-22749
+docs/codex-app-server-protocol/manifest.json
+  s_5d7c7bea71a1f2::t_6c36bd4a6818a6 2-3,6
+package.json
+  s_5d7c7bea71a1f2::t_fe2c7bb817b078 54,60
+src/agent/codex-environment.ts
+  s_5d7c7bea71a1f2::t_01e9a0be918156 1-43
+src/agent/codex-runner.ts
+  s_5d7c7bea71a1f2::t_2906869d8db165 6,129-202,264-356,381,498-501,691,1208-1226,1249-1362
+src/bot/access-control.ts
+  s_5d7c7bea71a1f2::t_0b4899c2bb96b4 27-33,36,45-47
+src/bot/lark-bot.ts
+  s_5d7c7bea71a1f2::t_6562864bfa0a49 115-116,121,217,250-256
+src/bot/lark-card.ts
+  s_21e9f06515a4b4::t_dd04e7cc7319d2 71-73,426,497,511,692-694
+src/bot/message-router.ts
+  s_5d7c7bea71a1f2::t_9daa364a268d37 2,11,19,22-28,30,35,43,47,149-153,187-196,210-211,213,232-244,266-269,271,278,281,284,287,290,296-311,313-318,322,379-418,432-434,436,486-493,498-505,520,546-551,554-613,632-643,653-655,808-842,848,864-865,867,869-878,884-885,896,1066-1071,1073-1074,1087,1101,1108,1273,1277,1284-1290,1302-1304,1311-1313,1315-1316,1320,1324-1325,1330-1331,1472,1518-1653,1711-1857,1869,1887,1897-1899,1903,1906-1918,1922-1934,2015-2021,2054-2060,2435-2442,2449,2480-2481,2483,2486,2546-2548,2794,2811-2817,2819,2923,2928,2935-3079,3185-3190,3192,3262-3267,3269-3271,3280-3287,3315-3338,3413-3432,3478-3520,3595-3600,3603-3610
+src/cli.ts
+  s_5d7c7bea71a1f2::t_22f4212ec72c35 9,13,144-153,161-162,204,426-429,453-463,468
+src/config/env.ts
+  s_bbf109802b9d9a::t_0d17048a8814eb 14
+src/setup/feishu.ts
+  s_5d7c7bea71a1f2::t_7ef69792c3d3e2 97-102,215,250-253
+src/setup/generate-app-server-schema.ts
+  s_5d7c7bea71a1f2::t_afc44965f683e4 8-9,34,111-114
+src/setup/service.ts
+  s_5d7c7bea71a1f2::t_3fa637411d630f 63,123-124,191,436-439
+src/setup/smoke-app-server.ts
+  s_5d7c7bea71a1f2::t_57a30062e57e81 8-9,11,230,461,534,568-571
+src/state/instance-lock.ts
+  s_5d7c7bea71a1f2::t_d812426b38afba 1-70
+src/state/store.ts
+  s_5d7c7bea71a1f2::t_341be8057e7a94 1,9,20,37-74
+src/state/types.ts
+  s_5d7c7bea71a1f2::t_b6bff6a1cb97f4 8,31-40,91,97-100,103,123-142,145,152
+tests/access-control.test.ts
+  s_5d7c7bea71a1f2::t_4e81efe96e7f92 24-43,46,63-74
+tests/cli.test.ts
+  s_5d7c7bea71a1f2::t_f769bcf0978a53 86,88,105,107
+tests/codex-environment.test.ts
+  s_5d7c7bea71a1f2::t_eab497c33564ca 1-43
+tests/codex-runner.test.ts
+  s_5d7c7bea71a1f2::t_1f2e760dbc6c02 239-419
+tests/config.test.ts
+  s_bbf109802b9d9a::t_038f5620ab12d9 88-98
+tests/instance-lock.test.ts
+  s_5d7c7bea71a1f2::t_76a1a9cbb4b74e 1-64
+tests/message-router.test.ts
+  s_5d7c7bea71a1f2::t_e6e270a67d11a0 1,15,18-25,66-75,196-200,202-210,232-285,350-383,615-890,919-921,926-943,996-1057,1083,1540-1748,1998,2033-2054,2492-2532,2682-2690,2894,2903,2914,2916-2917,3135-3143,3205,3244-3256
+tests/service-setup.test.ts
+  s_5d7c7bea71a1f2::t_303db1597dce62 16,29-30,34-35
+tests/state-store.test.ts
+  s_5d7c7bea71a1f2::t_b20cf11343a337 1,13-20,30,64-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0e8d90b37cf52e2172729672e4a5f5d2de352601",
+  "prompts": {},
+  "sessions": {
+    "s_21e9f06515a4b4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f37bf-0ec8-7932-aee2-4823c014d82c",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_5d7c7bea71a1f2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69bb-5676-7081-baa3-5c590644e4f5",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_bbf109802b9d9a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69e5-0d58-7e71-92a9-5b248becea81",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
