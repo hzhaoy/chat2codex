@@ -1,0 +1,29 @@
+.github/workflows/npm-publish.yml
+  s_5d7c7bea71a1f2::t_00061c279b808a 18-19,40-42,55
+CHANGELOG.md
+  s_5d7c7bea71a1f2::t_457c43256efbe1 10-15
+RELEASING.md
+  s_5d7c7bea71a1f2::t_dc23c80e5842b6 6-10,37-39,84-85,107-109
+scripts/render-release-notes.mjs
+  s_5d7c7bea71a1f2::t_718b742670200c 1-133
+tests/release-notes.test.ts
+  s_5d7c7bea71a1f2::t_9f8c175ad5eb8d 1-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7f86ff2b76a72e1a7692db48a8e74ed804c82bf1",
+  "prompts": {},
+  "sessions": {
+    "s_5d7c7bea71a1f2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69bb-5676-7081-baa3-5c590644e4f5",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
