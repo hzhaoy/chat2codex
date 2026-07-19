@@ -1,0 +1,37 @@
+src/cli.ts
+  s_c2c8f88cafcaa3::t_19f126ad3ce03b 12-17,32,38-42,63,221,253-255,387-424,466,472,474-479,483-488,576-579
+src/package-info.ts
+  s_c2c8f88cafcaa3::t_fb73217a9221f0 1-51
+src/setup/smoke-app-server.ts
+  s_4a82df81f9f349::t_522c705dbce589 9,16-19,34,43,87-92,99,106,140,215,303-306,309,334-339,388-393,414-418,424-462,701-776,779,809-814
+tests/cli.test.ts
+  s_c2c8f88cafcaa3::t_8d29de72a3b6bd 6,39-57,163-213,216-304
+tests/smoke-app-server.test.ts
+  s_4a82df81f9f349::t_d155ff522ea2e6 1-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "03e94c7a1f845945952415f23eb898ba64af9126",
+  "prompts": {},
+  "sessions": {
+    "s_4a82df81f9f349": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7994-101a-7021-b438-8ca6e53318d6",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_c2c8f88cafcaa3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f797f-d2fe-75e2-8288-e8bb3dac53c4",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
