@@ -1,6 +1,6 @@
 {
   "name": "chat2codex",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Run local Codex from Feishu/Lark chat.",
   "type": "module",
   "main": "./dist/index.js",

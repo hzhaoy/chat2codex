@@ -7,6 +7,8 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.4.1 - 2026-07-19
+
 ### Changed
 
 - GitHub Releases now use the matching `CHANGELOG.md` version section for
