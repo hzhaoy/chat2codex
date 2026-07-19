@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import readline from "node:readline";
+import { isDeepStrictEqual } from "node:util";
 
 import type { BridgeConfig } from "../config/env.js";
+import { readPackageVersion } from "../package-info.js";
 import type { Logger } from "../util/logger.js";
 import { buildCodexChildEnv } from "./codex-environment.js";
 
@@ -66,12 +69,15 @@ export type CodexApprovalDecision =
   | "cancel"
   | {
       acceptWithExecpolicyAmendment: {
-        execpolicy_amendment: unknown;
+        execpolicy_amendment: string[];
       };
     }
   | {
       applyNetworkPolicyAmendment: {
-        network_policy_amendment: unknown;
+        network_policy_amendment: {
+          action: "allow" | "deny";
+          host: string;
+        };
       };
     };
 
@@ -89,6 +95,7 @@ export interface CodexApprovalRequest {
   grantRoot?: string | null;
   commandActions?: unknown[];
   additionalPermissions?: unknown;
+  networkApprovalContext?: unknown;
   proposedExecpolicyAmendment?: unknown;
   proposedNetworkPolicyAmendments?: unknown[];
   decisions: CodexApprovalDecision[];
@@ -218,9 +225,34 @@ interface JsonRpcResponse {
   id: unknown;
   result?: unknown;
   error?: {
+    code?: number;
     message?: string;
   };
 }
+
+type ApprovalParseResult =
+  | { status: "supported"; request: CodexApprovalRequest }
+  | { status: "malformed"; message: string }
+  | { status: "unsupported" };
+
+type SafeServerRequestResult =
+  | { status: "handled"; result: Record<string, unknown> }
+  | { status: "malformed"; message: string }
+  | { status: "not-applicable" };
+
+type JsonRpcServerResponse =
+  | { id: string | number | null; result: unknown }
+  | { id: string | number | null; error: { code: number; message: string } };
+
+const knownUnsupportedServerRequestMethods = new Set([
+  "item/tool/requestUserInput",
+  "item/tool/call",
+  "account/chatgptAuthTokens/refresh",
+  "attestation/generate",
+  "currentTime/read",
+  "applyPatchApproval",
+  "execCommandApproval",
+]);
 
 export class CodexRunner {
   private appServerCliVersion?: string;
@@ -435,11 +467,11 @@ export class CodexRunner {
       return promise;
     };
 
-    const resolveServerRequest = (id: unknown, result: unknown) => {
+    const respondToServerRequest = (response: JsonRpcServerResponse) => {
       try {
-        sendJson({ id, result });
+        sendJson(response);
       } catch (error) {
-        this.logger.warn("Failed to resolve Codex app-server request", error);
+        this.logger.warn("Failed to respond to Codex app-server request", error);
       }
     };
 
@@ -465,10 +497,22 @@ export class CodexRunner {
       }
 
       if (isJsonRpcRequest(message)) {
-        this.handleAppServerRequest(message, input, resolveServerRequest, (decision) => {
-          if (decision === "cancel") {
-            approvalCancelled = true;
-          }
+        this.handleAppServerRequest(
+          message,
+          input.onApprovalRequest,
+          respondToServerRequest,
+          (decision) => {
+            if (decision === "cancel") {
+              approvalCancelled = true;
+            }
+          },
+        );
+        return;
+      }
+      if (isInvalidJsonRpcRequestEnvelope(message)) {
+        respondToServerRequest({
+          id: null,
+          error: { code: -32600, message: "Invalid Request" },
         });
         return;
       }
@@ -571,7 +615,7 @@ export class CodexRunner {
         clientInfo: {
           name: "chat2codex",
           title: "Chat2Codex",
-          version: "0.1.0",
+          version: await readPackageVersion(),
         },
         capabilities: {
           experimentalApi: true,
@@ -579,6 +623,7 @@ export class CodexRunner {
         },
       });
       this.rememberAppServerInfo(initializeResult);
+      sendJson({ method: "initialized" });
 
       const threadResult = input.threadId
         ? await sendRequest("thread/resume", buildThreadResumeParams(this.config, input))
@@ -656,31 +701,76 @@ export class CodexRunner {
 
   private handleAppServerRequest(
     message: JsonRpcRequest,
-    input: CodexRunInput,
-    resolveServerRequest: (id: unknown, result: unknown) => void,
+    onApprovalRequest: CodexRunInput["onApprovalRequest"],
+    respond: (response: JsonRpcServerResponse) => void,
     onApprovalDecision: (decision: CodexApprovalDecision) => void,
   ): void {
-    const approval = toCodexApprovalRequest(message);
-    if (!approval) {
-      resolveServerRequest(message.id, {});
+    if (!isRequestId(message.id)) {
+      respond({ id: null, error: { code: -32600, message: "Invalid Request" } });
+      return;
+    }
+    const requestId = message.id;
+
+    const safeRequest = parseSafeServerRequest(message);
+    if (safeRequest.status === "handled") {
+      respond({ id: requestId, result: safeRequest.result });
+      return;
+    }
+    if (safeRequest.status === "malformed") {
+      respond({ id: requestId, error: { code: -32602, message: safeRequest.message } });
       return;
     }
 
-    if (!input.onApprovalRequest) {
+    const parsed = parseApprovalRequest(message);
+    if (parsed.status === "unsupported") {
+      const knownMethod = knownUnsupportedServerRequestMethods.has(message.method);
+      respond({
+        id: requestId,
+        error: {
+          code: knownMethod ? -32000 : -32601,
+          message: knownMethod
+            ? `Unsupported app-server request method: ${message.method}`
+            : `Method not found: ${message.method}`,
+        },
+      });
+      return;
+    }
+    if (parsed.status === "malformed") {
+      respond({ id: requestId, error: { code: -32602, message: parsed.message } });
+      return;
+    }
+
+    const approval = parsed.request;
+    if (approval.decisions.length === 0) {
+      onApprovalDecision("cancel");
+      respond({ id: requestId, result: { decision: "cancel" } });
+      return;
+    }
+
+    if (!onApprovalRequest) {
       onApprovalDecision("decline");
-      resolveServerRequest(message.id, { decision: "decline" });
+      respond({ id: requestId, result: { decision: "decline" } });
       return;
     }
 
-    Promise.resolve(input.onApprovalRequest(approval))
+    Promise.resolve()
+      .then(() => onApprovalRequest(approval))
       .then((decision) => {
+        if (!isCodexApprovalDecision(decision) || !isOfferedDecision(decision, approval.decisions)) {
+          this.logger.warn("Codex approval callback returned an unavailable decision; cancelling", {
+            requestId: approval.id,
+          });
+          onApprovalDecision("cancel");
+          respond({ id: requestId, result: { decision: "cancel" } });
+          return;
+        }
         onApprovalDecision(decision);
-        resolveServerRequest(message.id, { decision });
+        respond({ id: requestId, result: { decision } });
       })
       .catch((error: unknown) => {
         this.logger.warn("Codex approval callback failed; cancelling approval request", error);
         onApprovalDecision("cancel");
-        resolveServerRequest(message.id, { decision: "cancel" });
+        respond({ id: requestId, result: { decision: "cancel" } });
       });
   }
 
@@ -754,10 +844,25 @@ export class CodexRunner {
         return;
       }
       if (isJsonRpcRequest(message)) {
+        this.handleAppServerRequest(
+          message,
+          undefined,
+          (response) => {
+            try {
+              sendJson(response);
+            } catch (error) {
+              this.logger.warn("Failed to respond to Codex app-server request", error);
+            }
+          },
+          () => undefined,
+        );
+        return;
+      }
+      if (isInvalidJsonRpcRequestEnvelope(message)) {
         try {
-          sendJson({ id: message.id, result: {} });
+          sendJson({ id: null, error: { code: -32600, message: "Invalid Request" } });
         } catch (error) {
-          this.logger.warn("Failed to resolve Codex app-server request", error);
+          this.logger.warn("Failed to respond to invalid Codex app-server request", error);
         }
       }
     });
@@ -792,7 +897,7 @@ export class CodexRunner {
           clientInfo: {
             name: "chat2codex",
             title: "Chat2Codex",
-            version: "0.1.0",
+            version: await readPackageVersion(),
           },
           capabilities: {
             experimentalApi: true,
@@ -800,6 +905,7 @@ export class CodexRunner {
           },
         });
         this.rememberAppServerInfo(initializeResult);
+        sendJson({ method: "initialized" });
         return sendRequest(method, params);
       })();
       return await Promise.race([operation, timeout]);
@@ -915,7 +1021,7 @@ export function parseCodexJsonLine(line: string): CodexJsonEvent | null {
 
 function parseJsonLine(line: string): Record<string, unknown> | null {
   try {
-    return JSON.parse(line) as Record<string, unknown>;
+    return asObjectRecord(JSON.parse(line));
   } catch {
     return null;
   }
@@ -923,6 +1029,10 @@ function parseJsonLine(line: string): Record<string, unknown> | null {
 
 function isJsonRpcRequest(message: Record<string, unknown>): message is JsonRpcRequest {
   return "id" in message && typeof message.method === "string";
+}
+
+function isInvalidJsonRpcRequestEnvelope(message: Record<string, unknown>): boolean {
+  return "id" in message && "method" in message;
 }
 
 function isJsonRpcNotification(message: Record<string, unknown>): message is JsonRpcNotification {
@@ -1133,53 +1243,345 @@ function getItemName(item: CodexJsonEvent["item"]): string | undefined {
   return normalized.length > 60 ? `${normalized.slice(0, 57)}...` : normalized;
 }
 
-function toCodexApprovalRequest(message: JsonRpcRequest): CodexApprovalRequest | null {
-  const params = message.params ?? {};
-  if (message.method === "item/commandExecution/requestApproval") {
-    return {
-      id: approvalRequestKey(message.id),
-      kind: "command",
-      threadId: getString(params, "threadId"),
-      turnId: getString(params, "turnId"),
-      itemId: getString(params, "itemId"),
-      approvalId: getString(params, "approvalId") ?? null,
-      startedAtMs: getNumber(params, "startedAtMs"),
-      reason: getString(params, "reason") ?? null,
-      command: getString(params, "command") ?? null,
-      cwd: getString(params, "cwd") ?? null,
-      commandActions: Array.isArray(params.commandActions) ? params.commandActions : undefined,
-      additionalPermissions: params.additionalPermissions,
-      proposedExecpolicyAmendment: params.proposedExecpolicyAmendment,
-      proposedNetworkPolicyAmendments: Array.isArray(params.proposedNetworkPolicyAmendments)
-        ? params.proposedNetworkPolicyAmendments
-        : undefined,
-      decisions: parseCommandDecisions(params.availableDecisions),
-    };
+function parseSafeServerRequest(message: JsonRpcRequest): SafeServerRequestResult {
+  if (message.method === "mcpServer/elicitation/request") {
+    const params = asObjectRecord(message.params);
+    if (!params || !isValidMcpElicitationParams(params)) {
+      return { status: "malformed", message: "Invalid params: malformed MCP elicitation" };
+    }
+    return { status: "handled", result: { action: "cancel", content: null } };
   }
 
-  if (message.method === "item/fileChange/requestApproval") {
-    return {
-      id: approvalRequestKey(message.id),
-      kind: "file_change",
-      threadId: getString(params, "threadId"),
-      turnId: getString(params, "turnId"),
-      itemId: getString(params, "itemId"),
-      startedAtMs: getNumber(params, "startedAtMs"),
-      reason: getString(params, "reason") ?? null,
-      grantRoot: getString(params, "grantRoot") ?? null,
-      decisions: ["accept", "acceptForSession", "decline", "cancel"],
-    };
+  if (message.method === "item/permissions/requestApproval") {
+    const params = asObjectRecord(message.params);
+    if (!params || !isValidPermissionsApprovalParams(params)) {
+      return { status: "malformed", message: "Invalid params: malformed permission approval" };
+    }
+    return { status: "handled", result: { permissions: {}, scope: "turn" } };
   }
 
-  return null;
+  return { status: "not-applicable" };
 }
 
-function parseCommandDecisions(value: unknown): CodexApprovalDecision[] {
-  if (!Array.isArray(value)) {
-    return ["accept", "acceptForSession", "decline", "cancel"];
+function isValidMcpElicitationParams(params: Record<string, unknown>): boolean {
+  if (
+    typeof params.serverName !== "string" ||
+    typeof params.threadId !== "string" ||
+    !isOptionalNullableString(params.turnId) ||
+    typeof params.message !== "string" ||
+    typeof params.mode !== "string"
+  ) {
+    return false;
   }
-  const decisions = value.filter(isCodexApprovalDecision);
-  return decisions.length ? decisions : ["accept", "acceptForSession", "decline", "cancel"];
+  if (params.mode === "form" || params.mode === "openai/form") {
+    return Object.hasOwn(params, "requestedSchema");
+  }
+  return (
+    params.mode === "url" &&
+    typeof params.elicitationId === "string" &&
+    typeof params.url === "string"
+  );
+}
+
+function isValidPermissionsApprovalParams(params: Record<string, unknown>): boolean {
+  return (
+    typeof params.cwd === "string" &&
+    typeof params.itemId === "string" &&
+    isRequestPermissionProfile(params.permissions) &&
+    typeof params.startedAtMs === "number" &&
+    Number.isInteger(params.startedAtMs) &&
+    typeof params.threadId === "string" &&
+    typeof params.turnId === "string" &&
+    isOptionalNullableString(params.environmentId) &&
+    isOptionalNullableString(params.reason)
+  );
+}
+
+function parseApprovalRequest(message: JsonRpcRequest): ApprovalParseResult {
+  if (
+    message.method !== "item/commandExecution/requestApproval" &&
+    message.method !== "item/fileChange/requestApproval"
+  ) {
+    return { status: "unsupported" };
+  }
+
+  const params = asObjectRecord(message.params);
+  if (!params) {
+    return { status: "malformed", message: "Invalid params: expected an object" };
+  }
+  const threadId = getString(params, "threadId");
+  const turnId = getString(params, "turnId");
+  const itemId = getString(params, "itemId");
+  const startedAtMs = getNumber(params, "startedAtMs");
+  if (
+    threadId === undefined ||
+    turnId === undefined ||
+    itemId === undefined ||
+    startedAtMs === undefined ||
+    !Number.isInteger(startedAtMs)
+  ) {
+    return {
+      status: "malformed",
+      message: "Invalid params: threadId, turnId, itemId, and integer startedAtMs are required",
+    };
+  }
+
+  if (message.method === "item/commandExecution/requestApproval") {
+    if (!hasValidCommandApprovalOptionalParams(params)) {
+      return {
+        status: "malformed",
+        message: "Invalid params: command approval fields do not match the protocol schema",
+      };
+    }
+    const decisions = parseCommandDecisions(params.availableDecisions);
+    if (!decisions) {
+      return {
+        status: "malformed",
+        message: "Invalid params: availableDecisions contains an unsupported decision",
+      };
+    }
+    return {
+      status: "supported",
+      request: {
+        id: randomUUID(),
+        kind: "command",
+        threadId,
+        turnId,
+        itemId,
+        approvalId: getString(params, "approvalId") ?? null,
+        startedAtMs,
+        reason: getString(params, "reason") ?? null,
+        command: getString(params, "command") ?? null,
+        cwd: getString(params, "cwd") ?? null,
+        commandActions: Array.isArray(params.commandActions) ? params.commandActions : undefined,
+        additionalPermissions: params.additionalPermissions,
+        networkApprovalContext: params.networkApprovalContext,
+        proposedExecpolicyAmendment: Array.isArray(params.proposedExecpolicyAmendment)
+          ? params.proposedExecpolicyAmendment
+          : undefined,
+        proposedNetworkPolicyAmendments: Array.isArray(params.proposedNetworkPolicyAmendments)
+          ? params.proposedNetworkPolicyAmendments
+          : undefined,
+        decisions,
+      },
+    };
+  }
+
+  if (!hasValidFileChangeApprovalOptionalParams(params)) {
+    return {
+      status: "malformed",
+      message: "Invalid params: file-change approval fields do not match the protocol schema",
+    };
+  }
+  return {
+    status: "supported",
+    request: {
+      id: randomUUID(),
+      kind: "file_change",
+      threadId,
+      turnId,
+      itemId,
+      startedAtMs,
+      reason: getString(params, "reason") ?? null,
+      grantRoot: getString(params, "grantRoot") ?? null,
+      decisions: ["decline", "cancel"],
+    },
+  };
+}
+
+function parseCommandDecisions(value: unknown): CodexApprovalDecision[] | null {
+  if (value === undefined || value === null) {
+    return ["decline", "cancel"];
+  }
+  if (!Array.isArray(value) || !value.every(isCodexApprovalDecision)) {
+    return null;
+  }
+  return value;
+}
+
+function hasValidCommandApprovalOptionalParams(params: Record<string, unknown>): boolean {
+  return (
+    isOptionalNullableString(params.approvalId) &&
+    isOptionalNullableString(params.command) &&
+    isOptionalNullableString(params.cwd) &&
+    isOptionalNullableString(params.environmentId) &&
+    isOptionalNullableString(params.reason) &&
+    isOptionalNullableCommandActions(params.commandActions) &&
+    isOptionalNullablePermissionProfile(params.additionalPermissions) &&
+    isOptionalNullableNetworkApprovalContext(params.networkApprovalContext) &&
+    isOptionalNullableStringArray(params.proposedExecpolicyAmendment) &&
+    isOptionalNullableNetworkPolicyArray(params.proposedNetworkPolicyAmendments)
+  );
+}
+
+function hasValidFileChangeApprovalOptionalParams(params: Record<string, unknown>): boolean {
+  return isOptionalNullableString(params.grantRoot) && isOptionalNullableString(params.reason);
+}
+
+function isOptionalNullableString(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+function isOptionalNullableStringArray(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (Array.isArray(value) && value.every((item) => typeof item === "string"))
+  );
+}
+
+function isOptionalNullableCommandActions(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (Array.isArray(value) && value.every(isCommandAction))
+  );
+}
+
+function isCommandAction(value: unknown): boolean {
+  const action = asObjectRecord(value);
+  if (!action || typeof action.command !== "string") {
+    return false;
+  }
+  if (action.type === "read") {
+    return typeof action.name === "string" && typeof action.path === "string";
+  }
+  if (action.type === "listFiles") {
+    return isOptionalNullableString(action.path);
+  }
+  if (action.type === "search") {
+    return isOptionalNullableString(action.path) && isOptionalNullableString(action.query);
+  }
+  return action.type === "unknown";
+}
+
+function isOptionalNullablePermissionProfile(value: unknown): boolean {
+  return value === undefined || value === null || isAdditionalPermissionProfile(value);
+}
+
+function isAdditionalPermissionProfile(value: unknown): boolean {
+  const profile = asObjectRecord(value);
+  return Boolean(
+    profile &&
+      isOptionalNullableFileSystemPermissions(profile.fileSystem) &&
+      isOptionalNullableNetworkPermissions(profile.network),
+  );
+}
+
+function isRequestPermissionProfile(value: unknown): boolean {
+  const profile = asObjectRecord(value);
+  return Boolean(
+    profile &&
+      Object.keys(profile).every((key) => key === "fileSystem" || key === "network") &&
+      isOptionalNullableFileSystemPermissions(profile.fileSystem) &&
+      isOptionalNullableNetworkPermissions(profile.network),
+  );
+}
+
+function isOptionalNullableFileSystemPermissions(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  const permissions = asObjectRecord(value);
+  return Boolean(
+    permissions &&
+      (permissions.entries === undefined ||
+        permissions.entries === null ||
+        (Array.isArray(permissions.entries) &&
+          permissions.entries.every(isFileSystemSandboxEntry))) &&
+      (permissions.globScanMaxDepth === undefined ||
+        permissions.globScanMaxDepth === null ||
+        (typeof permissions.globScanMaxDepth === "number" &&
+          Number.isInteger(permissions.globScanMaxDepth) &&
+          permissions.globScanMaxDepth >= 1)) &&
+      isOptionalNullableStringArray(permissions.read) &&
+      isOptionalNullableStringArray(permissions.write),
+  );
+}
+
+function isFileSystemSandboxEntry(value: unknown): boolean {
+  const entry = asObjectRecord(value);
+  return Boolean(
+    entry &&
+      (entry.access === "read" || entry.access === "write" || entry.access === "deny") &&
+      isFileSystemPath(entry.path),
+  );
+}
+
+function isFileSystemPath(value: unknown): boolean {
+  const filePath = asObjectRecord(value);
+  if (!filePath) {
+    return false;
+  }
+  if (filePath.type === "path") {
+    return typeof filePath.path === "string";
+  }
+  if (filePath.type === "glob_pattern") {
+    return typeof filePath.pattern === "string";
+  }
+  return filePath.type === "special" && isFileSystemSpecialPath(filePath.value);
+}
+
+function isFileSystemSpecialPath(value: unknown): boolean {
+  const special = asObjectRecord(value);
+  if (!special || !isOptionalNullableString(special.subpath)) {
+    return false;
+  }
+  if (
+    special.kind === "root" ||
+    special.kind === "minimal" ||
+    special.kind === "project_roots" ||
+    special.kind === "tmpdir" ||
+    special.kind === "slash_tmp"
+  ) {
+    return true;
+  }
+  return special.kind === "unknown" && typeof special.path === "string";
+}
+
+function isOptionalNullableNetworkPermissions(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  const permissions = asObjectRecord(value);
+  return Boolean(
+    permissions &&
+      (permissions.enabled === undefined ||
+        permissions.enabled === null ||
+        typeof permissions.enabled === "boolean"),
+  );
+}
+
+function isOptionalNullableNetworkApprovalContext(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  const context = asObjectRecord(value);
+  return Boolean(
+    context &&
+      typeof context.host === "string" &&
+      (context.protocol === "http" ||
+        context.protocol === "https" ||
+        context.protocol === "socks5Tcp" ||
+        context.protocol === "socks5Udp"),
+  );
+}
+
+function isOptionalNullableNetworkPolicyArray(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (Array.isArray(value) && value.every(isNetworkPolicyAmendment))
+  );
+}
+
+function isNetworkPolicyAmendment(value: unknown): boolean {
+  const policy = asObjectRecord(value);
+  return Boolean(
+    policy &&
+      (policy.action === "allow" || policy.action === "deny") &&
+      typeof policy.host === "string",
+  );
 }
 
 function isCodexApprovalDecision(value: unknown): value is CodexApprovalDecision {
@@ -1191,8 +1593,30 @@ function isCodexApprovalDecision(value: unknown): value is CodexApprovalDecision
   ) {
     return true;
   }
-  const record = asRecord(value);
-  return Boolean(record?.acceptWithExecpolicyAmendment || record?.applyNetworkPolicyAmendment);
+  const record = asObjectRecord(value);
+  if (!record || Object.keys(record).length !== 1) {
+    return false;
+  }
+  if ("acceptWithExecpolicyAmendment" in record) {
+    const amendment = asObjectRecord(record.acceptWithExecpolicyAmendment);
+    return Boolean(
+      amendment &&
+        Array.isArray(amendment.execpolicy_amendment) &&
+        amendment.execpolicy_amendment.every((part) => typeof part === "string"),
+    );
+  }
+  if ("applyNetworkPolicyAmendment" in record) {
+    const amendment = asObjectRecord(record.applyNetworkPolicyAmendment);
+    return Boolean(amendment && isNetworkPolicyAmendment(amendment.network_policy_amendment));
+  }
+  return false;
+}
+
+function isOfferedDecision(
+  decision: CodexApprovalDecision,
+  offered: CodexApprovalDecision[],
+): boolean {
+  return offered.some((candidate) => isDeepStrictEqual(candidate, decision));
 }
 
 function parseCodexThreads(value: unknown): CodexThread[] {
@@ -1501,8 +1925,8 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function approvalRequestKey(id: unknown): string {
-  return typeof id === "string" || typeof id === "number" ? String(id) : JSON.stringify(id);
+function isRequestId(value: unknown): value is string | number {
+  return typeof value === "string" || (typeof value === "number" && Number.isInteger(value));
 }
 
 function formatTurnError(error: unknown): string {
@@ -1516,6 +1940,12 @@ function formatTurnError(error: unknown): string {
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+function asObjectRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function getString(record: Record<string, unknown> | null | undefined, key: string): string | undefined {

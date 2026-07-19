@@ -2805,6 +2805,53 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("rejects card callbacks for approval decisions hidden by disclosure guards", async () => {
+    const request: CodexApprovalRequest = {
+      id: "approval_file_1",
+      kind: "file_change",
+      reason: "write outside the current root",
+      grantRoot: "/private/project",
+      decisions: ["accept", "acceptForSession", "decline", "cancel"],
+    };
+    const codex = new ApprovalCodex(request);
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "edit file",
+      });
+      await waitFor(() => sender.approvalCards.length === 1);
+
+      const rejected = await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_file_1",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(rejected).toast).toMatchObject({
+        type: "warning",
+        content: "无法处理审批：该选项未通过安全披露校验。",
+      });
+      expect(codex.decision).toBeUndefined();
+
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_file_1",
+        decisionIndex: 2,
+        sender: { openId: "ou_user" },
+      });
+      await running;
+      expect(codex.decision).toBe("decline");
+    });
+  });
+
   test("status reports pending approval wait details", async () => {
     const request: CodexApprovalRequest = {
       id: "approval_1",

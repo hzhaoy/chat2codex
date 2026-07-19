@@ -17,9 +17,9 @@ without exposing a public webhook server.
   must be explicitly allowlisted except for `/whoami` discovery.
 - Group chats are disabled by default and require both chat and sender
   allowlists. They can be constrained to `CODEX_GROUP_ALLOWED_ROOTS`.
-- The Codex app-server protocol is experimental. Run the smoke tests in
-  [Codex App-Server Guardrails](#codex-app-server-guardrails) after Codex CLI
-  upgrades.
+- The Codex app-server protocol is experimental. Run `chat2codex doctor` and
+  the checks in [Codex App-Server Guardrails](#codex-app-server-guardrails)
+  after installing or upgrading Codex CLI.
 
 ## Quick Start
 
@@ -90,7 +90,7 @@ If card creation or updates fail, it falls back to text progress replies.
 | `chat2codex` / `chat2codex start` | Start the Feishu/Lark bridge. |
 | `chat2codex setup --workdir <path>` | Create/connect a Feishu/Lark app and write `.env`. |
 | `chat2codex init --workdir <path>` | Create a starter `.env` when you already have an app. |
-| `chat2codex doctor` | Check `.env`, Node.js, Codex CLI, workspace paths, and mobile/team-bot safety warnings. |
+| `chat2codex doctor` | Check `.env`, Node.js, Codex CLI and protocol-snapshot versions, workspace paths, and mobile/team-bot safety warnings. |
 | `chat2codex smoke [--mode turn\|approval]` | Verify the Codex app-server protocol locally. |
 | `chat2codex service print\|install\|uninstall` | Manage a user-level launchd/systemd service. |
 
@@ -142,7 +142,17 @@ when you need a separate bot instance.
 
 Chat2Codex uses the experimental `codex app-server --stdio` protocol for
 thread control, progress events, and approval callbacks. After installing or
-upgrading Codex CLI, run the fast local smoke test:
+upgrading Codex CLI, first run:
+
+```bash
+chat2codex doctor
+```
+
+`doctor` compares the exact detected `codex --version` output with the Codex
+version recorded in the bundled protocol snapshot. A mismatch, or a missing or
+unreadable snapshot manifest, is a compatibility warning rather than a failed
+doctor run. Treat it as unverified protocol compatibility and continue with the
+fast local smoke test:
 
 ```bash
 chat2codex smoke
@@ -176,15 +186,26 @@ git diff -- docs/codex-app-server-protocol
 ```
 
 Review schema diffs before changing
-[`src/agent/codex-runner.ts`](src/agent/codex-runner.ts); approval behavior
-should fail closed if the app-server request shape is unknown.
+[`src/agent/codex-runner.ts`](src/agent/codex-runner.ts). Chat2Codex handles only
+explicitly supported app-server server requests. Unknown methods return a
+JSON-RPC method-not-found error; malformed approval requests return an
+invalid-params error without exposing or inventing an approval option. Until
+their interactive UI is implemented, MCP elicitations are cancelled and
+additional-permission requests receive an empty grant.
 
 When `CODEX_APPROVAL_POLICY` allows interactive approvals, Codex app-server
 emits approval requests while a turn is running. Chat2Codex posts a separate
 approval card to the same chat and pauses Codex until an authorized user clicks
 one of the options. The card buttons mirror Codex's `availableDecisions` for
-command execution requests; file-change approval cards use Codex's file-change
-decision set.
+command execution requests. The current file-change approval request does not
+include target files or patch details, so Chat2Codex exposes only decline/cancel
+until those details can be correlated and rendered completely. If command
+decisions are absent or `null`, the bridge likewise exposes only decline/cancel;
+a malformed decision list is rejected as invalid params.
+Cards disclose additional filesystem/network permissions and every exact
+exec/network policy rule. If security-relevant details cannot be rendered
+completely, allow actions are removed and only decline/cancel remain; the
+message router enforces the same decision filter when processing card callbacks.
 
 Apps created with the current `chat2codex setup` flow include that callback.
 If you created the Feishu/Lark app before status-card actions were added,
@@ -384,5 +405,7 @@ chat or reporting a security issue.
 
 ## Next Features To Add
 
-1. Advanced thread rollback after app-server support and file-change safety are verified.
+1. Fork from a selected historical turn with `thread/fork.lastTurnId`, leaving
+   the source thread unchanged. This is not a filesystem rollback and does not
+   restore local file changes.
 2. A chat-adapter boundary before adding Slack, Discord, or other platforms.

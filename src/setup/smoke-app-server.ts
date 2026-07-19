@@ -6,11 +6,16 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { buildCodexChildEnv } from "../agent/codex-environment.js";
+import { readPackageVersion } from "../package-info.js";
 
 type SmokeMode = "handshake" | "turn" | "approval";
 type ApprovalPolicy = "untrusted" | "on-request" | "never";
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+
+type SmokeApprovalDecisionResult =
+  | { ok: true; decision: ApprovalDecision }
+  | { ok: false; message: string };
 
 interface SmokeOptions {
   codexBin: string;
@@ -26,7 +31,7 @@ interface SmokeOptions {
 
 interface JsonRpcRequest {
   [key: string]: unknown;
-  id: string | number;
+  id: unknown;
   method: string;
   params?: Record<string, unknown>;
 }
@@ -35,7 +40,7 @@ interface JsonRpcResponse {
   [key: string]: unknown;
   id: string | number;
   result?: unknown;
-  error?: { message?: string };
+  error?: { code?: number; message?: string };
 }
 
 interface JsonRpcNotification {
@@ -79,20 +84,26 @@ export async function runAppServerSmoke(argv: string[]): Promise<void> {
     );
   }
 
-  const session = new AppServerSmokeSession(options.codexBin, cwd, options.timeoutMs);
+  const session = new AppServerSmokeSession(
+    options.codexBin,
+    cwd,
+    options.timeoutMs,
+    options.approvalDecision,
+  );
   try {
     await session.start();
     await session.request("initialize", {
       clientInfo: {
         name: "chat2codex-smoke",
         title: "Chat2Codex Smoke Test",
-        version: "0.1.0",
+        version: await readPackageVersion(),
       },
       capabilities: {
         experimentalApi: true,
         requestAttestation: false,
       },
     });
+    session.notify("initialized");
 
     const threadResult = await session.request("thread/start", {
       cwd,
@@ -126,6 +137,7 @@ export async function runAppServerSmoke(argv: string[]): Promise<void> {
       await session.waitForTurnCompletion();
     }
 
+    session.assertHealthy();
     if (options.mode === "approval" && session.approvalRequests.length === 0) {
       throw new Error(
         `Approval smoke completed without an app-server approval request. Observed server requests: ${[
@@ -200,6 +212,7 @@ class AppServerSmokeSession {
   private stopping = false;
   private turnStarted = false;
   private turnCompleted = false;
+  private smokeFailure: Error | null = null;
   private closePromise: Promise<void> | null = null;
   private resolveTurn: (() => void) | null = null;
   private rejectTurn: ((error: Error) => void) | null = null;
@@ -287,9 +300,13 @@ class AppServerSmokeSession {
     return promise;
   }
 
+  notify(method: string): void {
+    this.requireChild().stdin.write(`${JSON.stringify({ method })}\n`);
+  }
+
   waitForTurnCompletion(): Promise<void> {
     if (this.turnCompleted) {
-      return Promise.resolve();
+      return this.smokeFailure ? Promise.reject(this.smokeFailure) : Promise.resolve();
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -312,6 +329,12 @@ class AppServerSmokeSession {
         },
       );
     });
+  }
+
+  assertHealthy(): void {
+    if (this.smokeFailure) {
+      throw this.smokeFailure;
+    }
   }
 
   async stop(): Promise<void> {
@@ -362,6 +385,12 @@ class AppServerSmokeSession {
       this.resolveServerRequest(message);
       return;
     }
+    if ("id" in message && "method" in message) {
+      this.requireChild().stdin.write(
+        `${JSON.stringify({ id: null, error: { code: -32600, message: "Invalid Request" } })}\n`,
+      );
+      return;
+    }
 
     if (!isJsonRpcNotification(message)) {
       return;
@@ -382,18 +411,56 @@ class AppServerSmokeSession {
     }
     if (message.method === "turn/completed") {
       this.turnCompleted = true;
-      this.resolveTurn?.();
+      if (this.smokeFailure) {
+        this.rejectTurn?.(this.smokeFailure);
+      } else {
+        this.resolveTurn?.();
+      }
     }
   }
 
   private resolveServerRequest(message: JsonRpcRequest): void {
     const child = this.requireChild();
-    let result: Record<string, unknown> = {};
-    if (message.method.endsWith("/requestApproval")) {
-      this.approvalRequests.push(summarizeApprovalRequest(message));
-      result = { decision: this.approvalDecision };
+    const id = message.id;
+    if (!isRequestId(id)) {
+      child.stdin.write(
+        `${JSON.stringify({ id: null, error: { code: -32600, message: "Invalid Request" } })}\n`,
+      );
+      return;
     }
-    child.stdin.write(`${JSON.stringify({ id: message.id, result })}\n`);
+    if (
+      message.method !== "item/commandExecution/requestApproval" &&
+      message.method !== "item/fileChange/requestApproval"
+    ) {
+      child.stdin.write(
+        `${JSON.stringify({ id, error: { code: -32601, message: `Method not found: ${message.method}` } })}\n`,
+      );
+      return;
+    }
+    if (!hasRequiredApprovalParams(message.params)) {
+      this.rejectApprovalRequest(id, "Invalid approval params");
+      return;
+    }
+
+    const resolution = smokeApprovalDecision(message, this.approvalDecision);
+    if (!resolution.ok) {
+      this.rejectApprovalRequest(id, resolution.message);
+      return;
+    }
+
+    this.approvalRequests.push(summarizeApprovalRequest(message));
+    child.stdin.write(`${JSON.stringify({ id, result: { decision: resolution.decision } })}\n`);
+  }
+
+  private rejectApprovalRequest(id: string | number, message: string): void {
+    this.requireChild().stdin.write(
+      `${JSON.stringify({ id, error: { code: -32602, message } })}\n`,
+    );
+    const failure = new Error(`App-server approval protocol validation failed: ${message}`);
+    this.smokeFailure ??= failure;
+    if (this.turnStarted && !this.turnCompleted) {
+      this.rejectTurn?.(this.smokeFailure);
+    }
   }
 
   private requireChild(): ChildProcessWithoutNullStreams {
@@ -631,9 +698,85 @@ function summarizeApprovalRequest(message: JsonRpcRequest): Record<string, unkno
   return summary;
 }
 
+function hasRequiredApprovalParams(value: unknown): boolean {
+  const params = asObjectRecord(value);
+  return Boolean(
+    params &&
+      typeof params.threadId === "string" &&
+      typeof params.turnId === "string" &&
+      typeof params.itemId === "string" &&
+      typeof params.startedAtMs === "number" &&
+      Number.isInteger(params.startedAtMs),
+  );
+}
+
+function smokeApprovalDecision(
+  message: JsonRpcRequest,
+  configured: ApprovalDecision,
+): SmokeApprovalDecisionResult {
+  if (message.method === "item/fileChange/requestApproval") {
+    return { ok: true, decision: configured };
+  }
+  const params = asObjectRecord(message.params);
+  const available = params?.availableDecisions;
+  if (available === undefined || available === null) {
+    return { ok: true, decision: configured };
+  }
+  if (!Array.isArray(available) || !available.every(isSmokeCommandDecision)) {
+    return {
+      ok: false,
+      message: "Invalid approval params: availableDecisions must be a valid decision array",
+    };
+  }
+  if (!available.includes(configured)) {
+    return {
+      ok: false,
+      message: `Invalid approval params: configured decision ${configured} was not offered`,
+    };
+  }
+  return { ok: true, decision: configured };
+}
+
+function isSmokeCommandDecision(value: unknown): boolean {
+  if (
+    value === "accept" ||
+    value === "acceptForSession" ||
+    value === "decline" ||
+    value === "cancel"
+  ) {
+    return true;
+  }
+  const decision = asObjectRecord(value);
+  if (!decision || Object.keys(decision).length !== 1) {
+    return false;
+  }
+  if ("acceptWithExecpolicyAmendment" in decision) {
+    const amendment = asObjectRecord(decision.acceptWithExecpolicyAmendment);
+    return Boolean(
+      amendment &&
+        Array.isArray(amendment.execpolicy_amendment) &&
+        amendment.execpolicy_amendment.every((part) => typeof part === "string"),
+    );
+  }
+  if ("applyNetworkPolicyAmendment" in decision) {
+    const amendment = asObjectRecord(decision.applyNetworkPolicyAmendment);
+    const policy = asObjectRecord(amendment?.network_policy_amendment);
+    return Boolean(
+      policy &&
+        (policy.action === "allow" || policy.action === "deny") &&
+        typeof policy.host === "string",
+    );
+  }
+  return false;
+}
+
+function isRequestId(value: unknown): value is string | number {
+  return typeof value === "string" || (typeof value === "number" && Number.isInteger(value));
+}
+
 function parseJsonLine(line: string): Record<string, unknown> | null {
   try {
-    return JSON.parse(line) as Record<string, unknown>;
+    return asObjectRecord(JSON.parse(line));
   } catch {
     return null;
   }
@@ -661,6 +804,12 @@ function extractTurnId(result: unknown): string | undefined {
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+function asObjectRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function getString(record: Record<string, unknown> | null | undefined, key: string): string | undefined {

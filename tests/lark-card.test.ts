@@ -196,10 +196,11 @@ describe("Lark run status cards", () => {
     const serialized = JSON.stringify(card);
     expect(card.header.title.content).toBe("Codex 请求执行命令");
     expect(serialized).toContain("rm \\\\-rf build");
-    expect(serialized).toContain("approve_rule");
+    expect(serialized).toContain("proposed_exec_policy_amendment");
+    expect(serialized).toContain("exec_policy_decisions");
     expect(serialized).toContain("rm \\\\-rf");
     expect(serialized).toContain("Approve");
-    expect(serialized).toContain("Approve rule");
+    expect(serialized).toContain("Exec rule: rm -rf");
     expect(serialized).toContain("Approve session");
     expect(serialized).toContain("Deny");
     expect(serialized).toContain("Cancel turn");
@@ -213,23 +214,22 @@ describe("Lark run status cards", () => {
     );
   });
 
-  test("collapses nested shell wrappers in approval command display", () => {
-    const innerCommand = String.raw`/bin/zsh -lc "printf '%s\\n' 'hello approval' > codex-approval-smoke.txt"`;
-    const nestedCommand = String.raw`/bin/zsh -lc "/bin/zsh -lc \"printf '%s\\n' 'hello approval' > codex-approval-smoke.txt\""`;
+  test("preserves approval command whitespace exactly", () => {
+    const command = "printf 'a  b'\nprintf 'c   d'";
     const card = buildApprovalCard({
       status: "pending",
       updatedAt: "2026-06-29T12:00:30.000Z",
       request: {
         id: "approval_1",
         kind: "command",
-        command: nestedCommand,
+        command,
         cwd: "/tmp/chat2codex",
-        proposedExecpolicyAmendment: ["/bin/zsh", "-lc", innerCommand],
+        proposedExecpolicyAmendment: ["printf", "a  b", "line\nbreak"],
         decisions: [
           "accept",
           {
             acceptWithExecpolicyAmendment: {
-              execpolicy_amendment: ["/bin/zsh", "-lc", innerCommand],
+              execpolicy_amendment: ["printf", "a  b", "line\nbreak"],
             },
           },
           "cancel",
@@ -237,11 +237,225 @@ describe("Lark run status cards", () => {
       },
     });
 
+    const fields = approvalCardFieldText(card);
+    expect(fields).toContain(command);
+    expect(fields).toContain('printf "a  b" "line\\\\nbreak"');
+    expect(fields).not.toContain("printf 'a b'");
+    expect(fields).not.toContain("printf 'c d'");
+  });
+
+  test("discloses and distinguishes every exec policy decision", () => {
+    const card = buildApprovalCard({
+      status: "pending",
+      updatedAt: "2026-06-29T12:00:30.000Z",
+      request: {
+        id: "approval_exec_rules_1",
+        kind: "command",
+        command: "git fetch origin",
+        decisions: [
+          {
+            acceptWithExecpolicyAmendment: {
+              execpolicy_amendment: ["git", "fetch", "origin"],
+            },
+          },
+          {
+            acceptWithExecpolicyAmendment: {
+              execpolicy_amendment: ["git", "fetch", "upstream"],
+            },
+          },
+          "decline",
+        ],
+      },
+    });
+
+    const fields = approvalCardFieldText(card);
+    expect(fields).toContain("exec_policy_decisions");
+    expect(fields).toContain("1: git fetch origin");
+    expect(fields).toContain("2: git fetch upstream");
+    expect(approvalButtonLabels(card)).toEqual([
+      "Exec rule: git fetch origin",
+      "Exec rule: git fetch upstream",
+      "Deny",
+    ]);
+  });
+
+  test("discloses additional permissions and network policy scope in approval cards", () => {
+    const card = buildApprovalCard({
+      status: "pending",
+      updatedAt: "2026-06-29T12:00:30.000Z",
+      request: {
+        id: "approval_network_1",
+        kind: "command",
+        command: "curl https://registry.example.com/package",
+        cwd: "/tmp/chat2codex",
+        networkApprovalContext: {
+          protocol: "https",
+          host: "registry.example.com",
+        },
+        additionalPermissions: {
+          network: {
+            allowedDomains: ["registry.example.com"],
+          },
+          fileSystem: {
+            write: ["/tmp/package-cache"],
+          },
+        },
+        proposedNetworkPolicyAmendments: [
+          { host: "registry.example.com", action: "allow" },
+          { host: "telemetry.example.com", action: "deny" },
+        ],
+        decisions: [
+          {
+            applyNetworkPolicyAmendment: {
+              network_policy_amendment: {
+                action: "allow",
+                host: "registry.example.com",
+              },
+            },
+          },
+          {
+            applyNetworkPolicyAmendment: {
+              network_policy_amendment: {
+                action: "deny",
+                host: "telemetry.example.com",
+              },
+            },
+          },
+          "decline",
+        ],
+      },
+    });
+
+    const fields = approvalCardFieldText(card);
     const serialized = JSON.stringify(card);
-    expect(serialized.match(/\/bin\/zsh/gu)).toHaveLength(2);
-    expect(serialized).toContain("approve_rule");
-    expect(serialized).toContain("printf");
-    expect(serialized).toContain("hello approval");
+    expect(fields).toContain("additional_permissions");
+    expect(fields).toContain('"fileSystem"');
+    expect(fields).toContain('"network"');
+    expect(fields.indexOf('"fileSystem"')).toBeLessThan(fields.indexOf('"network"'));
+    expect(fields).toContain("network_approval_context");
+    expect(fields).toContain('"host":"registry\\.example\\.com"');
+    expect(fields).toContain('"protocol":"https"');
+    expect(fields).toContain("proposed_network_policy_amendments");
+    expect(fields).toContain('"action":"allow","host":"registry\\.example\\.com"');
+    expect(fields).toContain('"action":"deny","host":"telemetry\\.example\\.com"');
+    expect(fields).toContain("network_policy_decisions");
+    expect(fields).toContain("1: Network allow: registry\\.example\\.com");
+    expect(fields).toContain("2: Network deny: telemetry\\.example\\.com");
+    expect(serialized).toContain("Network allow: registry.example.com");
+    expect(serialized).toContain("Network deny: telemetry.example.com");
+    expect(serialized).not.toContain("Apply network policy");
+  });
+
+  test("renders bounded stable summaries without invoking approval payload accessors", () => {
+    let accessorCalls = 0;
+    const additionalPermissions: Record<string, unknown> = {
+      zeta: "z".repeat(1_000),
+      alpha: true,
+    };
+    Object.defineProperty(additionalPermissions, "dangerous", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        return "must not render";
+      },
+    });
+    additionalPermissions.self = additionalPermissions;
+
+    const card = buildApprovalCard({
+      status: "pending",
+      updatedAt: "2026-06-29T12:00:30.000Z",
+      request: {
+        id: "approval_permissions_1",
+        kind: "command",
+        additionalPermissions,
+        decisions: ["decline", "cancel"],
+      },
+    });
+
+    const fields = approvalCardFieldText(card);
+    expect(accessorCalls).toBe(0);
+    expect(fields.indexOf('"alpha"')).toBeLessThan(fields.indexOf('"dangerous"'));
+    expect(fields.indexOf('"dangerous"')).toBeLessThan(fields.indexOf('"self"'));
+    expect(fields).toContain("accessor omitted");
+    expect(fields).toContain("circular reference");
+    expect(fields).not.toContain("must not render");
+    expect(fields.length).toBeLessThan(900);
+  });
+
+  test("removes approval actions when security details cannot be shown completely", () => {
+    const longHost = `${"segment.".repeat(20)}example.com`;
+    const card = buildApprovalCard({
+      status: "pending",
+      updatedAt: "2026-06-29T12:00:30.000Z",
+      request: {
+        id: "approval_oversized_1",
+        kind: "command",
+        command: "curl https://example.com",
+        additionalPermissions: {
+          fileSystem: {
+            write: Array.from({ length: 30 }, (_, index) => `/private/path/${index}`),
+          },
+        },
+        decisions: [
+          "accept",
+          "acceptForSession",
+          {
+            applyNetworkPolicyAmendment: {
+              network_policy_amendment: { action: "allow", host: longHost },
+            },
+          },
+          "decline",
+          "cancel",
+        ],
+      },
+    });
+
+    expect(approvalButtonLabels(card)).toEqual(["Deny", "Cancel turn"]);
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain("仅保留拒绝/取消操作");
+    expect(serialized).toContain('"decisionIndex":3');
+    expect(serialized).toContain('"decisionIndex":4');
+    expect(serialized).not.toContain('"decisionIndex":0');
+    expect(serialized).not.toContain('"decisionIndex":1');
+    expect(serialized).not.toContain('"decisionIndex":2');
+  });
+
+  test("renders no action element when an undisclosed command has no safe decision", () => {
+    const card = buildApprovalCard({
+      status: "pending",
+      updatedAt: "2026-06-29T12:00:30.000Z",
+      request: {
+        id: "approval_missing_command_1",
+        kind: "command",
+        command: null,
+        decisions: ["accept"],
+      },
+    });
+
+    expect(approvalButtonLabels(card)).toEqual([]);
+    expect(JSON.stringify(card)).toContain("No safe decision is available");
+  });
+
+  test("limits file-change cards without target details to deny and cancel", () => {
+    const card = buildApprovalCard({
+      status: "pending",
+      updatedAt: "2026-06-29T12:00:30.000Z",
+      request: {
+        id: "approval_file_1",
+        kind: "file_change",
+        reason: "write outside the current root",
+        grantRoot: "/private/project",
+        decisions: ["accept", "acceptForSession", "decline", "cancel"],
+      },
+    });
+
+    expect(approvalButtonLabels(card)).toEqual(["Deny", "Cancel turn"]);
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain("file-change targets and patch details are unavailable");
+    expect(serialized).toContain('"decisionIndex":2');
+    expect(serialized).toContain('"decisionIndex":3');
+    expect(serialized).not.toContain('"decisionIndex":0');
+    expect(serialized).not.toContain('"decisionIndex":1');
   });
 
   test("builds project list cards with compact paths and selection buttons", () => {
@@ -429,3 +643,43 @@ describe("Lark run status cards", () => {
     expect(selectedSerialized).not.toContain("page_sessions");
   });
 });
+
+function approvalCardFieldText(card: ReturnType<typeof buildApprovalCard>): string {
+  return card.elements
+    .flatMap((element) => {
+      if (!Array.isArray(element.fields)) {
+        return [];
+      }
+      return element.fields.flatMap((entry) => {
+        if (typeof entry !== "object" || entry === null) {
+          return [];
+        }
+        const text = (entry as { text?: unknown }).text;
+        if (typeof text !== "object" || text === null) {
+          return [];
+        }
+        const content = (text as { content?: unknown }).content;
+        return typeof content === "string" ? [content] : [];
+      });
+    })
+    .join("\n");
+}
+
+function approvalButtonLabels(card: ReturnType<typeof buildApprovalCard>): string[] {
+  return card.elements.flatMap((element) => {
+    if (element.tag !== "action" || !Array.isArray(element.actions)) {
+      return [];
+    }
+    return element.actions.flatMap((action) => {
+      if (typeof action !== "object" || action === null) {
+        return [];
+      }
+      const text = (action as { text?: unknown }).text;
+      if (typeof text !== "object" || text === null) {
+        return [];
+      }
+      const content = (text as { content?: unknown }).content;
+      return typeof content === "string" ? [content] : [];
+    });
+  });
+}

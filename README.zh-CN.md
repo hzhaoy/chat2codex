@@ -11,7 +11,7 @@ Chat2Codex 会把一个飞书/Lark 机器人变成本机 Codex CLI 的消息平�
 - 当前已经实现的是飞书/Lark 长连接适配器。Slack、Discord 等其他聊天平台还在路线图中。
 - 私聊路由默认开启，但除 `/whoami` 外，发送者或私聊 chat 必须显式加入允许列表；授权后的私聊可以切换到任意本机目录。
 - 群聊默认关闭，启用后必须同时允许 chat 和发送者，并且可以用 `CODEX_GROUP_ALLOWED_ROOTS` 限制可访问目录。
-- Codex app-server 协议仍是实验性能力。升级 Codex CLI 后，请按 [Codex App-Server 防护检查](#codex-app-server-防护检查) 运行 smoke test。
+- Codex app-server 协议仍是实验性能力。安装或升级 Codex CLI 后，请先运行 `chat2codex doctor`，再按 [Codex App-Server 防护检查](#codex-app-server-防护检查) 完成验证。
 
 ## 快速开始
 
@@ -62,7 +62,7 @@ Summarize this repository.
 | `chat2codex` / `chat2codex start` | 启动飞书/Lark 桥接服务。 |
 | `chat2codex setup --workdir <path>` | 创建/连接飞书/Lark 应用，并写入 `.env`。 |
 | `chat2codex init --workdir <path>` | 已有应用时，创建一份初始 `.env`。 |
-| `chat2codex doctor` | 检查 `.env`、Node.js、Codex CLI、工作目录和移动/群机器人安全提示。 |
+| `chat2codex doctor` | 检查 `.env`、Node.js、Codex CLI 与协议快照版本、工作目录和移动/群机器人安全提示。 |
 | `chat2codex smoke [--mode turn\|approval]` | 本地验证 Codex app-server 协议。 |
 | `chat2codex service print\|install\|uninstall` | 管理用户级 launchd/systemd 服务。 |
 
@@ -98,7 +98,13 @@ Summarize this repository.
 
 ## Codex App-Server 防护检查
 
-Chat2Codex 使用实验性的 `codex app-server --stdio` 协议来控制线程、接收进度事件和处理审批回调。安装或升级 Codex CLI 后，先运行快速本地 smoke test：
+Chat2Codex 使用实验性的 `codex app-server --stdio` 协议来控制线程、接收进度事件和处理审批回调。安装或升级 Codex CLI 后，先运行：
+
+```bash
+chat2codex doctor
+```
+
+`doctor` 会把实际检测到的 `codex --version` 完整输出与内置协议快照记录的 Codex 版本做精确比对。如果版本不一致，或快照 manifest 缺失/无法读取，`doctor` 会给出兼容性警告，但不会仅因此判定检查失败。此时应把协议兼容性视为尚未验证，并继续运行快速本地 smoke test：
 
 ```bash
 chat2codex smoke
@@ -125,9 +131,9 @@ bun run protocol:generate
 git diff -- docs/codex-app-server-protocol
 ```
 
-修改 [`src/agent/codex-runner.ts`](src/agent/codex-runner.ts) 前，请先检查协议 schema diff；如果 app-server 的请求形状未知，审批逻辑应该默认关闭而不是放行。
+修改 [`src/agent/codex-runner.ts`](src/agent/codex-runner.ts) 前，请先检查协议 schema diff。Chat2Codex 只处理明确支持的 app-server 服务端请求：未知 method 会返回 JSON-RPC method-not-found 错误；格式不合法的审批请求会返回 invalid-params 错误，不会展示或自行补出批准选项。在对应交互界面实现前，MCP elicitation 会被取消，额外权限请求只会得到空授权。
 
-当 `CODEX_APPROVAL_POLICY` 允许交互式审批时，Codex app-server 会在 turn 运行过程中发出审批请求。Chat2Codex 会向同一个 chat 发送一张独立审批卡片，并暂停 Codex，直到授权用户点击其中一个选项。命令执行审批卡片的按钮会镜像 Codex 的 `availableDecisions`；文件变更审批卡片会使用 Codex 的文件变更审批选项。
+当 `CODEX_APPROVAL_POLICY` 允许交互式审批时，Codex app-server 会在 turn 运行过程中发出审批请求。Chat2Codex 会向同一个 chat 发送一张独立审批卡片，并暂停 Codex，直到授权用户点击其中一个选项。命令执行审批卡片的按钮会镜像 Codex 的 `availableDecisions`。当前文件变更审批请求不包含目标文件或补丁详情，因此在这些信息能够被关联并完整展示前，Chat2Codex 只提供拒绝/取消。命令决策缺失或为 `null` 时，桥接层同样只展示拒绝/取消；决策列表格式不合法时则直接返回 invalid-params。审批卡会展示额外的文件系统/网络权限以及每条完整的 exec/network policy 规则；如果安全相关详情无法完整展示，卡片会移除所有允许类操作，只保留拒绝/取消，消息路由在处理卡片回调时也会执行相同的决策过滤。
 
 用当前 `chat2codex setup` 流程创建的应用会包含这个回调。如果你的飞书/Lark 应用是在状态卡片动作加入之前创建的，请在开发者后台手动订阅 `card.action.trigger` 回调，这样停止按钮才能通过长连接回到这个桥接服务。
 
@@ -274,5 +280,5 @@ bun run check
 
 ## 后续功能
 
-1. 在 app-server 支持验证完成后，加入更高级的线程控制能力，例如 rollback。
+1. 通过 `thread/fork.lastTurnId` 从指定历史 turn 分叉，并保持原 thread 不变。这个操作不是文件系统回滚，也不会恢复本地文件变更。
 2. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。

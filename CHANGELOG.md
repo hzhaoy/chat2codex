@@ -12,6 +12,27 @@ numbers once releases are published.
 - GitHub Releases now use the matching `CHANGELOG.md` version section for
   structured Added, Changed, and Fixed notes while retaining the full compare
   link.
+- `chat2codex doctor` now compares the detected Codex CLI version with the
+  bundled app-server protocol snapshot and warns when compatibility needs to be
+  verified with smoke tests.
+- Replaced the deprecated rollback roadmap item with non-destructive
+  fork-from-history-turn guidance and updated the security support policy for
+  versioned releases.
+
+### Fixed
+
+- Unknown app-server server requests now return a method-not-found error, while
+  malformed approval requests fail closed without exposing or inventing an
+  approval option; MCP elicitations and additional-permission requests receive
+  explicit safe cancellation/denial responses.
+- Approval cards now disclose additional permissions and exact exec/network
+  policy rules, suppressing allow actions whenever security details cannot be
+  rendered completely. File-change requests without target/patch disclosure are
+  limited to decline/cancel, and card callbacks recheck the same decision filter
+  server-side.
+- Approval callbacks now fail closed for synchronous and asynchronous errors,
+  and each request receives a globally unique internal card key so concurrent
+  app-server connections cannot collide on reused JSON-RPC ids.
 
 ## 0.4.0 - 2026-07-17
 

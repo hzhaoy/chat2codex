@@ -76,6 +76,7 @@ import {
   buildHostHealthCard,
   buildProjectListCard,
   buildSessionListCard,
+  isApprovalDecisionIndexAllowed,
   type ApprovalCardInput,
   type HostHealthCardInput,
   type LarkInteractiveCard,
@@ -2110,6 +2111,9 @@ export class MessageRouter {
     }
     if (action.decisionIndex === undefined) {
       return cardActionToast("warning", "无法处理审批：缺少审批选项。");
+    }
+    if (!isApprovalDecisionIndexAllowed(pending.request, action.decisionIndex)) {
+      return cardActionToast("warning", "无法处理审批：该选项未通过安全披露校验。");
     }
     const decision = pending.request.decisions[action.decisionIndex];
     if (!decision) {

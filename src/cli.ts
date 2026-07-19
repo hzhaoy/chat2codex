@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { config as loadDotenv } from "dotenv";
 import { ZodError } from "zod";
@@ -10,6 +9,12 @@ import { buildCodexChildEnv } from "./agent/codex-environment.js";
 import { runBridge } from "./bot/lark-bot.js";
 import { loadConfig } from "./config/env.js";
 import { defaultChat2CodexHome, defaultEnvPath } from "./config/paths.js";
+import {
+  packageRoot,
+  protocolManifestPath,
+  readBundledProtocolManifest,
+  readPackageVersion,
+} from "./package-info.js";
 import { acquireBridgeInstanceLock } from "./state/instance-lock.js";
 import { ConsoleLogger } from "./util/logger.js";
 
@@ -24,10 +29,15 @@ type CliCommand =
   | "start"
   | "version";
 
-interface DoctorCheck {
+export interface DoctorCheck {
   label: string;
   status: "ok" | "warn" | "error";
   detail?: string;
+}
+
+interface CommandCheckResult {
+  check: DoctorCheck;
+  output: string | null;
 }
 
 interface InitOptions {
@@ -50,7 +60,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       printHelp();
       return;
     case "version":
-      console.log(await packageVersion());
+      console.log(await readPackageVersion());
       return;
     case "start":
       await runStart(args);
@@ -208,7 +218,7 @@ Options:
 
 async function runDoctor(args: string[]): Promise<void> {
   const options = parseEnvBackedArgs(args, "doctor");
-  if (args[0] === "-h" || args[0] === "--help") {
+  if (options.help) {
     console.log(`Usage: chat2codex doctor [options]
 
 Checks .env, Node.js, Codex CLI, CODEX_WORKDIR, and runtime directories.
@@ -240,7 +250,9 @@ Options:
   }
 
   const codexBin = config?.codexBin ?? process.env.CODEX_BIN ?? "codex";
-  checks.push(checkCommand(codexBin, ["--version"], "Codex CLI"));
+  const codexCommand = checkCommand(codexBin, ["--version"], "Codex CLI");
+  checks.push(codexCommand.check);
+  checks.push(await checkCodexProtocolCompatibility(codexCommand.output));
 
   if (config) {
     checks.push(await checkDirectory(config.codexWorkdir, "CODEX_WORKDIR"));
@@ -355,13 +367,6 @@ function requireValue(argv: string[], index: number, flag: string): string {
   return value;
 }
 
-async function packageVersion(): Promise<string> {
-  const packageJson = JSON.parse(await fs.readFile(path.join(packageRoot(), "package.json"), "utf8")) as {
-    version?: string;
-  };
-  return packageJson.version ?? "unknown";
-}
-
 async function readEnvExample(): Promise<string> {
   const local = path.resolve(".env.example");
   const bundled = path.join(packageRoot(), ".env.example");
@@ -379,8 +384,44 @@ function loadRuntimeEnv(envFile: string): void {
   process.env.CHAT2CODEX_HOME ??= defaultChat2CodexHome();
 }
 
-function packageRoot(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export async function checkCodexProtocolCompatibility(
+  actualVersion: string | null,
+  manifestPath = protocolManifestPath(),
+): Promise<DoctorCheck> {
+  let expectedVersion: string;
+  try {
+    const manifest = await readBundledProtocolManifest(manifestPath);
+    expectedVersion = manifest.codexVersion.trim();
+  } catch (error) {
+    return {
+      label: "Codex protocol",
+      status: "warn",
+      detail: `could not read the bundled protocol manifest at ${manifestPath}: ${formatError(error)}. Reinstall Chat2Codex or, from a source checkout, run chat2codex protocol generate; then run chat2codex smoke.`,
+    };
+  }
+
+  if (actualVersion === null) {
+    return {
+      label: "Codex protocol",
+      status: "warn",
+      detail: `could not compare against the bundled app-server schema for ${expectedVersion} because codex --version failed`,
+    };
+  }
+
+  const installedVersion = actualVersion.trim();
+  if (installedVersion === expectedVersion) {
+    return {
+      label: "Codex protocol",
+      status: "ok",
+      detail: `${installedVersion} matches the bundled app-server schema`,
+    };
+  }
+
+  return {
+    label: "Codex protocol",
+    status: "warn",
+    detail: `installed ${installedVersion || "Codex CLI returned no version"}; the bundled app-server schema was generated with ${expectedVersion}. Run chat2codex smoke; if the upgrade is intentional, run chat2codex protocol generate and review the schema diff.`,
+  };
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -422,22 +463,29 @@ function checkNodeVersion(version: string): DoctorCheck {
   };
 }
 
-function checkCommand(command: string, args: string[], label: string): DoctorCheck {
+function checkCommand(command: string, args: string[], label: string): CommandCheckResult {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     env: buildCodexChildEnv(),
   });
   if (result.status === 0) {
+    const output = result.stdout.trim();
     return {
-      label,
-      status: "ok",
-      detail: result.stdout.trim() || command,
+      check: {
+        label,
+        status: "ok",
+        detail: output || command,
+      },
+      output,
     };
   }
   return {
-    label,
-    status: "error",
-    detail: `failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout || "not found"}`,
+    check: {
+      label,
+      status: "error",
+      detail: `failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout || "not found"}`,
+    },
+    output: null,
   };
 }
 
@@ -523,6 +571,10 @@ function formatConfigError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatEnvValue(value: string): string {

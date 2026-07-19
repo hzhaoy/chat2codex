@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { parseCommand, runCli } from "../src/cli.js";
+import { checkCodexProtocolCompatibility, parseCommand, runCli } from "../src/cli.js";
 
 const originalCwd = process.cwd();
 const originalLog = console.log;
@@ -34,6 +34,25 @@ describe("CLI", () => {
   test("start help does not require bridge configuration", async () => {
     await runCli(["start", "--help"]);
     await expect(runCli(["not-a-command"])).rejects.toThrow("Unknown start argument");
+  });
+
+  test("doctor help does not require bridge configuration", async () => {
+    const previousAppId = process.env.FEISHU_APP_ID;
+    const previousAppSecret = process.env.FEISHU_APP_SECRET;
+    const previousExitCode = process.exitCode;
+    try {
+      delete process.env.FEISHU_APP_ID;
+      delete process.env.FEISHU_APP_SECRET;
+      process.exitCode = undefined;
+
+      await runCli(["doctor", "--env", path.join(os.tmpdir(), "missing.env"), "--help"]);
+
+      expect(process.exitCode).toBeUndefined();
+    } finally {
+      setOptionalEnv("FEISHU_APP_ID", previousAppId);
+      setOptionalEnv("FEISHU_APP_SECRET", previousAppSecret);
+      process.exitCode = previousExitCode;
+    }
   });
 
   test("init creates an env file with an explicit CODEX_WORKDIR", async () => {
@@ -141,7 +160,147 @@ describe("CLI", () => {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  test("doctor accepts the exact Codex version recorded by the bundled protocol manifest", async () => {
+    const manifest = JSON.parse(
+      await fs.readFile(
+        new URL("../docs/codex-app-server-protocol/manifest.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { codexVersion: string };
+
+    const result = await runDoctorWithCodexVersion(manifest.codexVersion);
+
+    expect(result.output).toContain(`ok    Codex protocol - ${manifest.codexVersion}`);
+    expect(result.output).toContain("matches the bundled app-server schema");
+    expect(result.exitCode).toBeUndefined();
+  });
+
+  test("doctor warns without failing when Codex and the bundled protocol manifest differ", async () => {
+    const result = await runDoctorWithCodexVersion("codex-cli 999.0.0");
+
+    expect(result.output).toContain("warn  Codex protocol");
+    expect(result.output).toContain("codex-cli 999.0.0");
+    expect(result.output).toContain("chat2codex smoke");
+    expect(result.output).toContain("chat2codex protocol generate");
+    expect(result.output).toContain("review the schema diff");
+    expect(result.exitCode).toBeUndefined();
+  });
+
+  test("protocol compatibility warns when the manifest is missing or unreadable", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat2codex-manifest-"));
+    try {
+      const missing = await checkCodexProtocolCompatibility(
+        "codex-cli 1.2.3",
+        path.join(tempDir, "missing.json"),
+      );
+      expect(missing.status).toBe("warn");
+      expect(missing.detail).toContain("could not read the bundled protocol manifest");
+      expect(missing.detail).toContain("chat2codex protocol generate");
+
+      const invalidManifest = path.join(tempDir, "manifest.json");
+      await fs.writeFile(invalidManifest, "not json");
+      const unreadable = await checkCodexProtocolCompatibility(
+        "codex-cli 1.2.3",
+        invalidManifest,
+      );
+      expect(unreadable.status).toBe("warn");
+      expect(unreadable.detail).toContain("could not read the bundled protocol manifest");
+      expect(unreadable.detail).toContain("chat2codex smoke");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
 });
+
+async function runDoctorWithCodexVersion(
+  codexVersion: string,
+): Promise<{ exitCode: number | string | undefined; output: string }> {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat2codex-doctor-"));
+  const workdir = path.join(tempDir, "workspace");
+  const stateDir = path.join(tempDir, "state");
+  const attachmentDir = path.join(tempDir, "attachments");
+  const fakeCodex = path.join(tempDir, "codex");
+  const output: string[] = [];
+  const envKeys = [
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "LARK_DOMAIN",
+    "CODEX_BIN",
+    "CODEX_WORKDIR",
+    "CODEX_SANDBOX",
+    "CODEX_APPROVAL_POLICY",
+    "CODEX_RUN_TIMEOUT_MS",
+    "CODEX_APPROVAL_TIMEOUT_MS",
+    "ALLOW_DIRECT_MESSAGES",
+    "ALLOW_GROUPS",
+    "ALLOWED_CHAT_IDS",
+    "ALLOWED_USER_IDS",
+    "ATTACHMENT_DOWNLOAD_DIR",
+    "BRIDGE_STATE_PATH",
+  ];
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+  const previousLog = console.log;
+  const previousExitCode = process.exitCode;
+  const previousCwd = process.cwd();
+  try {
+    await fs.mkdir(workdir);
+    await fs.mkdir(stateDir);
+    await fs.mkdir(attachmentDir);
+    await fs.writeFile(fakeCodex, `#!/bin/sh\nprintf '%s\\n' '${codexVersion}'\n`);
+    await fs.chmod(fakeCodex, 0o755);
+    await fs.writeFile(
+      path.join(tempDir, ".env"),
+      [
+        "FEISHU_APP_ID=cli_test",
+        "FEISHU_APP_SECRET=secret",
+        `CODEX_BIN=${fakeCodex}`,
+        `CODEX_WORKDIR=${workdir}`,
+        `BRIDGE_STATE_PATH=${path.join(stateDir, "state.json")}`,
+        `ATTACHMENT_DOWNLOAD_DIR=${attachmentDir}`,
+        "ALLOW_DIRECT_MESSAGES=false",
+        "ALLOW_GROUPS=false",
+        "CODEX_APPROVAL_POLICY=on-request",
+        "CODEX_RUN_TIMEOUT_MS=60000",
+        "CODEX_APPROVAL_TIMEOUT_MS=60000",
+      ].join("\n"),
+    );
+
+    process.env.CHAT2CODEX_HOME = tempDir;
+    process.env.FEISHU_APP_ID = "cli_test";
+    process.env.FEISHU_APP_SECRET = "secret";
+    process.env.LARK_DOMAIN = "feishu";
+    process.env.CODEX_BIN = fakeCodex;
+    process.env.CODEX_WORKDIR = workdir;
+    process.env.CODEX_SANDBOX = "workspace-write";
+    process.env.CODEX_APPROVAL_POLICY = "on-request";
+    process.env.CODEX_RUN_TIMEOUT_MS = "60000";
+    process.env.CODEX_APPROVAL_TIMEOUT_MS = "60000";
+    process.env.ALLOW_DIRECT_MESSAGES = "false";
+    process.env.ALLOW_GROUPS = "false";
+    process.env.ALLOWED_CHAT_IDS = "";
+    process.env.ALLOWED_USER_IDS = "";
+    process.env.ATTACHMENT_DOWNLOAD_DIR = attachmentDir;
+    process.env.BRIDGE_STATE_PATH = path.join(stateDir, "state.json");
+    console.log = (line?: unknown) => {
+      output.push(String(line ?? ""));
+    };
+    process.exitCode = undefined;
+    process.chdir(tempDir);
+
+    await runCli(["doctor"]);
+
+    return { exitCode: process.exitCode, output: output.join("\n") };
+  } finally {
+    process.chdir(previousCwd);
+    console.log = previousLog;
+    process.exitCode = previousExitCode;
+    for (const key of envKeys) {
+      setOptionalEnv(key, previousEnv.get(key));
+    }
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
 
 function setOptionalEnv(key: string, value: string | undefined): void {
   if (value === undefined) {

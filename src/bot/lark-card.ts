@@ -105,6 +105,19 @@ export interface LarkInteractiveCard {
   elements: Array<Record<string, unknown>>;
 }
 
+export function isApprovalDecisionIndexAllowed(
+  request: CodexApprovalRequest,
+  decisionIndex: number,
+): boolean {
+  if (!Number.isInteger(decisionIndex) || decisionIndex < 0) {
+    return false;
+  }
+  const disclosureIssue = approvalDisclosureIssue(request);
+  return approvalDecisionEntries(request, disclosureIssue).some(
+    ({ index }) => index === decisionIndex,
+  );
+}
+
 const statusMeta: Record<RunStatusCardStatus, { title: string; template: string }> = {
   running: {
     title: "Codex 正在处理",
@@ -277,6 +290,7 @@ export function buildHostHealthCard(input: HostHealthCardInput): LarkInteractive
 
 export function buildApprovalCard(input: ApprovalCardInput): LarkInteractiveCard {
   const meta = approvalStatusMeta(input.status, input.request);
+  const disclosureIssue = approvalDisclosureIssue(input.request);
   const elements: Array<Record<string, unknown>> = [
     {
       tag: "div",
@@ -284,15 +298,18 @@ export function buildApprovalCard(input: ApprovalCardInput): LarkInteractiveCard
     },
     {
       tag: "div",
-      fields: approvalFields(input),
+      fields: approvalFields(input, disclosureIssue),
     },
     {
       tag: "hr",
     },
   ];
 
-  if (input.status === "pending") {
-    elements.push(approvalActionElement(input.request));
+  if (
+    input.status === "pending" &&
+    approvalDecisionEntries(input.request, disclosureIssue).length > 0
+  ) {
+    elements.push(approvalActionElement(input.request, disclosureIssue));
   }
 
   elements.push({
@@ -302,7 +319,9 @@ export function buildApprovalCard(input: ApprovalCardInput): LarkInteractiveCard
         tag: "plain_text",
         content:
           input.status === "pending"
-            ? "按钮来自 Codex 当前审批请求的 availableDecisions。"
+            ? disclosureIssue
+              ? `审批详情无法完整安全展示（${disclosureIssue}）；仅保留拒绝/取消操作。`
+              : "按钮来自 Codex 当前审批请求的 availableDecisions。"
             : "这条 Codex 审批请求已处理。",
       },
     ],
@@ -612,10 +631,13 @@ function runDetailActionElement(result: RunResultCardInput): Record<string, unkn
   };
 }
 
-function approvalActionElement(request: CodexApprovalRequest): Record<string, unknown> {
+function approvalActionElement(
+  request: CodexApprovalRequest,
+  disclosureIssue: string | null,
+): Record<string, unknown> {
   return {
     tag: "action",
-    actions: request.decisions.map((decision, index) => ({
+    actions: approvalDecisionEntries(request, disclosureIssue).map(({ decision, index }) => ({
       tag: "button",
       text: {
         tag: "plain_text",
@@ -873,53 +895,188 @@ function approvalDetail(input: ApprovalCardInput): string {
   return request.reason ? `Codex 需要审批后修改文件：${request.reason}` : "Codex 需要审批后修改文件。";
 }
 
-function approvalFields(input: ApprovalCardInput): Array<Record<string, unknown>> {
+function approvalFields(
+  input: ApprovalCardInput,
+  disclosureIssue: string | null,
+): Array<Record<string, unknown>> {
   const request = input.request;
   const fields = [
     field("type", request.kind === "command" ? "commandExecution" : "fileChange", 80),
     field("updated", input.updatedAt, 80),
   ];
   if (request.command) {
-    fields.push(field("command", formatCommandForDisplay(request.command), 360));
+    fields.push(approvalField("command", request.command, 360));
   }
   if (request.cwd) {
-    fields.push(field("cwd", request.cwd, 220));
+    fields.push(approvalField("cwd", request.cwd, 220));
   }
   if (request.grantRoot) {
-    fields.push(field("grant_root", request.grantRoot, 220));
+    fields.push(approvalField("grant_root", request.grantRoot, 220));
   }
-  const proposedExecRule = formatExecpolicyAmendment(
-    request.proposedExecpolicyAmendment ?? execpolicyAmendmentFromDecisions(request.decisions),
-  );
+  if (request.additionalPermissions !== undefined && request.additionalPermissions !== null) {
+    fields.push(
+      approvalField(
+        "additional_permissions",
+        stableStructuredSummary(request.additionalPermissions),
+        500,
+      ),
+    );
+  }
+  if (request.networkApprovalContext !== undefined && request.networkApprovalContext !== null) {
+    fields.push(
+      approvalField(
+        "network_approval_context",
+        stableStructuredSummary(request.networkApprovalContext),
+        360,
+      ),
+    );
+  }
+  if (
+    request.proposedNetworkPolicyAmendments !== undefined &&
+    request.proposedNetworkPolicyAmendments !== null
+  ) {
+    fields.push(
+      approvalField(
+        "proposed_network_policy_amendments",
+        stableStructuredSummary(request.proposedNetworkPolicyAmendments),
+        500,
+      ),
+    );
+  }
+  const proposedExecRule = formatExecpolicyAmendment(request.proposedExecpolicyAmendment);
   if (proposedExecRule) {
-    fields.push(field("approve_rule", proposedExecRule, 360));
+    fields.push(approvalField("proposed_exec_policy_amendment", proposedExecRule, 360));
   }
-  fields.push(field("options", request.decisions.map(decisionLabel).join(" / "), 220));
+  const execPolicyDecisions = request.decisions.flatMap((decision, index) => {
+    const amendment = execpolicyAmendmentFromDecision(decision);
+    const formatted = amendment ? formatExecpolicyAmendment(amendment) : null;
+    return formatted ? [`${index + 1}: ${formatted}`] : [];
+  });
+  if (execPolicyDecisions.length) {
+    fields.push(approvalField("exec_policy_decisions", execPolicyDecisions.join(" / "), 500));
+  }
+  const networkPolicyDecisions = request.decisions.flatMap((decision, index) => {
+    const amendment = networkPolicyAmendmentFromDecision(decision);
+    return amendment ? [`${index + 1}: ${formatNetworkPolicyAmendment(amendment)}`] : [];
+  });
+  if (networkPolicyDecisions.length) {
+    fields.push(approvalField("network_policy_decisions", networkPolicyDecisions.join(" / "), 500));
+  }
+  if (disclosureIssue) {
+    fields.push(
+      field(
+        "approval_guard",
+        `Approval actions disabled because ${disclosureIssue}; only deny/cancel remain available.`,
+        360,
+      ),
+    );
+  }
+  fields.push(
+    approvalField(
+      "options",
+      approvalDecisionEntries(request, disclosureIssue)
+        .map(({ decision }) => decisionLabel(decision))
+        .join(" / ") || "No safe decision is available",
+      360,
+    ),
+  );
   return fields;
 }
 
-function execpolicyAmendmentFromDecisions(decisions: CodexApprovalDecision[]): unknown {
-  for (const decision of decisions) {
-    if (typeof decision === "object" && "acceptWithExecpolicyAmendment" in decision) {
-      return decision.acceptWithExecpolicyAmendment.execpolicy_amendment;
+function approvalDecisionEntries(
+  request: CodexApprovalRequest,
+  disclosureIssue: string | null,
+): Array<{ decision: CodexApprovalDecision; index: number }> {
+  const entries = request.decisions.map((decision, index) => ({ decision, index }));
+  if (!disclosureIssue) {
+    return entries;
+  }
+  return entries.filter(
+    ({ decision }) => decision === "decline" || decision === "cancel",
+  );
+}
+
+function approvalDisclosureIssue(request: CodexApprovalRequest): string | null {
+  if (request.kind === "file_change") {
+    return "file-change targets and patch details are unavailable";
+  }
+  if (request.kind === "command") {
+    if (!request.command?.trim()) {
+      return "the command is missing";
+    }
+    if (request.command.length > 360) {
+      return "the command exceeds the display limit";
     }
   }
-  return undefined;
+  if (request.cwd && request.cwd.length > 220) {
+    return "the working directory exceeds the display limit";
+  }
+  if (request.grantRoot && request.grantRoot.length > 220) {
+    return "the grant root exceeds the display limit";
+  }
+
+  const structuredDetails: Array<[string, unknown, number]> = [
+    ["additional permissions", request.additionalPermissions, 500],
+    ["network approval context", request.networkApprovalContext, 360],
+    ["proposed network policy amendments", request.proposedNetworkPolicyAmendments, 500],
+  ];
+  for (const [label, value, maxLength] of structuredDetails) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    const summary = structuredSummary(value);
+    if (!summary.complete) {
+      return `${label} cannot be rendered completely`;
+    }
+    if (summary.text.length > maxLength) {
+      return `${label} exceeds the display limit`;
+    }
+  }
+
+  const proposedExecRule = formatExecpolicyAmendment(request.proposedExecpolicyAmendment);
+  if (proposedExecRule && proposedExecRule.length > 360) {
+    return "the exec policy amendment exceeds the display limit";
+  }
+
+  const execPolicyDecisions = request.decisions.flatMap((decision, index) => {
+    const amendment = execpolicyAmendmentFromDecision(decision);
+    const formatted = amendment ? formatExecpolicyAmendment(amendment) : null;
+    return formatted ? [`${index + 1}: ${formatted}`] : [];
+  });
+  if (execPolicyDecisions.join(" / ").length > 500) {
+    return "exec policy decisions exceed the display limit";
+  }
+
+  const networkPolicyDecisions = request.decisions.flatMap((decision, index) => {
+    const amendment = networkPolicyAmendmentFromDecision(decision);
+    return amendment ? [`${index + 1}: ${formatNetworkPolicyAmendment(amendment)}`] : [];
+  });
+  if (networkPolicyDecisions.join(" / ").length > 500) {
+    return "network policy decisions exceed the display limit";
+  }
+
+  const labels = request.decisions.map(decisionLabel);
+  if (labels.some((label) => label.length > 80) || labels.join(" / ").length > 360) {
+    return "approval options exceed the display limit";
+  }
+  return null;
+}
+
+function execpolicyAmendmentFromDecision(decision: CodexApprovalDecision): string[] | null {
+  return typeof decision === "object" && "acceptWithExecpolicyAmendment" in decision
+    ? decision.acceptWithExecpolicyAmendment.execpolicy_amendment
+    : null;
 }
 
 function formatExecpolicyAmendment(value: unknown): string | null {
   const command = execpolicyCommandTokens(value);
   if (command?.length) {
-    return formatCommandForDisplay(command.map(formatCommandToken).join(" "));
+    return command.map(formatCommandToken).join(" ");
   }
   if (value === undefined || value === null) {
     return null;
   }
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
+  return stableStructuredSummary(value);
 }
 
 function execpolicyCommandTokens(value: unknown): string[] | null {
@@ -940,60 +1097,6 @@ function formatCommandToken(token: string): string {
   return /^[A-Za-z0-9_./:@%+=,-]+$/u.test(token) ? token : JSON.stringify(token);
 }
 
-function formatCommandForDisplay(command: string): string {
-  let current = command.trim();
-  while (true) {
-    const outer = parseShellLcInvocation(current);
-    if (!outer) {
-      return current;
-    }
-    const inner = outer.command.trim();
-    if (!parseShellLcInvocation(inner)) {
-      return current;
-    }
-    current = inner;
-  }
-}
-
-function parseShellLcInvocation(command: string): { command: string } | null {
-  const match = command.trim().match(/^(?:\/(?:usr\/)?bin\/)?(?:ba|z)?sh\s+-lc\s+([\s\S]+)$/u);
-  if (!match?.[1]) {
-    return null;
-  }
-  const inner = parseQuotedShellArgument(match[1].trim());
-  return inner === null ? null : { command: inner };
-}
-
-function parseQuotedShellArgument(value: string): string | null {
-  if (!value) {
-    return null;
-  }
-  const quote = value[0];
-  if (quote !== "\"" && quote !== "'") {
-    return value;
-  }
-
-  let content = "";
-  for (let index = 1; index < value.length; index += 1) {
-    const char = value[index];
-    if (quote === "\"" && char === "\\") {
-      const next = value[index + 1];
-      if (next && "\"\\$`\n".includes(next)) {
-        content += next;
-        index += 1;
-      } else {
-        content += char;
-      }
-      continue;
-    }
-    if (char === quote) {
-      return value.slice(index + 1).trim() ? null : content;
-    }
-    content += char;
-  }
-  return null;
-}
-
 function decisionLabel(decision: CodexApprovalDecision): string {
   if (decision === "accept") {
     return "Approve";
@@ -1008,9 +1111,140 @@ function decisionLabel(decision: CodexApprovalDecision): string {
     return "Cancel turn";
   }
   if ("acceptWithExecpolicyAmendment" in decision) {
-    return "Approve rule";
+    return `Exec rule: ${formatExecpolicyAmendment(
+      decision.acceptWithExecpolicyAmendment.execpolicy_amendment,
+    )}`;
   }
-  return "Apply network policy";
+  return formatNetworkPolicyAmendment(
+    decision.applyNetworkPolicyAmendment.network_policy_amendment,
+  );
+}
+
+function networkPolicyAmendmentFromDecision(
+  decision: CodexApprovalDecision,
+): { action: "allow" | "deny"; host: string } | null {
+  return typeof decision === "object" && "applyNetworkPolicyAmendment" in decision
+    ? decision.applyNetworkPolicyAmendment.network_policy_amendment
+    : null;
+}
+
+function formatNetworkPolicyAmendment(amendment: {
+  action: "allow" | "deny";
+  host: string;
+}): string {
+  return `Network ${amendment.action}: ${amendment.host}`;
+}
+
+function stableStructuredSummary(value: unknown): string {
+  return structuredSummary(value).text;
+}
+
+function structuredSummary(value: unknown): { text: string; complete: boolean } {
+  const seen = new Set<object>();
+  const state = { complete: true, entries: 100 };
+  try {
+    const text = JSON.stringify(normalizeStructuredValue(value, seen, state, 0));
+    return typeof text === "string"
+      ? { text, complete: state.complete }
+      : { text: '"[unrenderable value]"', complete: false };
+  } catch {
+    return { text: '"[unrenderable value]"', complete: false };
+  }
+}
+
+function normalizeStructuredValue(
+  value: unknown,
+  seen: Set<object>,
+  state: { complete: boolean; entries: number },
+  depth: number,
+): unknown {
+  if (value === null || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    if (value.length > 240) {
+      state.complete = false;
+      return `${value.slice(0, 237)}...`;
+    }
+    return value;
+  }
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) {
+      return value;
+    }
+    state.complete = false;
+    return "[non-finite number]";
+  }
+  if (typeof value === "bigint") {
+    state.complete = false;
+    return `[bigint ${value.toString()}]`;
+  }
+  if (typeof value === "undefined") {
+    state.complete = false;
+    return "[undefined]";
+  }
+  if (typeof value === "function") {
+    state.complete = false;
+    return "[unsupported function]";
+  }
+  if (typeof value === "symbol") {
+    state.complete = false;
+    return "[unsupported symbol]";
+  }
+  if (depth >= 8) {
+    state.complete = false;
+    return "[maximum depth reached]";
+  }
+  if (seen.has(value)) {
+    state.complete = false;
+    return "[circular reference]";
+  }
+  if (state.entries <= 0) {
+    state.complete = false;
+    return "[entry limit reached]";
+  }
+
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const normalized: unknown[] = [];
+      for (const item of value) {
+        if (state.entries <= 0) {
+          state.complete = false;
+          normalized.push("[entry limit reached]");
+          break;
+        }
+        state.entries -= 1;
+        normalized.push(normalizeStructuredValue(item, seen, state, depth + 1));
+      }
+      return normalized;
+    }
+
+    const normalized: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    const keys = Object.keys(value).sort((left, right) =>
+      left < right ? -1 : left > right ? 1 : 0,
+    );
+    for (const key of keys) {
+      if (state.entries <= 0) {
+        state.complete = false;
+        normalized["[truncated]"] = "[entry limit reached]";
+        break;
+      }
+      state.entries -= 1;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      const renderedKey = key.length > 120 ? `${key.slice(0, 117)}...` : key;
+      if (renderedKey !== key || !descriptor || !("value" in descriptor)) {
+        state.complete = false;
+      }
+      normalized[renderedKey] =
+        descriptor && "value" in descriptor
+          ? normalizeStructuredValue(descriptor.value, seen, state, depth + 1)
+          : "[accessor omitted]";
+    }
+    return normalized;
+  } finally {
+    seen.delete(value);
+  }
 }
 
 function decisionButtonType(decision: CodexApprovalDecision): string {
@@ -1027,6 +1261,15 @@ function field(label: string, value: string, maxLength: number): Record<string, 
   return {
     is_short: false,
     text: markdown(`**${label}**\n${escapeLarkMarkdown(truncate(value, maxLength))}`),
+  };
+}
+
+function approvalField(label: string, value: string, maxLength: number): Record<string, unknown> {
+  const visibleValue =
+    value.length <= maxLength ? value : `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+  return {
+    is_short: false,
+    text: markdown(`**${label}**\n${escapeLarkMarkdown(visibleValue)}`),
   };
 }
 
