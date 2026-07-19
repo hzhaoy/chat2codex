@@ -1,0 +1,39 @@
+README.md
+  s_bc0331dd4e9203::t_9a52fb9cb0c573 127-129,162-168,325,417-420
+README.zh-CN.md
+  s_bc0331dd4e9203::t_03932c8371ec9b 85,113-114,227,286-287
+src/agent/codex-runner.ts
+  s_04881f69acff8d::t_5e8c4149f12878 7,208,234-238,375-388,396,398,798-802,932-934,936-943,1857-1859
+src/state/store.ts
+  s_bc0331dd4e9203::t_1018ec54ab5c64 59
+src/state/types.ts
+  s_bc0331dd4e9203::t_2ff0d214e50a13 41-48,149
+tests/codex-runner.test.ts
+  s_04881f69acff8d::t_2ef216be481a14 323-471
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "720a323811d185e6061774c3ba812cb37068ea04",
+  "prompts": {},
+  "sessions": {
+    "s_04881f69acff8d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7b05-ee3b-7f61-9bb6-de95a42ecdbc",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
