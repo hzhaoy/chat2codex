@@ -17,6 +17,8 @@ export class JsonStateStore {
       const parsed = JSON.parse(raw) as Partial<BridgeState>;
       return {
         chats: parsed.chats ?? {},
+        jobs: parsed.jobs ?? {},
+        outbox: parsed.outbox ?? {},
         pendingMessages: parsed.pendingMessages ?? {},
         processedMessageIds: parsed.processedMessageIds ?? [],
         diagnostics: parsed.diagnostics ?? {},

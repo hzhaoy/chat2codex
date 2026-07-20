@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -15,6 +16,8 @@ import {
   type CodexRunInput,
   type CodexRunResult,
   type CodexRunSummary,
+  type CodexUserInputRequest,
+  type CodexUserInputResponse,
   type CodexThread,
   type CodexThreadItem,
   type CodexThreadListInput,
@@ -32,6 +35,9 @@ import { BridgeConfig } from "../config/env.js";
 import { JsonStateStore } from "../state/store.js";
 import {
   BridgeState,
+  type DurableCodexJob,
+  type DurableCodexJobStatus,
+  type DurableOutboxMessage,
   type ChatDiagnostics,
   type EventDiagnosticOutcome,
   type EventDiagnosticSnapshot,
@@ -57,6 +63,8 @@ import {
   type SenderIdentity,
 } from "./access-control.js";
 import {
+  answerUserInputCardAction,
+  cancelUserInputCardAction,
   cardActionCard,
   cardActionToast,
   pageProjectsCardAction,
@@ -76,18 +84,22 @@ import {
   buildHostHealthCard,
   buildProjectListCard,
   buildSessionListCard,
+  buildUserInputCard,
   isApprovalDecisionIndexAllowed,
   type ApprovalCardInput,
   type HostHealthCardInput,
   type LarkInteractiveCard,
   type RunResultCardInput,
   type RunStatusCardInput,
+  type UserInputCardInput,
 } from "./lark-card.js";
 
 const minProgressIntervalMs = 15_000;
 const maxRememberedStatusCards = 100;
 const pendingRunSteerTtlMs = 30_000;
 const maxPendingSteers = 5;
+const maxUserInputAnswerLength = 4_000;
+const outboxRetryDelaysMs = [250, 1_000, 5_000, 30_000, 120_000] as const;
 const pendingSteerLimitMessage = "已有 5 条补充指令等待发送，请先等当前 Codex 任务接收后再试。";
 
 export interface IncomingTextMessage {
@@ -125,8 +137,8 @@ export interface IncomingEventDiagnostic {
 }
 
 export interface ChatSender {
-  sendText(chatId: string, text: string): Promise<void>;
-  sendMarkdown?(chatId: string, markdown: string): Promise<void>;
+  sendText(chatId: string, text: string, options?: ChatDeliveryOptions): Promise<void>;
+  sendMarkdown?(chatId: string, markdown: string, options?: ChatDeliveryOptions): Promise<void>;
   sendInteractiveCard?(chatId: string, card: LarkInteractiveCard): Promise<void>;
   updateInteractiveCard?(messageId: string, card: LarkInteractiveCard): Promise<void>;
   downloadAttachment?(
@@ -137,6 +149,12 @@ export interface ChatSender {
   updateStatusCard?(handle: StatusCardHandle, input: RunStatusCardInput): Promise<void>;
   createApprovalCard?(chatId: string, input: ApprovalCardInput): Promise<StatusCardHandle>;
   updateApprovalCard?(handle: StatusCardHandle, input: ApprovalCardInput): Promise<void>;
+  createUserInputCard?(chatId: string, input: UserInputCardInput): Promise<StatusCardHandle>;
+  updateUserInputCard?(handle: StatusCardHandle, input: UserInputCardInput): Promise<void>;
+}
+
+export interface ChatDeliveryOptions {
+  idempotencyKey?: string;
 }
 
 export interface StatusCardHandle {
@@ -192,7 +210,23 @@ interface QueuedRunState {
   messageId?: string;
   threadId?: string;
   chatType?: ChatType;
+  originSender?: SenderIdentity;
   queuedAtMs: number;
+}
+
+interface PendingUserInput {
+  key: string;
+  chatId: string;
+  chatType: ChatType;
+  originSender: SenderIdentity;
+  request: CodexUserInputRequest;
+  replyCode: string;
+  answers: Map<string, { answers: string[] }>;
+  resolve: (response: CodexUserInputResponse) => void;
+  signal: AbortSignal;
+  abortListener: () => void;
+  handle: StatusCardHandle | null;
+  terminalCard?: UserInputCardInput;
 }
 
 interface PendingSteer {
@@ -206,17 +240,22 @@ interface PendingRunSteers {
 
 export class MessageRouter {
   private state: BridgeState | null = null;
+  private stateMutationTail: Promise<void> = Promise.resolve();
   private readonly bridgeStartedAtMs = Date.now();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly workspaceQueues = new Map<string, Promise<void>>();
   private readonly messageTasks = new Map<string, Promise<void>>();
+  private readonly outboxTasks = new Map<string, Promise<void>>();
+  private readonly outboxRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly queueDepths = new Map<string, number>();
   private readonly queuedRuns = new Map<string, QueuedRunState>();
   private readonly activeRuns = new Map<string, ActiveRunState>();
   private readonly pendingRunSteers = new Map<string, PendingRunSteers>();
   private readonly activeApprovals = new Map<string, PendingApproval>();
+  private readonly activeUserInputs = new Map<string, PendingUserInput>();
   private readonly statusCardRuns = new Map<string, { chatId: string; prompt: string }>();
   private readonly codex: CodexClient;
+  private disposed = false;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -228,20 +267,71 @@ export class MessageRouter {
     this.codex = codex ?? new CodexRunner(config, logger);
   }
 
+  dispose(): void {
+    this.disposed = true;
+    for (const timer of this.outboxRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.outboxRetryTimers.clear();
+  }
+
   async start(): Promise<void> {
     this.state = await this.store.load();
+    await this.recoverDurableState();
+    for (const jobId of new Set(
+      Object.values(this.state.outbox)
+        .filter((delivery) => delivery.status === "pending")
+        .map((delivery) => delivery.jobId),
+    )) {
+      this.scheduleOutboxDrain(jobId);
+    }
     for (const pending of Object.values(this.state.pendingMessages)) {
+      if (this.state.jobs[pending.messageId]?.status !== "queued") {
+        continue;
+      }
       this.scheduleAcceptedMessage(fromPendingMessage(pending));
     }
   }
 
   async accept(message: IncomingTextMessage): Promise<void> {
-    const state = this.requireState();
-    if (state.processedMessageIds.includes(message.messageId)) {
+    if (this.requireState().processedMessageIds.includes(message.messageId)) {
       return;
     }
-    state.pendingMessages[message.messageId] ??= toPendingMessage(message);
-    await this.store.save(state);
+    if (!message.attachments?.length && isUserInputAnswerCommand(message)) {
+      // User-input answers can contain secrets or other private values. Keep the
+      // command in memory only; processMessage still persists its message id so
+      // successful deliveries remain deduplicated without persisting the answer.
+      this.scheduleAcceptedMessage(message);
+      return;
+    }
+    const accepted = await this.mutateState((state) => {
+      if (state.processedMessageIds.includes(message.messageId)) {
+        return false;
+      }
+      state.pendingMessages[message.messageId] ??= toPendingMessage(message);
+      if (isDurableCodexCandidate(this.config, message) && !state.jobs[message.messageId]) {
+        const session = this.ensureSession(message.chatId, state, message.chatType);
+        const now = new Date().toISOString();
+        state.jobs[message.messageId] = {
+          id: message.messageId,
+          kind: "codex_run",
+          messageId: message.messageId,
+          chatId: message.chatId,
+          chatType: message.chatType,
+          cwd: session.cwd,
+          prompt: routedText(message),
+          threadId: session.threadId,
+          status: "queued",
+          createdAt: now,
+          updatedAt: now,
+          deliveryIds: [],
+        };
+      }
+      return true;
+    });
+    if (!accepted) {
+      return;
+    }
     this.scheduleAcceptedMessage(message);
   }
 
@@ -289,6 +379,9 @@ export class MessageRouter {
     }
     if (!message.attachments?.length && detailCommandKind(message)) {
       return this.handleImmediateRunDetail(message);
+    }
+    if (!message.attachments?.length && isUserInputAnswerCommand(message)) {
+      return this.handleImmediateUserInputAnswer(message);
     }
 
     return this.enqueueTask(message.chatId, () => this.handle(message));
@@ -339,6 +432,12 @@ export class MessageRouter {
 
     if (action.action === resolveApprovalCardAction) {
       return this.handleApprovalCardAction(action);
+    }
+    if (
+      action.action === answerUserInputCardAction ||
+      action.action === cancelUserInputCardAction
+    ) {
+      return this.handleUserInputCardAction(action);
     }
     if (action.action === pageProjectsCardAction) {
       return this.handleProjectPageCardAction(action);
@@ -402,19 +501,25 @@ export class MessageRouter {
     const state = this.requireState();
     if (state.processedMessageIds.includes(message.messageId)) {
       if (state.pendingMessages[message.messageId]) {
-        delete state.pendingMessages[message.messageId];
-        await this.store.save(state);
+        await this.mutateState((currentState) => {
+          delete currentState.pendingMessages[message.messageId];
+        });
       }
       this.logger.debug("Skipping duplicate message", { messageId: message.messageId });
       return;
     }
 
     await action();
-    if (!state.processedMessageIds.includes(message.messageId)) {
-      state.processedMessageIds.push(message.messageId);
-    }
-    delete state.pendingMessages[message.messageId];
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const job = currentState.jobs[message.messageId];
+      if (job?.status === "queued") {
+        job.status = "cancelled";
+        job.prompt = truncateInline(job.prompt, 180);
+        job.updatedAt = new Date().toISOString();
+        job.completedAt = job.updatedAt;
+      }
+      markMessageProcessed(currentState, message.messageId);
+    });
   }
 
   private incrementQueueDepth(chatId: string): void {
@@ -518,7 +623,13 @@ export class MessageRouter {
       return;
     }
 
-    await this.runCodex(message.chatId, prompt, message.chatType, message.messageId);
+    await this.runCodex(
+      message.chatId,
+      prompt,
+      message.chatType,
+      message.messageId,
+      message.sender,
+    );
   }
 
   private async rejectUnauthorized(
@@ -544,14 +655,47 @@ export class MessageRouter {
     );
   }
 
-  private runCodex(
+  private async runCodex(
     chatId: string,
     prompt: string,
     chatType?: ChatType,
     messageId?: string,
+    originSender?: SenderIdentity,
   ): Promise<void> {
     const state = this.requireState();
     const session = this.ensureSession(chatId, state, chatType);
+    if (messageId) {
+      await this.mutateState((currentState) => {
+        const currentSession = this.ensureSession(chatId, currentState, chatType);
+        const now = new Date().toISOString();
+        const job = currentState.jobs[messageId] ?? {
+          id: messageId,
+          kind: "codex_run" as const,
+          messageId,
+          chatId,
+          chatType: currentSession.chatType ?? chatType ?? "direct",
+          cwd: currentSession.cwd,
+          prompt,
+          status: "queued" as const,
+          createdAt: now,
+          updatedAt: now,
+          deliveryIds: [],
+        };
+        if (isTerminalJobStatus(job.status)) {
+          return;
+        }
+        job.cwd = currentSession.cwd;
+        job.prompt = prompt;
+        job.threadId = currentSession.threadId;
+        job.updatedAt = now;
+        currentState.jobs[messageId] = job;
+      });
+      const existing = this.requireState().jobs[messageId];
+      if (existing && isTerminalJobStatus(existing.status)) {
+        this.scheduleOutboxDrain(messageId);
+        return;
+      }
+    }
     const workspace = canonicalExistingPath(session.cwd) ?? path.resolve(session.cwd);
     const queuedRun: QueuedRunState = {
       controller: new AbortController(),
@@ -560,6 +704,7 @@ export class MessageRouter {
       messageId,
       threadId: session.threadId,
       chatType: session.chatType ?? chatType,
+      originSender: originSender ? { ...originSender } : undefined,
       queuedAtMs: Date.now(),
     };
     this.queuedRuns.set(chatId, queuedRun);
@@ -571,7 +716,7 @@ export class MessageRouter {
       }
       await this.runCodexInWorkspace(chatId, queuedRun);
     });
-    return waitForTaskOrQueuedAbort(
+    return await waitForTaskOrQueuedAbort(
       workspaceTask,
       queuedRun.controller.signal,
       () => workspaceTaskStarted,
@@ -642,6 +787,18 @@ export class MessageRouter {
       });
       return;
     }
+    if (queuedRun.messageId) {
+      await this.mutateState((currentState) => {
+        const job = currentState.jobs[queuedRun.messageId!];
+        if (!job || isTerminalJobStatus(job.status)) {
+          return;
+        }
+        job.status = "running";
+        job.prompt = truncateInline(job.prompt, 180);
+        job.startedAt = startedAt;
+        job.updatedAt = startedAt;
+      });
+    }
     const runState: ActiveRunState = {
       controller,
       cwd: session.cwd,
@@ -691,6 +848,14 @@ export class MessageRouter {
             prompt,
             startedAt,
           ),
+        onUserInputRequest: (request, context) =>
+          this.requestUserInput(
+            chatId,
+            queuedRun.chatType ?? "direct",
+            queuedRun.originSender,
+            request,
+            context.signal,
+          ),
         onRunControl: (control) => {
           runState.threadId = control.threadId ?? runState.threadId;
           runState.turnId = control.turnId;
@@ -701,11 +866,11 @@ export class MessageRouter {
 
       if (result.cancelled || controller.signal.aborted) {
         if (runState.timedOut) {
-          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt);
+          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt, queuedRun.messageId);
           return;
         }
         const completedAt = new Date().toISOString();
-        session.lastRun = buildLastRunSummary({
+        const lastRun = buildLastRunSummary({
           status: "stopped",
           cwd: session.cwd,
           threadId: result.threadId ?? session.threadId,
@@ -714,8 +879,14 @@ export class MessageRouter {
           completedAt,
           summary: result.summary,
         });
-        session.updatedAt = completedAt;
-        await this.store.save(state);
+        await this.persistRunTerminal({
+          chatId,
+          messageId: queuedRun.messageId,
+          status: "cancelled",
+          lastRun,
+          threadId: result.threadId ?? session.threadId,
+          deliveries: [],
+        });
         this.logger.info("Codex run stopped", { chatId });
         await this.updateStatusCard(statusCard, {
           status: "stopped",
@@ -724,39 +895,44 @@ export class MessageRouter {
           prompt,
           startedAt,
           updatedAt: completedAt,
-          result: runResultCardInput(session.lastRun),
+          result: runResultCardInput(lastRun),
         });
         return;
       }
 
-      if (result.threadId) {
-        session.threadId = result.threadId;
-      }
+      const resultThreadId = result.threadId ?? session.threadId;
       const completedAt = new Date().toISOString();
-      session.updatedAt = completedAt;
 
       if (result.exitCode !== 0) {
-        session.lastRun = buildLastRunSummary({
+        const lastRun = buildLastRunSummary({
           status: "failed",
           cwd: session.cwd,
-          threadId: session.threadId,
+          threadId: resultThreadId,
           prompt,
           startedAt,
           completedAt,
           summary: result.summary,
           errorText: [result.finalText, result.stderr].filter(Boolean).join("\n"),
         });
-        await this.store.save(state);
         const failure = formatCodexFailure(result, session.cwd);
         await this.recordRecentFailure(chatId, {
           category: inferCodexResultFailureCategory(result),
           cwd: session.cwd,
           promptPreview: prompt,
-          threadId: session.threadId,
+          threadId: resultThreadId,
           exitCode: result.exitCode,
           signal: result.signal ?? null,
           detail: formatExit(result),
           hint: inferCodexFailureHint(result.finalText, result.stderr) ?? undefined,
+        });
+        const durable = await this.persistRunTerminal({
+          chatId,
+          messageId: queuedRun.messageId,
+          status: "failed",
+          lastRun,
+          threadId: resultThreadId,
+          updateSessionThread: true,
+          deliveries: splitForChat(failure).map((text) => ({ kind: "text" as const, text })),
         });
         await this.updateStatusCard(statusCard, {
           status: "failed",
@@ -765,25 +941,39 @@ export class MessageRouter {
           prompt,
           startedAt,
           updatedAt: completedAt,
-          result: runResultCardInput(session.lastRun),
+          result: runResultCardInput(lastRun),
         });
-        for (const chunk of splitForChat(failure)) {
-          await this.sender.sendText(chatId, chunk);
+        if (durable) {
+          await this.drainOutboxForJob(queuedRun.messageId!);
+        } else {
+          for (const chunk of splitForChat(failure)) {
+            await this.sender.sendText(chatId, chunk);
+          }
         }
         return;
       }
 
-      session.lastRun = buildLastRunSummary({
+      const lastRun = buildLastRunSummary({
         status: "success",
         cwd: session.cwd,
-        threadId: session.threadId,
+        threadId: resultThreadId,
         prompt,
         startedAt,
         completedAt,
         summary: result.summary,
         finalText: result.finalText,
       });
-      await this.store.save(state);
+      const durable = await this.persistRunTerminal({
+        chatId,
+        messageId: queuedRun.messageId,
+        status: "completed",
+        lastRun,
+        threadId: resultThreadId,
+        deliveries: splitForChat(result.finalText).map((text) => ({
+          kind: "markdown" as const,
+          text,
+        })),
+      });
       await this.updateStatusCard(statusCard, {
         status: "success",
         detail: "Codex 已完成，正在发送最终回答。",
@@ -791,18 +981,42 @@ export class MessageRouter {
         prompt,
         startedAt,
         updatedAt: completedAt,
-        result: runResultCardInput(session.lastRun),
+        result: runResultCardInput(lastRun),
       });
-      for (const chunk of splitForChat(result.finalText)) {
-        await this.sendMarkdown(chatId, chunk);
+      if (durable) {
+        await this.drainOutboxForJob(queuedRun.messageId!);
+      } else {
+        for (const chunk of splitForChat(result.finalText)) {
+          await this.sendMarkdown(chatId, chunk);
+        }
       }
     } catch (error) {
       if (controller.signal.aborted) {
         if (runState.timedOut) {
-          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt);
+          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt, queuedRun.messageId);
           return;
         }
         this.logger.info("Codex run stopped", { chatId });
+        if (queuedRun.messageId) {
+          const completedAt = new Date().toISOString();
+          const lastRun = buildLastRunSummary({
+            status: "stopped",
+            cwd: session.cwd,
+            threadId: session.threadId,
+            prompt,
+            startedAt,
+            completedAt,
+            errorText: "Codex run was stopped.",
+          });
+          await this.persistRunTerminal({
+            chatId,
+            messageId: queuedRun.messageId,
+            status: "cancelled",
+            lastRun,
+            threadId: session.threadId,
+            deliveries: [],
+          });
+        }
         return;
       }
       this.logger.error("Codex run failed", error);
@@ -880,7 +1094,7 @@ export class MessageRouter {
         });
       }
       const completedAt = new Date().toISOString();
-      session.lastRun = buildLastRunSummary({
+      const lastRun = buildLastRunSummary({
         status: "failed",
         cwd: failedCwd,
         threadId: failedThreadId,
@@ -889,8 +1103,14 @@ export class MessageRouter {
         completedAt,
         errorText: formatError(error),
       });
-      session.updatedAt = completedAt;
-      await this.store.save(state);
+      const durable = await this.persistRunTerminal({
+        chatId,
+        messageId: queuedRun.messageId,
+        status: "failed",
+        lastRun,
+        threadId: failedThreadId,
+        deliveries: splitForChat(failure).map((text) => ({ kind: "text" as const, text })),
+      });
       await this.updateStatusCard(statusCard, {
         status: "failed",
         detail: "Codex 启动失败，错误摘要已发送。",
@@ -898,16 +1118,21 @@ export class MessageRouter {
         prompt,
         startedAt,
         updatedAt: completedAt,
-        result: runResultCardInput(session.lastRun),
+        result: runResultCardInput(lastRun),
       });
-      for (const chunk of splitForChat(failure)) {
-        await this.sender.sendText(chatId, chunk);
+      if (durable) {
+        await this.drainOutboxForJob(queuedRun.messageId!);
+      } else {
+        for (const chunk of splitForChat(failure)) {
+          await this.sender.sendText(chatId, chunk);
+        }
       }
     } finally {
       if (runState.timeoutTimer) {
         clearTimeout(runState.timeoutTimer);
       }
       await this.cancelApprovalsForChat(chatId);
+      await this.cancelUserInputsForChat(chatId);
       if (this.activeRuns.get(chatId) === runState) {
         await this.reportUnsentPendingSteers(chatId, runState);
         this.activeRuns.delete(chatId);
@@ -922,6 +1147,7 @@ export class MessageRouter {
     prompt: string,
     threadId: string | undefined,
     startedAt: string,
+    messageId?: string,
   ): Promise<void> {
     const failure = formatRunTimeoutFailure(this.config.codexRunTimeoutMs, cwd);
     this.logger.warn("Codex run timed out", {
@@ -936,10 +1162,8 @@ export class MessageRouter {
       detail: `Run exceeded CODEX_RUN_TIMEOUT_MS=${this.config.codexRunTimeoutMs}.`,
       hint: runTimeoutHint(this.config.codexRunTimeoutMs),
     });
-    const state = this.requireState();
-    const session = this.ensureSession(chatId, state);
     const completedAt = new Date().toISOString();
-    session.lastRun = buildLastRunSummary({
+    const lastRun = buildLastRunSummary({
       status: "failed",
       cwd,
       threadId,
@@ -948,8 +1172,14 @@ export class MessageRouter {
       completedAt,
       errorText: `Run exceeded CODEX_RUN_TIMEOUT_MS=${this.config.codexRunTimeoutMs}.`,
     });
-    session.updatedAt = completedAt;
-    await this.store.save(state);
+    const durable = await this.persistRunTerminal({
+      chatId,
+      messageId,
+      status: "failed",
+      lastRun,
+      threadId,
+      deliveries: splitForChat(failure).map((text) => ({ kind: "text" as const, text })),
+    });
     await this.updateStatusCard(statusCard, {
       status: "failed",
       detail: "Codex 运行超时，已停止当前任务。",
@@ -957,10 +1187,249 @@ export class MessageRouter {
       prompt,
       startedAt,
       updatedAt: completedAt,
-      result: runResultCardInput(session.lastRun),
+      result: runResultCardInput(lastRun),
     });
-    for (const chunk of splitForChat(failure)) {
-      await this.sender.sendText(chatId, chunk);
+    if (durable) {
+      await this.drainOutboxForJob(messageId!);
+    } else {
+      for (const chunk of splitForChat(failure)) {
+        await this.sender.sendText(chatId, chunk);
+      }
+    }
+  }
+
+  private async recoverDurableState(): Promise<void> {
+    await this.mutateState((state) => {
+      const now = new Date().toISOString();
+      for (const delivery of Object.values(state.outbox)) {
+        if (delivery.status === "sending") {
+          delivery.status = "pending";
+          delivery.updatedAt = now;
+        }
+      }
+
+      for (const pending of Object.values(state.pendingMessages)) {
+        let job = state.jobs[pending.messageId];
+        if (!job) {
+          const session = state.chats[pending.chatId];
+          job = {
+            id: pending.messageId,
+            kind: "codex_run",
+            messageId: pending.messageId,
+            chatId: pending.chatId,
+            chatType: pending.chatType,
+            cwd: session?.cwd ?? this.config.codexWorkdir,
+            prompt: pending.text,
+            threadId: session?.threadId,
+            status: "interrupted",
+            createdAt: pending.acceptedAt,
+            updatedAt: now,
+            completedAt: now,
+            deliveryIds: [],
+            interruptionReason: "legacy_pending_without_job",
+          };
+          state.jobs[job.id] = job;
+          appendOutboxDeliveries(state, job, [
+            {
+              kind: "text",
+              text: interruptedJobMessage(job),
+            },
+          ], now);
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+
+        if (job.status === "running") {
+          interruptDurableJob(state, job, now);
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+        if (isTerminalJobStatus(job.status)) {
+          markMessageProcessed(state, pending.messageId);
+        }
+      }
+
+      for (const job of Object.values(state.jobs)) {
+        if (job.status === "running") {
+          interruptDurableJob(state, job, now);
+          markMessageProcessed(state, job.messageId);
+          continue;
+        }
+        if (job.status === "queued" && !state.pendingMessages[job.messageId]) {
+          interruptDurableJob(state, job, now, "queued_job_missing_inbox");
+          markMessageProcessed(state, job.messageId);
+        }
+      }
+    });
+  }
+
+  private async persistRunTerminal(input: {
+    chatId: string;
+    messageId?: string;
+    status: Extract<DurableCodexJobStatus, "completed" | "failed" | "cancelled">;
+    lastRun: LastRunSummary;
+    threadId?: string;
+    updateSessionThread?: boolean;
+    deliveries: Array<{ kind: DurableOutboxMessage["kind"]; text: string }>;
+  }): Promise<boolean> {
+    return this.mutateState((state) => {
+      const job = input.messageId ? state.jobs[input.messageId] : undefined;
+      const session = this.ensureSession(input.chatId, state, job?.chatType);
+      if ((input.status !== "failed" || input.updateSessionThread) && input.threadId) {
+        session.threadId = input.threadId;
+      }
+      session.lastRun = input.lastRun;
+      session.updatedAt = input.lastRun.completedAt;
+      if (!input.messageId) {
+        return false;
+      }
+
+      const durableJob = job ?? {
+        id: input.messageId,
+        kind: "codex_run" as const,
+        messageId: input.messageId,
+        chatId: input.chatId,
+        chatType: session.chatType ?? "direct",
+        cwd: input.lastRun.cwd,
+        prompt: input.lastRun.promptPreview,
+        status: "running" as const,
+        createdAt: input.lastRun.startedAt,
+        updatedAt: input.lastRun.startedAt,
+        deliveryIds: [],
+      };
+      if (!isTerminalJobStatus(durableJob.status)) {
+        durableJob.status = input.status;
+        durableJob.prompt = input.lastRun.promptPreview;
+        durableJob.threadId = input.threadId ?? durableJob.threadId;
+        durableJob.result = input.lastRun;
+        durableJob.completedAt = input.lastRun.completedAt;
+        durableJob.updatedAt = input.lastRun.completedAt;
+        appendOutboxDeliveries(state, durableJob, input.deliveries, input.lastRun.completedAt);
+        state.jobs[input.messageId] = durableJob;
+      }
+      markMessageProcessed(state, input.messageId);
+      return true;
+    });
+  }
+
+  private scheduleOutboxDrain(jobId: string): void {
+    if (this.disposed) {
+      return;
+    }
+    void this.drainOutboxForJob(jobId).catch((error: unknown) => {
+      this.logger.error("Durable outbox drain failed", error);
+    });
+  }
+
+  private drainOutboxForJob(jobId: string): Promise<void> {
+    const active = this.outboxTasks.get(jobId);
+    if (active) {
+      return active;
+    }
+    const task = this.drainOutboxForJobOnce(jobId).finally(() => {
+      if (this.outboxTasks.get(jobId) === task) {
+        this.outboxTasks.delete(jobId);
+      }
+    });
+    this.outboxTasks.set(jobId, task);
+    return task;
+  }
+
+  private async drainOutboxForJobOnce(jobId: string): Promise<void> {
+    const deliveries = Object.values(this.requireState().outbox)
+      .filter((delivery) => delivery.jobId === jobId)
+      .sort((left, right) => left.sequence - right.sequence);
+    for (const delivery of deliveries) {
+      if (delivery.status === "delivered") {
+        continue;
+      }
+      if (!(await this.deliverOutboxMessage(delivery.id))) {
+        return;
+      }
+    }
+    this.clearOutboxRetry(jobId);
+  }
+
+  private scheduleOutboxRetry(jobId: string, attempts: number): void {
+    if (this.disposed || this.outboxRetryTimers.has(jobId)) {
+      return;
+    }
+    const delayIndex = Math.min(
+      Math.max(0, attempts - 1),
+      outboxRetryDelaysMs.length - 1,
+    );
+    const timer = setTimeout(() => {
+      if (this.outboxRetryTimers.get(jobId) !== timer) {
+        return;
+      }
+      this.outboxRetryTimers.delete(jobId);
+      this.scheduleOutboxDrain(jobId);
+    }, outboxRetryDelaysMs[delayIndex]);
+    timer.unref?.();
+    this.outboxRetryTimers.set(jobId, timer);
+  }
+
+  private clearOutboxRetry(jobId: string): void {
+    const timer = this.outboxRetryTimers.get(jobId);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    this.outboxRetryTimers.delete(jobId);
+  }
+
+  private async deliverOutboxMessage(deliveryId: string): Promise<boolean> {
+    const delivery = await this.mutateState((state) => {
+      const current = state.outbox[deliveryId];
+      if (!current || current.status === "delivered") {
+        return null;
+      }
+      current.status = "sending";
+      current.attempts += 1;
+      current.updatedAt = new Date().toISOString();
+      delete current.lastError;
+      return structuredClone(current);
+    });
+    if (!delivery) {
+      return true;
+    }
+
+    try {
+      const options = { idempotencyKey: delivery.idempotencyKey };
+      if (delivery.kind === "markdown" && this.sender.sendMarkdown) {
+        await this.sender.sendMarkdown(delivery.chatId, delivery.text, options);
+      } else {
+        await this.sender.sendText(delivery.chatId, delivery.text, options);
+      }
+      await this.mutateState((state) => {
+        const current = state.outbox[deliveryId];
+        if (!current) {
+          return;
+        }
+        current.status = "delivered";
+        current.text = "";
+        current.deliveredAt = new Date().toISOString();
+        current.updatedAt = current.deliveredAt;
+        delete current.lastError;
+      });
+      return true;
+    } catch (error) {
+      await this.mutateState((state) => {
+        const current = state.outbox[deliveryId];
+        if (!current) {
+          return;
+        }
+        current.status = "pending";
+        current.updatedAt = new Date().toISOString();
+        current.lastError = truncateInline(formatError(error), 240);
+      });
+      this.logger.warn("Durable outbox delivery failed; leaving it pending", {
+        deliveryId,
+        jobId: delivery.jobId,
+        error: formatError(error),
+      });
+      this.scheduleOutboxRetry(delivery.jobId, delivery.attempts);
+      return false;
     }
   }
 
@@ -1058,6 +1527,10 @@ export class MessageRouter {
     await this.handleImmediateCommand(message, () =>
       this.steerActiveRun(message.chatId, routedText(message).slice("/steer".length).trim()),
     );
+  }
+
+  private async handleImmediateUserInputAnswer(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.answerUserInputFromText(message));
   }
 
   private async handleImmediateCommand(
@@ -1890,6 +2363,333 @@ export class MessageRouter {
     await this.store.save(state);
   }
 
+  private async handleUserInputCardAction(
+    action: IncomingCardAction,
+  ): Promise<CardActionResponse> {
+    if (!action.userInputId) {
+      return cardActionToast("warning", "无法处理输入请求：缺少请求上下文。");
+    }
+    const pending = this.activeUserInputs.get(userInputKey(action.chatId, action.userInputId));
+    if (!pending) {
+      return cardActionToast("warning", "无法处理输入请求：请求已结束或已失效。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以回答这条输入请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      action.messageId !== pending.handle.messageId
+    ) {
+      return cardActionToast("warning", "无法处理输入请求：卡片上下文不匹配。");
+    }
+
+    if (action.action === cancelUserInputCardAction) {
+      const input = this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+      await this.updateUserInputCard(pending.handle, input);
+      return cardActionCard(buildUserInputCard(input));
+    }
+
+    const question = nextUserInputQuestion(pending);
+    if (!question || !action.questionId || action.questionId !== question.id) {
+      return cardActionToast("warning", "无法处理输入请求：当前问题已变化，请刷新卡片后重试。");
+    }
+
+    let answers: string[] = [];
+    if (action.optionIndex !== undefined) {
+      const options = question.options ?? [];
+      const option = options[action.optionIndex];
+      if (!option || action.optionIndex < 0) {
+        return cardActionToast("warning", "无法处理输入请求：选项已失效。");
+      }
+      if (option.label.length > maxUserInputAnswerLength) {
+        return cardActionToast("warning", "无法处理输入请求：选项内容超过安全长度上限。");
+      }
+      // Never trust a label supplied by the callback. Resolve the selected value
+      // from the original app-server request using the validated index.
+      answers = [option.label];
+    }
+
+    const input = this.advancePendingUserInput(pending, question.id, answers);
+    await this.updateUserInputCard(pending.handle, input);
+    return cardActionCard(buildUserInputCard(input));
+  }
+
+  private async requestUserInput(
+    chatId: string,
+    chatType: ChatType,
+    originSender: SenderIdentity | undefined,
+    request: CodexUserInputRequest,
+    signal: AbortSignal,
+  ): Promise<CodexUserInputResponse> {
+    if (signal.aborted || request.questions.length === 0) {
+      return { answers: {} };
+    }
+    if (request.questions.some((question) => question.isSecret)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "这次 Codex 请求包含敏感输入；当前聊天通道不提供安全密码输入，已按安全策略跳过。",
+      );
+      return { answers: {} };
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已拒绝这次 Codex 用户输入请求。",
+      );
+      return { answers: {} };
+    }
+
+    const key = userInputKey(chatId, request.id);
+    if (this.activeUserInputs.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的 Codex 用户输入请求；为避免回答错配，已拒绝后到请求。",
+      );
+      return { answers: {} };
+    }
+
+    return new Promise<CodexUserInputResponse>((resolve) => {
+      let pending!: PendingUserInput;
+      const abortListener = () => {
+        if (this.activeUserInputs.get(key) !== pending) {
+          return;
+        }
+        const input = this.finishPendingUserInput(pending, "expired", { answers: {} });
+        void this.updateUserInputCard(pending.handle, input);
+      };
+      pending = {
+        key,
+        chatId,
+        chatType,
+        originSender: { ...originSender },
+        request,
+        replyCode: this.createUserInputReplyCode(),
+        answers: new Map(),
+        resolve,
+        signal,
+        abortListener,
+        handle: null,
+      };
+      this.activeUserInputs.set(key, pending);
+      signal.addEventListener("abort", abortListener, { once: true });
+      void this.presentUserInputRequest(pending);
+    });
+  }
+
+  private async answerUserInputFromText(message: IncomingTextMessage): Promise<void> {
+    const command = parseUserInputAnswerCommand(routedText(message));
+    if (!command) {
+      await this.sender.sendText(message.chatId, "用法：/answer <replyCode> <内容>");
+      return;
+    }
+    const pending = [...this.activeUserInputs.values()].find(
+      (candidate) =>
+        candidate.chatId === message.chatId &&
+        candidate.replyCode.toLowerCase() === command.replyCode.toLowerCase(),
+    );
+    if (!pending) {
+      await this.sender.sendText(message.chatId, "回复码无效，或这条 Codex 输入请求已经结束。");
+      return;
+    }
+    if (!sameStableSenderIdentity(pending.originSender, message.sender)) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起当前 Codex 任务的用户可以回答这条输入请求。",
+      );
+      return;
+    }
+
+    const question = nextUserInputQuestion(pending);
+    if (!question) {
+      await this.sender.sendText(message.chatId, "这条 Codex 输入请求已经结束。");
+      return;
+    }
+    if (command.answer.length > maxUserInputAnswerLength) {
+      await this.sender.sendText(
+        message.chatId,
+        `回答超过 ${maxUserInputAnswerLength} 个字符，未提交；请缩短后重试。`,
+      );
+      return;
+    }
+    let answer = command.answer;
+    if ((question.options?.length ?? 0) > 0 && !question.isOther) {
+      const option = question.options?.find((candidate) => candidate.label === answer);
+      if (!option) {
+        await this.sender.sendText(
+          message.chatId,
+          "当前问题只接受卡片中的可选项；请发送完全一致的选项名称。",
+        );
+        return;
+      }
+      answer = option.label;
+    }
+
+    const input = this.advancePendingUserInput(pending, question.id, [answer]);
+    await this.updateUserInputCard(pending.handle, input);
+    if (input.status === "pending" && !pending.handle) {
+      const delivered = await this.sendUserInputTextSafely(
+        message.chatId,
+        formatUserInputTextPrompt(pending),
+      );
+      if (!delivered && this.activeUserInputs.get(pending.key) === pending) {
+        this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+      }
+      return;
+    }
+    await this.sendUserInputTextSafely(
+      message.chatId,
+      input.status === "resolved"
+        ? "已把回答提交给 Codex（回答内容不会在聊天中回显）。"
+        : "已记录当前问题的回答（回答内容不会在聊天中回显）。",
+    );
+  }
+
+  private advancePendingUserInput(
+    pending: PendingUserInput,
+    questionId: string,
+    answers: string[],
+  ): UserInputCardInput {
+    pending.answers.set(questionId, { answers: [...answers] });
+    if (nextUserInputQuestion(pending)) {
+      return this.userInputCardInput(pending, "pending");
+    }
+    return this.finishPendingUserInput(
+      pending,
+      "resolved",
+      pendingUserInputResponse(pending),
+    );
+  }
+
+  private finishPendingUserInput(
+    pending: PendingUserInput,
+    status: "resolved" | "cancelled" | "expired",
+    response: CodexUserInputResponse,
+  ): UserInputCardInput {
+    if (this.activeUserInputs.get(pending.key) === pending) {
+      this.activeUserInputs.delete(pending.key);
+    }
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    const input = this.userInputCardInput(pending, status);
+    pending.terminalCard = input;
+    pending.resolve(response);
+    return input;
+  }
+
+  private userInputCardInput(
+    pending: PendingUserInput,
+    status: UserInputCardInput["status"],
+  ): UserInputCardInput {
+    return {
+      status,
+      request: pending.request,
+      replyCode: pending.replyCode,
+      ...(status === "pending" || status === "resolved"
+        ? { answers: redactedUserInputAnswers(pending) }
+        : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  private async presentUserInputRequest(pending: PendingUserInput): Promise<void> {
+    if (!this.sender.createUserInputCard || !this.sender.updateUserInputCard) {
+      const delivered = await this.sendUserInputTextSafely(
+        pending.chatId,
+        formatUserInputTextPrompt(pending),
+      );
+      if (!delivered && this.activeUserInputs.get(pending.key) === pending) {
+        this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+      }
+      return;
+    }
+    try {
+      const handle = await this.sender.createUserInputCard(
+        pending.chatId,
+        this.userInputCardInput(pending, "pending"),
+      );
+      if (this.activeUserInputs.get(pending.key) === pending) {
+        pending.handle = handle;
+        const answerCount = pending.answers.size;
+        if (answerCount > 0) {
+          await this.updateUserInputCard(handle, this.userInputCardInput(pending, "pending"));
+        }
+        if (this.activeUserInputs.get(pending.key) !== pending) {
+          if (pending.terminalCard) {
+            await this.updateUserInputCard(handle, pending.terminalCard);
+          }
+        } else if (pending.answers.size !== answerCount) {
+          await this.updateUserInputCard(handle, this.userInputCardInput(pending, "pending"));
+        }
+        return;
+      }
+      if (pending.terminalCard) {
+        await this.updateUserInputCard(handle, pending.terminalCard);
+      }
+    } catch (error) {
+      this.logger.warn("User-input card creation failed; falling back to text", error);
+      if (this.activeUserInputs.get(pending.key) === pending) {
+        const delivered = await this.sendUserInputTextSafely(
+          pending.chatId,
+          formatUserInputTextPrompt(pending),
+        );
+        if (!delivered && this.activeUserInputs.get(pending.key) === pending) {
+          this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+        }
+      }
+    }
+  }
+
+  private async updateUserInputCard(
+    handle: StatusCardHandle | null,
+    input: UserInputCardInput,
+  ): Promise<boolean> {
+    if (!handle || !this.sender.updateUserInputCard) {
+      return false;
+    }
+    try {
+      await this.sender.updateUserInputCard(handle, input);
+      return true;
+    } catch (error) {
+      this.logger.warn("User-input card update failed", error);
+      return false;
+    }
+  }
+
+  private async sendUserInputTextSafely(chatId: string, text: string): Promise<boolean> {
+    try {
+      await this.sender.sendText(chatId, text);
+      return true;
+    } catch (error) {
+      this.logger.warn("User-input text delivery failed", error);
+      return false;
+    }
+  }
+
+  private async cancelUserInputsForChat(chatId: string): Promise<void> {
+    const pending = [...this.activeUserInputs.values()].filter(
+      (request) => request.chatId === chatId,
+    );
+    for (const request of pending) {
+      if (this.activeUserInputs.get(request.key) !== request) {
+        continue;
+      }
+      const input = this.finishPendingUserInput(request, "cancelled", { answers: {} });
+      await this.updateUserInputCard(request.handle, input);
+    }
+  }
+
+  private createUserInputReplyCode(): string {
+    let code = "";
+    do {
+      code = randomUUID().replaceAll("-", "").slice(0, 8).toLowerCase();
+    } while (
+      [...this.activeUserInputs.values()].some(
+        (pending) => pending.replyCode.toLowerCase() === code,
+      )
+    );
+    return code;
+  }
+
   private async stopCodex(
     chatId: string,
     options: { notifyChat?: boolean } = {},
@@ -1927,12 +2727,16 @@ export class MessageRouter {
     if (!run.messageId) {
       return;
     }
-    const state = this.requireState();
-    if (!state.processedMessageIds.includes(run.messageId)) {
-      state.processedMessageIds.push(run.messageId);
-    }
-    delete state.pendingMessages[run.messageId];
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const job = state.jobs[run.messageId!];
+      if (job?.status === "queued") {
+        job.status = "cancelled";
+        job.prompt = truncateInline(job.prompt, 180);
+        job.updatedAt = new Date().toISOString();
+        job.completedAt = job.updatedAt;
+      }
+      markMessageProcessed(state, run.messageId!);
+    });
   }
 
   private handleRetryCardAction(action: IncomingCardAction): CardActionResponse {
@@ -1950,7 +2754,13 @@ export class MessageRouter {
     }
 
     this.enqueueTask(action.chatId, () =>
-      this.runCodex(action.chatId, run.prompt, this.chatTypeForAction(action.chatId)),
+      this.runCodex(
+        action.chatId,
+        run.prompt,
+        this.chatTypeForAction(action.chatId),
+        undefined,
+        action.sender,
+      ),
     ).catch(
       (error) => {
         this.logger.error("Retry task failed", error);
@@ -2546,30 +3356,52 @@ export class MessageRouter {
     chatId: string,
     failure: Omit<RecentFailureDiagnostic, "at"> & { at?: string },
   ): Promise<void> {
-    const state = this.requireState();
-    const diagnostics = ensureChatDiagnostics(state, chatId);
-    const recentFailures = diagnostics.recentFailures ?? [];
-    diagnostics.recentFailures = [
-      ...recentFailures,
-      {
-        at: failure.at ?? new Date().toISOString(),
-        category: failure.category,
-        cwd: failure.cwd,
-        promptPreview: failure.promptPreview
-          ? truncateInline(failure.promptPreview, 120)
-          : undefined,
-        threadId: failure.threadId,
-        exitCode: failure.exitCode,
-        signal: failure.signal,
-        detail: truncateInline(failure.detail, 240),
-        hint: failure.hint ? truncateInline(failure.hint, 240) : undefined,
-      },
-    ].slice(-5);
+    await this.mutateState((state) => {
+      const diagnostics = ensureChatDiagnostics(state, chatId);
+      const recentFailures = diagnostics.recentFailures ?? [];
+      diagnostics.recentFailures = [
+        ...recentFailures,
+        {
+          at: failure.at ?? new Date().toISOString(),
+          category: failure.category,
+          cwd: failure.cwd,
+          promptPreview: failure.promptPreview
+            ? truncateInline(failure.promptPreview, 120)
+            : undefined,
+          threadId: failure.threadId,
+          exitCode: failure.exitCode,
+          signal: failure.signal,
+          detail: truncateInline(failure.detail, 240),
+          hint: failure.hint ? truncateInline(failure.hint, 240) : undefined,
+        },
+      ].slice(-5);
+    });
     this.logger.warn("Recorded recent Chat2Codex failure", {
       chatId,
       category: failure.category,
     });
-    await this.store.save(state);
+  }
+
+  private mutateState<T>(mutation: (state: BridgeState) => T): Promise<T> {
+    const operation = this.stateMutationTail
+      .catch(() => undefined)
+      .then(async () => {
+        const state = this.requireState();
+        const previous = structuredClone(state);
+        try {
+          const result = mutation(state);
+          await this.store.save(state);
+          return result;
+        } catch (error) {
+          restoreBridgeState(state, previous);
+          throw error;
+        }
+      });
+    this.stateMutationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   private requireState(): BridgeState {
@@ -2578,6 +3410,15 @@ export class MessageRouter {
     }
     return this.state;
   }
+}
+
+function restoreBridgeState(target: BridgeState, source: BridgeState): void {
+  target.chats = source.chats;
+  target.jobs = source.jobs;
+  target.outbox = source.outbox;
+  target.pendingMessages = source.pendingMessages;
+  target.processedMessageIds = source.processedMessageIds;
+  target.diagnostics = source.diagnostics;
 }
 
 interface ProjectAggregate extends ProjectSelection {
@@ -3316,6 +4157,123 @@ function getErrorCode(error: unknown): string | null {
   return typeof code === "string" ? code : null;
 }
 
+function isDurableCodexCandidate(config: BridgeConfig, message: IncomingTextMessage): boolean {
+  if (!decideAccess(config.access, toAccessContext(message)).allowed) {
+    return false;
+  }
+  if (message.attachments?.length) {
+    return true;
+  }
+  const text = routedText(message);
+  return Boolean(text) && !isBuiltInRouterCommand(text);
+}
+
+function isBuiltInRouterCommand(text: string): boolean {
+  return (
+    text === "/whoami" ||
+    text === "/status" ||
+    text === "/host" ||
+    text === "/health" ||
+    text === "/diff" ||
+    text === "/logs" ||
+    text === "/files" ||
+    text === "/summary" ||
+    text === "/stop" ||
+    text === "/projects" ||
+    text === "/threads" ||
+    text === "/sessions" ||
+    text === "/compact" ||
+    text === "/new" ||
+    text === "/reset" ||
+    text === "/steer" ||
+    text.startsWith("/steer ") ||
+    text === "/answer" ||
+    text.startsWith("/answer ") ||
+    text === "/project" ||
+    text.startsWith("/project ") ||
+    text === "/history" ||
+    text.startsWith("/history ") ||
+    text === "/search" ||
+    text.startsWith("/search ") ||
+    text === "/resume" ||
+    text.startsWith("/resume ") ||
+    text === "/fork" ||
+    text.startsWith("/fork ") ||
+    text.startsWith("/cd ")
+  );
+}
+
+function isTerminalJobStatus(status: DurableCodexJobStatus): boolean {
+  return status !== "queued" && status !== "running";
+}
+
+function appendOutboxDeliveries(
+  state: BridgeState,
+  job: DurableCodexJob,
+  deliveries: Array<{ kind: DurableOutboxMessage["kind"]; text: string }>,
+  createdAt: string,
+): void {
+  for (const delivery of deliveries) {
+    const id = randomUUID();
+    const outbox: DurableOutboxMessage = {
+      id,
+      jobId: job.id,
+      chatId: job.chatId,
+      kind: delivery.kind,
+      text: delivery.text,
+      sequence: job.deliveryIds.length,
+      status: "pending",
+      idempotencyKey: id,
+      attempts: 0,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    state.outbox[id] = outbox;
+    job.deliveryIds.push(id);
+  }
+}
+
+function interruptDurableJob(
+  state: BridgeState,
+  job: DurableCodexJob,
+  at: string,
+  reason = "bridge_restarted_during_run",
+): void {
+  if (isTerminalJobStatus(job.status)) {
+    return;
+  }
+  job.status = "interrupted";
+  job.prompt = truncateInline(job.prompt, 180);
+  job.updatedAt = at;
+  job.completedAt = at;
+  job.interruptionReason = reason;
+  appendOutboxDeliveries(
+    state,
+    job,
+    [{ kind: "text", text: interruptedJobMessage(job) }],
+    at,
+  );
+}
+
+function interruptedJobMessage(job: DurableCodexJob): string {
+  return [
+    "Chat2Codex 在任务执行期间重启，无法确认此前的 Codex 进程是否已经产生副作用。",
+    "为避免重复修改，系统不会自动重新执行这条任务。",
+    `cwd: ${job.cwd}`,
+    job.threadId ? `thread: ${job.threadId}` : null,
+    "请先检查当前 thread、Git 工作区和相关外部状态，再决定是否重新发送任务。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function markMessageProcessed(state: BridgeState, messageId: string): void {
+  if (!state.processedMessageIds.includes(messageId)) {
+    state.processedMessageIds.push(messageId);
+  }
+  delete state.pendingMessages[messageId];
+}
+
 function toPendingMessage(message: IncomingTextMessage): PendingMessageDelivery {
   return {
     messageId: message.messageId,
@@ -3370,6 +4328,88 @@ function isHostCommand(message: IncomingTextMessage): boolean {
 function isSteerCommand(message: IncomingTextMessage): boolean {
   const text = routedText(message);
   return text === "/steer" || text.startsWith("/steer ");
+}
+
+function isUserInputAnswerCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/answer" || text.startsWith("/answer ");
+}
+
+function parseUserInputAnswerCommand(
+  text: string,
+): { replyCode: string; answer: string } | null {
+  if (!text.startsWith("/answer ")) {
+    return null;
+  }
+  const rest = text.slice("/answer".length).trim();
+  const separator = rest.search(/\s/);
+  if (separator <= 0) {
+    return null;
+  }
+  const replyCode = rest.slice(0, separator).trim();
+  const answer = rest.slice(separator).trim();
+  return replyCode && answer ? { replyCode, answer } : null;
+}
+
+function userInputKey(chatId: string, requestId: string): string {
+  return `${chatId}\u0000${requestId}`;
+}
+
+function hasStableSenderIdentity(sender: SenderIdentity): boolean {
+  return Boolean(sender.openId || sender.userId || sender.unionId);
+}
+
+function sameStableSenderIdentity(left: SenderIdentity, right: SenderIdentity): boolean {
+  return Boolean(
+    (left.openId && right.openId && left.openId === right.openId) ||
+    (left.userId && right.userId && left.userId === right.userId) ||
+    (left.unionId && right.unionId && left.unionId === right.unionId),
+  );
+}
+
+function nextUserInputQuestion(
+  pending: PendingUserInput,
+): CodexUserInputRequest["questions"][number] | undefined {
+  return pending.request.questions.find((question) => !pending.answers.has(question.id));
+}
+
+function pendingUserInputResponse(pending: PendingUserInput): CodexUserInputResponse {
+  return {
+    answers: Object.fromEntries(
+      [...pending.answers].map(([questionId, answer]) => [
+        questionId,
+        { answers: [...answer.answers] },
+      ]),
+    ),
+  };
+}
+
+function redactedUserInputAnswers(
+  pending: PendingUserInput,
+): CodexUserInputResponse["answers"] {
+  return Object.fromEntries(
+    [...pending.answers.keys()].map((questionId) => [questionId, { answers: [] }]),
+  );
+}
+
+function formatUserInputTextPrompt(pending: PendingUserInput): string {
+  const question = nextUserInputQuestion(pending);
+  if (!question) {
+    return "这条 Codex 用户输入请求已经结束。";
+  }
+  const options = (question.options ?? []).slice(0, 10);
+  return [
+    "Codex 正在等待你的补充输入。",
+    `${truncateInline(question.header, 80)}：${truncateInline(question.question, 500)}`,
+    ...options.map((option) => `- ${truncateInline(option.label, 80)}`),
+    `发送 /answer ${pending.replyCode} <内容> 回答当前问题。`,
+    options.length > 0 && !question.isOther
+      ? "当前问题只接受上面的可选项名称（需完全一致）。"
+      : null,
+    "回答内容不会在聊天中回显，也不会写入 Chat2Codex 持久化状态。",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 function detailCommandKind(message: IncomingTextMessage): RunDetailKind | null {

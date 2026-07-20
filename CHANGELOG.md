@@ -7,6 +7,24 @@ numbers once releases are published.
 
 ## Unreleased
 
+### Added
+
+- Codex `item/tool/requestUserInput` requests can now pause a turn for
+  sender-bound Feishu/Lark card answers or an explicit
+  `/answer <reply-code> <value>` text reply. Multi-question requests support
+  option selection, free-form answers, skip, cancel, and server-side validation.
+- Codex runs now persist a durable job and terminal-reply outbox. A reply-send
+  failure retries the stored delivery with a stable idempotency key instead of
+  executing the Codex turn again; runs interrupted by a bridge restart are
+  reported for manual inspection rather than replayed automatically.
+
+### Security
+
+- Secret `requestUserInput` questions fail closed because ordinary chat
+  messages cannot provide a non-persistent masked-input channel. User-input
+  request fields are bounded, withdrawn requests suppress late callbacks, and
+  answers are neither echoed in terminal cards nor retained in bridge state.
+
 ## 0.4.1 - 2026-07-19
 
 ### Changed

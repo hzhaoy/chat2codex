@@ -6,8 +6,11 @@ import {
   buildProjectListCard,
   buildRunStatusCard,
   buildSessionListCard,
+  buildUserInputCard,
 } from "../src/bot/lark-card.js";
 import {
+  answerUserInputCardAction,
+  cancelUserInputCardAction,
   retryRunCardActionValue,
   runCardActionApp,
   stopRunCardActionValue,
@@ -458,6 +461,226 @@ describe("Lark run status cards", () => {
     expect(serialized).not.toContain('"decisionIndex":1');
   });
 
+  test("builds requestUserInput option buttons for the first unanswered question", () => {
+    const card = buildUserInputCard({
+      status: "pending",
+      replyCode: "R7K2M9",
+      updatedAt: "2026-07-20T12:00:00.000Z",
+      answers: {
+        editor: { answers: ["VS Code"] },
+      },
+      request: {
+        id: "user_input_1",
+        threadId: "thread_1",
+        turnId: "turn_1",
+        itemId: "item_1",
+        autoResolutionMs: 120_000,
+        questions: [
+          {
+            id: "editor",
+            header: "Editor",
+            question: "Which editor do you use?",
+            isOther: false,
+            isSecret: false,
+            options: [
+              { label: "VS Code", description: "Use the Visual Studio Code setup." },
+            ],
+          },
+          {
+            id: "mode",
+            header: "Mode",
+            question: "Which mode should Codex use?",
+            isOther: false,
+            isSecret: false,
+            options: [
+              { label: "Safe", description: "Keep the current security boundary." },
+              { label: "Fast", description: "Prefer the faster execution path." },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(card.header.title.content).toBe("Codex 需要你的回答");
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain("Which mode should Codex use?");
+    expect(serialized).not.toContain("Which editor do you use?");
+    expect(serialized).toContain("Keep the current security boundary\\\\.");
+
+    const actions = cardActionValues(card);
+    expect(actions).toContainEqual({
+      app: runCardActionApp,
+      action: answerUserInputCardAction,
+      userInputId: "user_input_1",
+      questionId: "mode",
+      optionIndex: 0,
+    });
+    expect(actions).toContainEqual({
+      app: runCardActionApp,
+      action: answerUserInputCardAction,
+      userInputId: "user_input_1",
+      questionId: "mode",
+      optionIndex: 1,
+    });
+    expect(actions).toContainEqual({
+      app: runCardActionApp,
+      action: answerUserInputCardAction,
+      userInputId: "user_input_1",
+      questionId: "mode",
+    });
+    expect(actions).toContainEqual({
+      app: runCardActionApp,
+      action: cancelUserInputCardAction,
+      userInputId: "user_input_1",
+    });
+    expect(actions.every((value) => !("label" in value) && !("answer" in value))).toBe(true);
+  });
+
+  test("shows bounded text reply guidance for free-form and other answers", () => {
+    for (const question of [
+      {
+        id: "name",
+        header: "Name",
+        question: "What should this release be called?",
+        isOther: false,
+        isSecret: false,
+        options: null,
+      },
+      {
+        id: "target",
+        header: "Target",
+        question: "Choose a target or provide another value.",
+        isOther: true,
+        isSecret: false,
+        options: [{ label: "Staging", description: "Use staging." }],
+      },
+    ]) {
+      const card = buildUserInputCard({
+        status: "pending",
+        replyCode: "R7K2M9",
+        updatedAt: "2026-07-20T12:00:00.000Z",
+        request: {
+          id: `user_input_${question.id}`,
+          threadId: "thread_1",
+          turnId: "turn_1",
+          itemId: "item_1",
+          autoResolutionMs: null,
+          questions: [question],
+        },
+      });
+
+      expect(JSON.stringify(card)).toContain("/answer R7K2M9 <内容>");
+      expect(cardActionValues(card)).toContainEqual({
+        app: runCardActionApp,
+        action: answerUserInputCardAction,
+        userInputId: `user_input_${question.id}`,
+        questionId: question.id,
+      });
+    }
+  });
+
+  test("removes requestUserInput actions in terminal states and never echoes secret answers", () => {
+    for (const status of ["resolved", "cancelled", "expired"] as const) {
+      const card = buildUserInputCard({
+        status,
+        replyCode: "R7K2M9",
+        updatedAt: "2026-07-20T12:00:00.000Z",
+        answers: {
+          token: { answers: ["super-secret-token"] },
+        },
+        request: {
+          id: "user_input_secret",
+          threadId: "thread_1",
+          turnId: "turn_1",
+          itemId: "item_1",
+          autoResolutionMs: null,
+          questions: [
+            {
+              id: "token",
+              header: "Credential",
+              question: "Provide the temporary token.",
+              isOther: false,
+              isSecret: true,
+              options: null,
+            },
+          ],
+        },
+      });
+
+      const serialized = JSON.stringify(card);
+      expect(cardActionValues(card)).toEqual([]);
+      expect(serialized).not.toContain("answer_user_input");
+      expect(serialized).not.toContain("cancel_user_input");
+      expect(serialized).not.toContain("super-secret-token");
+    }
+  });
+
+  test("fails closed instead of offering chat input for pending secret questions", () => {
+    const card = buildUserInputCard({
+      status: "pending",
+      replyCode: "R7K2M9",
+      updatedAt: "2026-07-20T12:00:00.000Z",
+      request: {
+        id: "user_input_secret",
+        threadId: "thread_1",
+        turnId: "turn_1",
+        itemId: "item_1",
+        autoResolutionMs: null,
+        questions: [
+          {
+            id: "token",
+            header: "Credential",
+            question: "Provide the temporary token.",
+            isOther: false,
+            isSecret: true,
+            options: null,
+          },
+        ],
+      },
+    });
+
+    const serialized = JSON.stringify(card);
+    expect(cardActionValues(card)).toEqual([]);
+    expect(serialized).not.toContain("/answer");
+    expect(serialized).not.toContain("answer_user_input");
+    expect(serialized).toContain("不会收集或提交回答");
+  });
+
+  test("bounds requestUserInput fields and visible option buttons", () => {
+    const card = buildUserInputCard({
+      status: "pending",
+      replyCode: "R".repeat(200),
+      updatedAt: "2026-07-20T12:00:00.000Z",
+      request: {
+        id: "user_input_bounded",
+        threadId: "thread_1",
+        turnId: "turn_1",
+        itemId: "item_1",
+        autoResolutionMs: null,
+        questions: [
+          {
+            id: "choice",
+            header: "H".repeat(1_000),
+            question: "Q".repeat(5_000),
+            isOther: false,
+            isSecret: false,
+            options: Array.from({ length: 20 }, (_, index) => ({
+              label: `${index}-${"L".repeat(500)}`,
+              description: "D".repeat(2_000),
+            })),
+          },
+        ],
+      },
+    });
+
+    const optionActions = cardActionValues(card).filter(
+      (value) => value.action === answerUserInputCardAction && "optionIndex" in value,
+    );
+    expect(optionActions.length).toBeGreaterThan(0);
+    expect(optionActions.length).toBeLessThanOrEqual(5);
+    expect(JSON.stringify(card).length).toBeLessThan(8_000);
+  });
+
   test("builds project list cards with compact paths and selection buttons", () => {
     const card = buildProjectListCard({
       currentCwd: "/workspace/chat2codex",
@@ -680,6 +903,25 @@ function approvalButtonLabels(card: ReturnType<typeof buildApprovalCard>): strin
       }
       const content = (text as { content?: unknown }).content;
       return typeof content === "string" ? [content] : [];
+    });
+  });
+}
+
+function cardActionValues(
+  card: ReturnType<typeof buildUserInputCard>,
+): Array<Record<string, unknown>> {
+  return card.elements.flatMap((element) => {
+    if (element.tag !== "action" || !Array.isArray(element.actions)) {
+      return [];
+    }
+    return element.actions.flatMap((action) => {
+      if (typeof action !== "object" || action === null) {
+        return [];
+      }
+      const value = (action as { value?: unknown }).value;
+      return typeof value === "object" && value !== null
+        ? [value as Record<string, unknown>]
+        : [];
     });
   });
 }

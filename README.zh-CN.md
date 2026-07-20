@@ -77,6 +77,7 @@ Summarize this repository.
 - 使用 Codex app-server JSON-RPC 获取机器可读的进度、最终输出和审批回调。
 - Codex 运行时会限频更新状态卡片，并提供停止/重试、本轮详情按钮；卡片不可用时自动回退为文本。
 - 支持用飞书/Lark 审批卡片处理 Codex 命令执行和文件变更审批请求。按钮会根据 Codex 当前提供的审批选项生成，包括 Approve、Approve session、Deny、Cancel turn 等。
+- 支持结构化 Codex `requestUserInput` 提问卡；自由输入可使用显式的 `/answer <回复码> <内容>`。选项会按原始请求在服务端重新校验；secret 问题会安全拒绝，不通过聊天记录收集凭据。
 - 支持飞书/Lark 图片和文件消息，把附件下载为本地路径后随 prompt 传给 Codex。
 - 在日志和 `/status` 中记录近期消息路由/丢弃诊断信息。
 - `/status` 会显示队列深度、当前运行时长、审批等待时长和近期失败信息。
@@ -131,7 +132,7 @@ bun run protocol:generate
 git diff -- docs/codex-app-server-protocol
 ```
 
-修改 [`src/agent/codex-runner.ts`](src/agent/codex-runner.ts) 前，请先检查协议 schema diff。Chat2Codex 只处理明确支持的 app-server 服务端请求：未知 method 会返回 JSON-RPC method-not-found 错误；格式不合法的审批请求会返回 invalid-params 错误，不会展示或自行补出批准选项。在对应交互界面实现前，MCP elicitation 会被取消，额外权限请求只会得到空授权。
+修改 [`src/agent/codex-runner.ts`](src/agent/codex-runner.ts) 前，请先检查协议 schema diff。Chat2Codex 只处理明确支持的 app-server 服务端请求：未知 method 会返回 JSON-RPC method-not-found 错误；格式不合法的审批请求会返回 invalid-params 错误，不会展示或自行补出批准选项。`item/tool/requestUserInput` 已支持卡片和显式 `/answer` 回复；请求字段和回答都会重新校验，已撤销请求会拒绝迟到回复，`isSecret` 问题因聊天无法保证遮罩且不留存而安全拒绝。MCP elicitation 仍会被取消，额外权限请求仍只会得到空授权，直到它们各自的交互合约完整实现。
 
 当 `CODEX_APPROVAL_POLICY` 允许交互式审批时，Codex app-server 会在 turn 运行过程中发出审批请求。Chat2Codex 会向同一个 chat 发送一张独立审批卡片，并暂停 Codex，直到授权用户点击其中一个选项。命令执行审批卡片的按钮会镜像 Codex 的 `availableDecisions`。当前文件变更审批请求不包含目标文件或补丁详情，因此在这些信息能够被关联并完整展示前，Chat2Codex 只提供拒绝/取消。命令决策缺失或为 `null` 时，桥接层同样只展示拒绝/取消；决策列表格式不合法时则直接返回 invalid-params。审批卡会展示额外的文件系统/网络权限以及每条完整的 exec/network policy 规则；如果安全相关详情无法完整展示，卡片会移除所有允许类操作，只保留拒绝/取消，消息路由在处理卡片回调时也会执行相同的决策过滤。
 
@@ -227,6 +228,7 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/cd <path>` | 修改当前 chat 的 cwd，并开始一个新的 Codex thread。 |
 | `/stop` | 停止当前 chat 正在运行的 Codex。运行状态卡片里也有停止按钮。 |
 | `/steer <补充指令>` | 立即把补充指令发送给当前 Codex 运行，绕过当前 chat 的普通任务队列。 |
+| `/answer <回复码> <内容>` | 回答当前非 secret 的 Codex `requestUserInput` 问题。回复码会显示在提问卡上；回答会立即绕过 chat 队列，且不会被回显。 |
 | `/summary` | 查看当前 chat 最近一轮运行摘要。 |
 | `/files` | 查看最近一轮变更文件。 |
 | `/diff` | 查看最近一轮捕获到的 diff。 |
@@ -247,7 +249,7 @@ Chat2Codex 默认使用 `CODEX_SANDBOX=workspace-write`，所以 Codex 可以编
 
 私聊路由默认开启，但除 `/whoami` 外，必须由 `ALLOWED_USER_IDS` 中的发送者发出，或来自 `ALLOWED_CHAT_IDS` 中的私聊 chat。群聊消息必须提到机器人，并且只有同时配置 `ALLOW_GROUPS=true`、允许的 chat 和 `ALLOWED_USER_IDS` 中的发送者才会执行。`ALLOWED_USER_IDS` 接受逗号分隔的 `open_id`、`user_id` 或 `union_id`。授权后的私聊可以切换到任意本机目录；群聊只能切换到 `CODEX_GROUP_ALLOWED_ROOTS` 的真实路径，软链接不能绕过限制。
 
-飞书事件会先写入本地 pending inbox，再向长连接返回；处理完成并成功发送回复后才标记为 processed。服务重启会重放未完成消息。同一个工作区的 Codex 任务会跨 chat 串行执行，不同工作区仍可并行；等待工作区锁的任务也会显示在 `/status` 中，并可用 `/stop` 取消。同一份 `BRIDGE_STATE_PATH` 只允许一个桥接进程使用。该机制提供 at-least-once 恢复语义：极少数“Codex 已产生副作用、但回复发送前进程中断”的场景仍可能在重放时重复执行，应结合审批和 Git 检查使用。
+飞书事件会先写入本地 pending inbox，再向长连接返回；Codex prompt 还会在执行前创建 durable job。尚未开始的 queued job 可在重启后继续；已进入 `running` 的 job 会被标记为 interrupted，由于无法安全判断已产生的副作用，不会自动重新执行。最终回复从 durable outbox 发送，并使用稳定的幂等键，因此聊天发送失败不会重跑 Codex。同一个工作区的 Codex 任务会跨 chat 串行执行，不同工作区仍可并行；等待工作区锁的任务也会显示在 `/status` 中，并可用 `/stop` 取消。同一份 `BRIDGE_STATE_PATH` 只允许一个桥接进程使用。对敏感任务仍应保留审批和 Git 检查；手动重试 interrupted job 前，先检查 thread 和工作区状态。
 
 正常退出会自动删除实例锁。若进程被 `SIGKILL` 或运行时发生致命崩溃，可能遗留 `<BRIDGE_STATE_PATH>.lock`；确认没有 Chat2Codex 进程运行后，再手动删除这个锁目录并重启。为避免与另一次启动竞争，程序不会自动回收陈旧实例锁。
 
@@ -278,7 +280,8 @@ bun run check
 
 本地开发和 pull request 流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。在共享 chat 中运行 Chat2Codex 或报告安全问题前，请先阅读 [SECURITY.md](SECURITY.md)。
 
-## 后续功能
+## 版本路线
 
-1. 通过 `thread/fork.lastTurnId` 从指定历史 turn 分叉，并保持原 thread 不变。这个操作不是文件系统回滚，也不会恢复本地文件变更。
-2. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。
+1. **v0.5：**完成交互与生产安全收口：MCP elicitation、额外权限审批、并发与队列上限、附件配额、输出上限、durable delivery 留存策略和日志轮转。`requestUserInput` 和第一版 durable job/outbox 已进入当前 Unreleased 开发。
+2. **v0.6：**通过 `thread/fork.lastTurnId` 从指定历史 turn 分叉，并保持原 thread 不变。这个操作不是文件系统回滚，也不会恢复本地文件变更。
+3. 后续再在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。

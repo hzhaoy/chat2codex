@@ -151,6 +151,84 @@ describe("Lark card action adaptation", () => {
     });
   });
 
+  test("adapts requestUserInput option callbacks", () => {
+    const action = adaptLarkCardActionEvent({
+      context: {
+        open_chat_id: "oc_chat",
+        open_message_id: "om_user_input",
+      },
+      operator: {
+        open_id: "ou_sender",
+      },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: "answer_user_input",
+          userInputId: "user_input_1",
+          questionId: "mode",
+          optionIndex: 1,
+        },
+      },
+    });
+
+    expect(action).toMatchObject({
+      action: "answer_user_input",
+      chatId: "oc_chat",
+      messageId: "om_user_input",
+      userInputId: "user_input_1",
+      questionId: "mode",
+      optionIndex: 1,
+      sender: {
+        openId: "ou_sender",
+      },
+    });
+  });
+
+  test("adapts requestUserInput skip and cancel callbacks", () => {
+    const skip = adaptLarkCardActionEvent({
+      context: {
+        open_chat_id: "oc_chat",
+        open_message_id: "om_user_input",
+      },
+      operator: { open_id: "ou_sender" },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: "answer_user_input",
+          userInputId: "user_input_1",
+          questionId: "mode",
+        },
+      },
+    });
+    const cancel = adaptLarkCardActionEvent({
+      context: {
+        open_chat_id: "oc_chat",
+        open_message_id: "om_user_input",
+      },
+      operator: { open_id: "ou_sender" },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: "cancel_user_input",
+          userInputId: "user_input_1",
+        },
+      },
+    });
+
+    expect(skip).toMatchObject({
+      action: "answer_user_input",
+      userInputId: "user_input_1",
+      questionId: "mode",
+    });
+    expect(skip?.optionIndex).toBeUndefined();
+    expect(cancel).toMatchObject({
+      action: "cancel_user_input",
+      userInputId: "user_input_1",
+      chatId: "oc_chat",
+      messageId: "om_user_input",
+    });
+  });
+
   test("adapts project selection button callbacks", () => {
     const action = adaptLarkCardActionEvent({
       context: {

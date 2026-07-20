@@ -14,6 +14,8 @@ describe("JsonStateStore", () => {
       const store = new JsonStateStore(path.join(stateDirectory, "state.json"));
       expect(await store.load()).toEqual({
         chats: {},
+        jobs: {},
+        outbox: {},
         pendingMessages: {},
         processedMessageIds: [],
         diagnostics: {},
@@ -27,6 +29,8 @@ describe("JsonStateStore", () => {
             threadId: "thread_1",
           },
         },
+        jobs: {},
+        outbox: {},
         pendingMessages: {},
         processedMessageIds: Array.from({ length: 510 }, (_, index) => `m${index}`),
         diagnostics: {
@@ -80,6 +84,8 @@ describe("JsonStateStore", () => {
       const store = new JsonStateStore(path.join(stateDirectory, "state.json"));
       await store.save({
         chats: {},
+        jobs: {},
+        outbox: {},
         pendingMessages: {},
         processedMessageIds: [],
         diagnostics: {},
@@ -108,6 +114,8 @@ describe("JsonStateStore", () => {
               threadId: `thread_${index}`,
             },
           },
+          jobs: {},
+          outbox: {},
           pendingMessages: {},
           processedMessageIds: [`m${index}`],
           diagnostics: {},
@@ -119,6 +127,29 @@ describe("JsonStateStore", () => {
       const loaded = await stores[0]!.load();
       expect(loaded.chats.oc_chat?.threadId).toBe("thread_49");
       expect(loaded.processedMessageIds).toEqual(["m49"]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("loads pre-outbox state with empty durable job collections", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const statePath = path.join(tempDir, "state.json");
+    try {
+      await Bun.write(
+        statePath,
+        JSON.stringify({
+          chats: {},
+          pendingMessages: {},
+          processedMessageIds: ["legacy"],
+          diagnostics: {},
+        }),
+      );
+
+      const loaded = await new JsonStateStore(statePath).load();
+      expect(loaded.jobs).toEqual({});
+      expect(loaded.outbox).toEqual({});
+      expect(loaded.processedMessageIds).toEqual(["legacy"]);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

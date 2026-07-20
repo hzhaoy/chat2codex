@@ -4,6 +4,8 @@ export const runCardActionApp = "chat2codex";
 export const stopRunCardAction = "stop_run";
 export const retryRunCardAction = "retry_run";
 export const resolveApprovalCardAction = "resolve_approval";
+export const answerUserInputCardAction = "answer_user_input";
+export const cancelUserInputCardAction = "cancel_user_input";
 export const selectProjectCardAction = "select_project";
 export const resumeThreadCardAction = "resume_thread";
 export const pageProjectsCardAction = "page_projects";
@@ -22,6 +24,8 @@ export type RunCardActionKind =
   | typeof stopRunCardAction
   | typeof retryRunCardAction
   | typeof resolveApprovalCardAction
+  | typeof answerUserInputCardAction
+  | typeof cancelUserInputCardAction
   | typeof selectProjectCardAction
   | typeof resumeThreadCardAction
   | typeof pageProjectsCardAction
@@ -37,6 +41,9 @@ export interface IncomingCardAction {
   sender: SenderIdentity;
   approvalId?: string;
   decisionIndex?: number;
+  userInputId?: string;
+  questionId?: string;
+  optionIndex?: number;
   detailKind?: RunDetailKind;
   projectIndex?: number;
   threadIndex?: number;
@@ -108,6 +115,9 @@ export function adaptLarkCardActionEvent(event: unknown): IncomingCardAction | n
     },
     approvalId: getString(value, "approvalId"),
     decisionIndex: getNumber(value, "decisionIndex"),
+    userInputId: getString(value, "userInputId"),
+    questionId: getString(value, "questionId"),
+    optionIndex: getNumber(value, "optionIndex"),
     detailKind: getRunDetailKind(value),
     projectIndex: getNumber(value, "projectIndex"),
     threadIndex: getNumber(value, "threadIndex"),
@@ -134,6 +144,8 @@ function getRunCardActionKind(value: unknown): RunCardActionKind | null {
     action === stopRunCardAction ||
     action === retryRunCardAction ||
     action === resolveApprovalCardAction ||
+    action === answerUserInputCardAction ||
+    action === cancelUserInputCardAction ||
     action === selectProjectCardAction ||
     action === resumeThreadCardAction ||
     action === pageProjectsCardAction ||

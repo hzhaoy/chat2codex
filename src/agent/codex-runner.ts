@@ -9,6 +9,13 @@ import type { Logger } from "../util/logger.js";
 import { buildCodexChildEnv } from "./codex-environment.js";
 
 const appServerSteerRetryDelaysMs = [0, 100, 250, 500, 1000, 1500];
+const maxUserInputQuestions = 3;
+const maxUserInputOptions = 10;
+const maxUserInputQuestionIdLength = 128;
+const maxUserInputHeaderLength = 64;
+const maxUserInputQuestionLength = 1_024;
+const maxUserInputOptionLabelLength = 128;
+const maxUserInputOptionDescriptionLength = 512;
 
 export interface CodexRunInput {
   prompt: string;
@@ -17,6 +24,10 @@ export interface CodexRunInput {
   signal?: AbortSignal;
   onProgress?: (update: CodexProgressUpdate) => void | Promise<void>;
   onApprovalRequest?: (request: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
+  onUserInputRequest?: (
+    request: CodexUserInputRequest,
+    context: CodexUserInputRequestContext,
+  ) => Promise<CodexUserInputResponse>;
   onRunControl?: (control: CodexRunControl) => void;
 }
 
@@ -99,6 +110,41 @@ export interface CodexApprovalRequest {
   proposedExecpolicyAmendment?: unknown;
   proposedNetworkPolicyAmendments?: unknown[];
   decisions: CodexApprovalDecision[];
+}
+
+export interface CodexUserInputOption {
+  label: string;
+  description: string;
+}
+
+export interface CodexUserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options: CodexUserInputOption[] | null;
+}
+
+export interface CodexUserInputRequest {
+  id: string;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  questions: CodexUserInputQuestion[];
+  autoResolutionMs: number | null;
+}
+
+export interface CodexUserInputAnswer {
+  answers: string[];
+}
+
+export interface CodexUserInputResponse {
+  answers: Record<string, CodexUserInputAnswer>;
+}
+
+export interface CodexUserInputRequestContext {
+  signal: AbortSignal;
 }
 
 export interface CodexThread {
@@ -235,6 +281,16 @@ type ApprovalParseResult =
   | { status: "malformed"; message: string }
   | { status: "unsupported" };
 
+type UserInputParseResult =
+  | { status: "supported"; request: CodexUserInputRequest }
+  | { status: "malformed"; message: string }
+  | { status: "not-applicable" };
+
+interface PendingUserInputRequest {
+  controller: AbortController;
+  threadId: string;
+}
+
 type SafeServerRequestResult =
   | { status: "handled"; result: Record<string, unknown> }
   | { status: "malformed"; message: string }
@@ -245,7 +301,6 @@ type JsonRpcServerResponse =
   | { id: string | number | null; error: { code: number; message: string } };
 
 const knownUnsupportedServerRequestMethods = new Set([
-  "item/tool/requestUserInput",
   "item/tool/call",
   "account/chatgptAuthTokens/refresh",
   "attestation/generate",
@@ -413,8 +468,16 @@ export class CodexRunner {
       env: buildCodexChildEnv(),
     });
 
+    const pendingUserInputRequests = new Map<string | number, PendingUserInputRequest>();
+    const abortPendingUserInputRequests = () => {
+      for (const pending of pendingUserInputRequests.values()) {
+        pending.controller.abort();
+      }
+      pendingUserInputRequests.clear();
+    };
     let forceKillTimer: NodeJS.Timeout | null = null;
     const abortChild = () => {
+      abortPendingUserInputRequests();
       if (child.exitCode !== null || child.signalCode !== null) {
         return;
       }
@@ -500,6 +563,9 @@ export class CodexRunner {
         this.handleAppServerRequest(
           message,
           input.onApprovalRequest,
+          input.onUserInputRequest,
+          pendingUserInputRequests,
+          input.signal,
           respondToServerRequest,
           (decision) => {
             if (decision === "cancel") {
@@ -519,6 +585,10 @@ export class CodexRunner {
 
       if (!isJsonRpcNotification(message)) {
         return;
+      }
+
+      if (message.method === "serverRequest/resolved") {
+        abortResolvedUserInputRequest(message, pendingUserInputRequests);
       }
 
       if (message.method === "thread/started") {
@@ -600,10 +670,12 @@ export class CodexRunner {
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolve, reject) => {
         child.on("error", (error) => {
+          abortPendingUserInputRequests();
           rejectPendingRequests(error);
           reject(error);
         });
         child.on("close", (code, signal) => {
+          abortPendingUserInputRequests();
           rejectPendingRequests(new Error("Codex app-server exited before responding."));
           resolve({ code, signal });
         });
@@ -702,6 +774,9 @@ export class CodexRunner {
   private handleAppServerRequest(
     message: JsonRpcRequest,
     onApprovalRequest: CodexRunInput["onApprovalRequest"],
+    onUserInputRequest: CodexRunInput["onUserInputRequest"],
+    pendingUserInputRequests: Map<string | number, PendingUserInputRequest>,
+    runSignal: AbortSignal | undefined,
     respond: (response: JsonRpcServerResponse) => void,
     onApprovalDecision: (decision: CodexApprovalDecision) => void,
   ): void {
@@ -710,6 +785,68 @@ export class CodexRunner {
       return;
     }
     const requestId = message.id;
+
+    const userInput = parseUserInputRequest(message);
+    if (userInput.status === "malformed") {
+      respond({ id: requestId, error: { code: -32602, message: userInput.message } });
+      return;
+    }
+    if (userInput.status === "supported") {
+      if (runSignal?.aborted) {
+        return;
+      }
+      if (!onUserInputRequest) {
+        respondUserInputFailure(requestId, respond);
+        return;
+      }
+
+      const pending: PendingUserInputRequest = {
+        controller: new AbortController(),
+        threadId: userInput.request.threadId,
+      };
+      pendingUserInputRequests.get(requestId)?.controller.abort();
+      pendingUserInputRequests.set(requestId, pending);
+      Promise.resolve()
+        .then(() => {
+          if (
+            pending.controller.signal.aborted ||
+            pendingUserInputRequests.get(requestId) !== pending
+          ) {
+            return undefined;
+          }
+          return onUserInputRequest(userInput.request, {
+            signal: pending.controller.signal,
+          });
+        })
+        .then((response) => {
+          if (
+            pending.controller.signal.aborted ||
+            pendingUserInputRequests.get(requestId) !== pending
+          ) {
+            return;
+          }
+          pendingUserInputRequests.delete(requestId);
+          const validated = parseUserInputResponse(response, userInput.request);
+          if (!validated) {
+            this.logger.warn("Codex user input callback returned an invalid response");
+            respondUserInputFailure(requestId, respond);
+            return;
+          }
+          respond({ id: requestId, result: validated });
+        })
+        .catch(() => {
+          if (
+            pending.controller.signal.aborted ||
+            pendingUserInputRequests.get(requestId) !== pending
+          ) {
+            return;
+          }
+          pendingUserInputRequests.delete(requestId);
+          this.logger.warn("Codex user input callback failed");
+          respondUserInputFailure(requestId, respond);
+        });
+      return;
+    }
 
     const safeRequest = parseSafeServerRequest(message);
     if (safeRequest.status === "handled") {
@@ -787,6 +924,7 @@ export class CodexRunner {
       string,
       { resolve: (value: unknown) => void; reject: (error: Error) => void }
     >();
+    const pendingUserInputRequests = new Map<string | number, PendingUserInputRequest>();
 
     let forceKillTimer: NodeJS.Timeout | null = null;
     const abortChild = () => {
@@ -847,6 +985,9 @@ export class CodexRunner {
         this.handleAppServerRequest(
           message,
           undefined,
+          undefined,
+          pendingUserInputRequests,
+          undefined,
           (response) => {
             try {
               sendJson(response);
@@ -864,6 +1005,10 @@ export class CodexRunner {
         } catch (error) {
           this.logger.warn("Failed to respond to invalid Codex app-server request", error);
         }
+        return;
+      }
+      if (isJsonRpcNotification(message) && message.method === "serverRequest/resolved") {
+        abortResolvedUserInputRequest(message, pendingUserInputRequests);
       }
     });
 
@@ -1241,6 +1386,155 @@ function getItemName(item: CodexJsonEvent["item"]): string | undefined {
   }
   const normalized = raw.replace(/\s+/gu, " ").trim();
   return normalized.length > 60 ? `${normalized.slice(0, 57)}...` : normalized;
+}
+
+function parseUserInputRequest(message: JsonRpcRequest): UserInputParseResult {
+  if (message.method !== "item/tool/requestUserInput") {
+    return { status: "not-applicable" };
+  }
+
+  const params = asObjectRecord(message.params);
+  if (
+    !params ||
+    typeof params.threadId !== "string" ||
+    typeof params.turnId !== "string" ||
+    typeof params.itemId !== "string" ||
+    !Array.isArray(params.questions) ||
+    params.questions.length > maxUserInputQuestions
+  ) {
+    return { status: "malformed", message: "Invalid params: malformed user input request" };
+  }
+
+  const autoResolutionMs = params.autoResolutionMs;
+  if (
+    autoResolutionMs !== undefined &&
+    autoResolutionMs !== null &&
+    (typeof autoResolutionMs !== "number" ||
+      !Number.isSafeInteger(autoResolutionMs) ||
+      autoResolutionMs < 0)
+  ) {
+    return { status: "malformed", message: "Invalid params: malformed user input request" };
+  }
+
+  const questions: CodexUserInputQuestion[] = [];
+  const questionIds = new Set<string>();
+  for (const value of params.questions) {
+    const question = asObjectRecord(value);
+    if (
+      !question ||
+      typeof question.id !== "string" ||
+      question.id.length === 0 ||
+      question.id.length > maxUserInputQuestionIdLength ||
+      typeof question.header !== "string" ||
+      question.header.length > maxUserInputHeaderLength ||
+      typeof question.question !== "string" ||
+      question.question.length > maxUserInputQuestionLength ||
+      (question.isOther !== undefined && typeof question.isOther !== "boolean") ||
+      (question.isSecret !== undefined && typeof question.isSecret !== "boolean") ||
+      questionIds.has(question.id)
+    ) {
+      return { status: "malformed", message: "Invalid params: malformed user input request" };
+    }
+
+    let options: CodexUserInputOption[] | null = null;
+    if (question.options !== undefined && question.options !== null) {
+      if (!Array.isArray(question.options) || question.options.length > maxUserInputOptions) {
+        return { status: "malformed", message: "Invalid params: malformed user input request" };
+      }
+      options = [];
+      for (const value of question.options) {
+        const option = asObjectRecord(value);
+        if (
+          !option ||
+          typeof option.label !== "string" ||
+          option.label.length > maxUserInputOptionLabelLength ||
+          typeof option.description !== "string" ||
+          option.description.length > maxUserInputOptionDescriptionLength
+        ) {
+          return { status: "malformed", message: "Invalid params: malformed user input request" };
+        }
+        options.push({ label: option.label, description: option.description });
+      }
+    }
+
+    questionIds.add(question.id);
+    questions.push({
+      id: question.id,
+      header: question.header,
+      question: question.question,
+      isOther: question.isOther ?? false,
+      isSecret: question.isSecret ?? false,
+      options,
+    });
+  }
+
+  return {
+    status: "supported",
+    request: {
+      id: randomUUID(),
+      threadId: params.threadId,
+      turnId: params.turnId,
+      itemId: params.itemId,
+      questions,
+      autoResolutionMs: autoResolutionMs ?? null,
+    },
+  };
+}
+
+function parseUserInputResponse(
+  value: unknown,
+  request: CodexUserInputRequest,
+): CodexUserInputResponse | null {
+  const response = asPlainObjectRecord(value);
+  const rawAnswers = asPlainObjectRecord(response?.answers);
+  if (!response || !rawAnswers) {
+    return null;
+  }
+
+  const questionIds = new Set(request.questions.map((question) => question.id));
+  const answers: Array<[string, CodexUserInputAnswer]> = [];
+  for (const [questionId, value] of Object.entries(rawAnswers)) {
+    const answer = asPlainObjectRecord(value);
+    if (
+      !questionIds.has(questionId) ||
+      !answer ||
+      !Array.isArray(answer.answers) ||
+      !answer.answers.every((item) => typeof item === "string")
+    ) {
+      return null;
+    }
+    answers.push([questionId, { answers: [...answer.answers] }]);
+  }
+
+  return { answers: Object.fromEntries(answers) };
+}
+
+function respondUserInputFailure(
+  requestId: string | number,
+  respond: (response: JsonRpcServerResponse) => void,
+): void {
+  respond({
+    id: requestId,
+    error: { code: -32000, message: "User input request failed." },
+  });
+}
+
+function abortResolvedUserInputRequest(
+  notification: JsonRpcNotification,
+  pendingUserInputRequests: Map<string | number, PendingUserInputRequest>,
+): void {
+  const params = asObjectRecord(notification.params);
+  const requestId = params?.requestId;
+  const threadId = getString(params, "threadId");
+  if (!isRequestId(requestId) || threadId === undefined) {
+    return;
+  }
+  const pending = pendingUserInputRequests.get(requestId);
+  if (!pending || pending.threadId !== threadId) {
+    return;
+  }
+  pendingUserInputRequests.delete(requestId);
+  pending.controller.abort();
 }
 
 function parseSafeServerRequest(message: JsonRpcRequest): SafeServerRequestResult {
@@ -1946,6 +2240,15 @@ function asObjectRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function asPlainObjectRecord(value: unknown): Record<string, unknown> | null {
+  const record = asObjectRecord(value);
+  if (!record) {
+    return null;
+  }
+  const prototype = Object.getPrototypeOf(record) as unknown;
+  return prototype === Object.prototype || prototype === null ? record : null;
 }
 
 function getString(record: Record<string, unknown> | null | undefined, key: string): string | undefined {

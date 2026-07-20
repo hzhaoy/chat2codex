@@ -481,9 +481,9 @@ if (message.id === null && message.error && message.error.code === -32600) compl
       const unsupportedResponse = received.find(
         (message) => message.id === "unsupported_input_1",
       );
-      expect(unsupportedResponse).toMatchObject({
+      expect(unsupportedResponse).toEqual({
         id: "unsupported_input_1",
-        error: { code: -32000 },
+        error: { code: -32000, message: "User input request failed." },
       });
       expect(unsupportedResponse && "result" in unsupportedResponse).toBe(false);
       const invalidRequestResponse = received.find(
@@ -512,6 +512,486 @@ if (message.id === null && message.error && message.error.code === -32600) compl
     }
   });
 
+  test("handles requestUserInput with normalized defaults and an exact response", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({
+    id: "user_input_1",
+    method: "item/tool/requestUserInput",
+    params: {
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      itemId: "input_1",
+      autoResolutionMs: 60000,
+      questions: [
+        {
+          id: "provider",
+          header: "Provider",
+          question: "Choose a provider",
+          isOther: true,
+          isSecret: false,
+          options: [
+            { label: "OpenAI", description: "Use OpenAI" },
+            { label: "Local", description: "Use a local model" }
+          ]
+        },
+        { id: "note", header: "Note", question: "Add a note" }
+      ]
+    }
+  });
+  return;
+}
+if (message.id === "user_input_1") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const requests: unknown[] = [];
+      const signals: AbortSignal[] = [];
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise user input",
+        cwd: tempDir,
+        onUserInputRequest: async (request, context) => {
+          requests.push(request);
+          signals.push(context.signal);
+          return {
+            answers: {
+              provider: { answers: ["OpenAI"] },
+              note: { answers: ["ship it"] },
+            },
+          };
+        },
+      });
+
+      expect(result.finalText).toBe("done");
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toEqual({
+        id: expect.any(String),
+        threadId: "thread_fake",
+        turnId: "turn_fake",
+        itemId: "input_1",
+        autoResolutionMs: 60_000,
+        questions: [
+          {
+            id: "provider",
+            header: "Provider",
+            question: "Choose a provider",
+            isOther: true,
+            isSecret: false,
+            options: [
+              { label: "OpenAI", description: "Use OpenAI" },
+              { label: "Local", description: "Use a local model" },
+            ],
+          },
+          {
+            id: "note",
+            header: "Note",
+            question: "Add a note",
+            isOther: false,
+            isSecret: false,
+            options: null,
+          },
+        ],
+      });
+      expect(signals).toHaveLength(1);
+      expect(signals[0]?.aborted).toBe(false);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.find((message) => message.id === "user_input_1")).toEqual({
+        id: "user_input_1",
+        result: {
+          answers: {
+            provider: { answers: ["OpenAI"] },
+            note: { answers: ["ship it"] },
+          },
+        },
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects malformed requestUserInput params before invoking the callback", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+const invalidUserInputs = [
+  { id: "invalid_input_1", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_1", questions: "bad" } },
+  { id: "invalid_input_2", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_2", autoResolutionMs: -1, questions: [] } },
+  { id: "invalid_input_3", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_3", autoResolutionMs: 1.5, questions: [] } },
+  { id: "invalid_input_4", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_4", questions: [{ id: "same", header: "One", question: "First" }, { id: "same", header: "Two", question: "Second" }] } },
+  { id: "invalid_input_5", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_5", questions: [{ id: "q", header: "Header", question: "Question", isSecret: "yes" }] } },
+  { id: "invalid_input_6", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_6", questions: [{ id: "q", header: "Header", question: "Question", options: [{ label: "Only label" }] }] } },
+  { id: "invalid_input_7", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_7", questions: [{ id: "", header: "Header", question: "Question" }] } },
+  { id: "invalid_input_8", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_8", questions: [{ id: "q".repeat(129), header: "Header", question: "Question" }] } },
+  { id: "invalid_input_9", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_9", questions: Array.from({ length: 4 }, (_, index) => ({ id: "q" + index, header: "Header", question: "Question" })) } },
+  { id: "invalid_input_10", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_10", questions: [{ id: "q", header: "Header", question: "Question", options: Array.from({ length: 11 }, () => ({ label: "Label", description: "Description" })) }] } },
+  { id: "invalid_input_11", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_11", questions: [{ id: "q", header: "h".repeat(65), question: "Question" }] } },
+  { id: "invalid_input_12", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_12", questions: [{ id: "q", header: "Header", question: "q".repeat(1025) }] } },
+  { id: "invalid_input_13", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_13", questions: [{ id: "q", header: "Header", question: "Question", options: [{ label: "l".repeat(129), description: "Description" }] }] } },
+  { id: "invalid_input_14", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "input_14", questions: [{ id: "q", header: "Header", question: "Question", options: [{ label: "Label", description: "d".repeat(513) }] }] } }
+];
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  state.invalidInputIndex = 0;
+  const input = invalidUserInputs[state.invalidInputIndex];
+  send({ id: input.id, method: "item/tool/requestUserInput", params: input.params });
+  return;
+}
+if (String(message.id).startsWith("invalid_input_")) {
+  state.invalidInputIndex += 1;
+  const input = invalidUserInputs[state.invalidInputIndex];
+  if (input) send({ id: input.id, method: "item/tool/requestUserInput", params: input.params });
+  else completeTurn("done");
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let callbackCalls = 0;
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise invalid user input",
+        cwd: tempDir,
+        onUserInputRequest: async () => {
+          callbackCalls += 1;
+          return { answers: {} };
+        },
+      });
+
+      expect(callbackCalls).toBe(0);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      for (let index = 1; index <= 14; index += 1) {
+        const id = `invalid_input_${index}`;
+        const response = received.find((message) => message.id === id);
+        expect(response).toMatchObject({ id, error: { code: -32602 } });
+        expect(response && "result" in response).toBe(false);
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for invalid requestUserInput callback responses without leaking values", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+function sendUserInput(id) {
+  send({
+    id,
+    method: "item/tool/requestUserInput",
+    params: {
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      itemId: id,
+      questions: [{ id: "secret", header: "Secret", question: "Enter it", isSecret: true }]
+    }
+  });
+}
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  sendUserInput("invalid_output_1");
+  return;
+}
+if (message.id === "invalid_output_1") {
+  sendUserInput("invalid_output_2");
+  return;
+}
+if (message.id === "invalid_output_2") {
+  sendUserInput("invalid_output_3");
+  return;
+}
+if (message.id === "invalid_output_3") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let callbackCalls = 0;
+      const logged: unknown[] = [];
+      const logger = {
+        debug: () => undefined,
+        info: () => undefined,
+        warn: (message: string, data?: unknown) => logged.push([message, data]),
+        error: (message: string, data?: unknown) => logged.push([message, data]),
+      };
+      await new CodexRunner(config, logger).run({
+        prompt: "exercise invalid callback output",
+        cwd: tempDir,
+        onUserInputRequest: async () => {
+          callbackCalls += 1;
+          if (callbackCalls === 1) {
+            return { answers: { unexpected: { answers: ["DO_NOT_LEAK"] } } } as never;
+          }
+          if (callbackCalls === 2) {
+            return { answers: { secret: ["DO_NOT_LEAK"] } } as never;
+          }
+          throw new Error("DO_NOT_LEAK");
+        },
+      });
+
+      expect(callbackCalls).toBe(3);
+      const receivedText = await readFile(receivedPath, "utf8");
+      expect(receivedText).not.toContain("DO_NOT_LEAK");
+      expect(JSON.stringify(logged)).not.toContain("DO_NOT_LEAK");
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      for (const id of ["invalid_output_1", "invalid_output_2", "invalid_output_3"]) {
+        expect(received.find((message) => message.id === id)).toEqual({
+          id,
+          error: { code: -32000, message: "User input request failed." },
+        });
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("aborts requestUserInput callbacks when the server resolves them and suppresses late responses", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({
+    id: "resolved_input_1",
+    method: "item/tool/requestUserInput",
+    params: {
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      itemId: "input_1",
+      questions: [{ id: "choice", header: "Choice", question: "Choose" }]
+    }
+  });
+  setTimeout(() => {
+    send({ method: "serverRequest/resolved", params: { threadId: "thread_fake", requestId: "resolved_input_1" } });
+    setTimeout(() => completeTurn("done"), 30);
+  }, 10);
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let callbackSignal: AbortSignal | undefined;
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise resolved user input",
+        cwd: tempDir,
+        onUserInputRequest: async (_request, context) => {
+          callbackSignal = context.signal;
+          await new Promise<void>((resolve) => {
+            if (context.signal.aborted) resolve();
+            else context.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { answers: { choice: { answers: ["late"] } } };
+        },
+      });
+
+      expect(callbackSignal?.aborted).toBe(true);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.some((message) => message.id === "resolved_input_1")).toBe(false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not invoke requestUserInput callbacks resolved in the same stdout batch", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({
+    id: "same_batch_input_1",
+    method: "item/tool/requestUserInput",
+    params: {
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      itemId: "input_1",
+      questions: [{ id: "choice", header: "Choice", question: "Choose" }]
+    }
+  });
+  send({
+    method: "serverRequest/resolved",
+    params: { threadId: "thread_fake", requestId: "same_batch_input_1" }
+  });
+  setTimeout(() => completeTurn("done"), 20);
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let callbackCalls = 0;
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise same-batch resolution",
+        cwd: tempDir,
+        onUserInputRequest: async () => {
+          callbackCalls += 1;
+          return { answers: { choice: { answers: ["late"] } } };
+        },
+      });
+
+      expect(result.finalText).toBe("done");
+      expect(callbackCalls).toBe(0);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.some((message) => message.id === "same_batch_input_1")).toBe(false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("aborts pending requestUserInput callbacks when the run is cancelled", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({
+    id: "aborted_input_1",
+    method: "item/tool/requestUserInput",
+    params: {
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      itemId: "input_1",
+      questions: [{ id: "choice", header: "Choice", question: "Choose" }]
+    }
+  });
+  setTimeout(() => completeTurn("fallback"), 500);
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const controller = new AbortController();
+      let callbackSignal: AbortSignal | undefined;
+      let markCallbackStarted: (() => void) | undefined;
+      const callbackStarted = new Promise<void>((resolve) => {
+        markCallbackStarted = resolve;
+      });
+      const run = new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise aborted user input",
+        cwd: tempDir,
+        signal: controller.signal,
+        onUserInputRequest: async (_request, context) => {
+          callbackSignal = context.signal;
+          markCallbackStarted?.();
+          await new Promise<void>((resolve) => {
+            if (context.signal.aborted) resolve();
+            else context.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { answers: { choice: { answers: ["late"] } } };
+        },
+      });
+
+      const started = await Promise.race([
+        callbackStarted.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 750)),
+      ]);
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      controller.abort();
+      const result = await run;
+
+      expect(started).toBe(true);
+      expect(callbackSignal?.aborted).toBe(true);
+      expect(result.cancelled).toBe(true);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.some((message) => message.id === "aborted_input_1")).toBe(false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("rejects unknown short-lived requests and completes listThreads", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
     const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
@@ -527,6 +1007,19 @@ if (message.method === "thread/list") {
   return;
 }
 if (message.id === "unknown_list_1") {
+  send({
+    id: "short_lived_input_1",
+    method: "item/tool/requestUserInput",
+    params: {
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      itemId: "input_1",
+      questions: [{ id: "choice", header: "Choice", question: "Choose" }]
+    }
+  });
+  return;
+}
+if (message.id === "short_lived_input_1") {
   send({ id: state.listRequestId, result: { data: [] } });
 }
 `,
@@ -549,6 +1042,10 @@ if (message.id === "unknown_list_1") {
         error: { code: -32601 },
       });
       expect(unknownResponse && "result" in unknownResponse).toBe(false);
+      expect(received.find((message) => message.id === "short_lived_input_1")).toEqual({
+        id: "short_lived_input_1",
+        error: { code: -32000, message: "User input request failed." },
+      });
 
       const packageVersion = await readPackageVersionForTest();
       expect(received).toContainEqual(

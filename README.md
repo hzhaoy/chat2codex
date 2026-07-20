@@ -115,6 +115,10 @@ when you need a separate bot instance.
   Buttons are generated from Codex's current approval decisions, including
   Approve, Approve session, Deny, and Cancel turn when those options are
   offered.
+- Structured Codex `requestUserInput` questions rendered as sender-bound cards,
+  with an explicit `/answer <reply-code> <value>` fallback for free-form input.
+  Options are validated against the original request; secret questions fail
+  closed instead of collecting credentials through chat history.
 - Feishu/Lark image and file messages downloaded to local paths and passed to
   Codex with the prompt.
 - Event diagnostics in logs and `/status` for recent routed/dropped messages.
@@ -189,9 +193,13 @@ Review schema diffs before changing
 [`src/agent/codex-runner.ts`](src/agent/codex-runner.ts). Chat2Codex handles only
 explicitly supported app-server server requests. Unknown methods return a
 JSON-RPC method-not-found error; malformed approval requests return an
-invalid-params error without exposing or inventing an approval option. Until
-their interactive UI is implemented, MCP elicitations are cancelled and
-additional-permission requests receive an empty grant.
+invalid-params error without exposing or inventing an approval option.
+`item/tool/requestUserInput` is supported through cards and explicit `/answer`
+replies; request fields and callback answers are revalidated, withdrawn
+requests reject late replies, and `isSecret` questions fail closed because chat
+cannot guarantee masked, non-persistent input. MCP elicitations are still
+cancelled and additional-permission requests still receive an empty grant until
+their dedicated interaction contracts are implemented.
 
 When `CODEX_APPROVAL_POLICY` allows interactive approvals, Codex app-server
 emits approval requests while a turn is running. Chat2Codex posts a separate
@@ -319,6 +327,7 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/cd <path>` | Change the current chat cwd and start a fresh Codex thread. |
 | `/stop` | Stop the active Codex run for the current chat. The running status card also has a stop button. |
 | `/steer <instruction>` | Send extra guidance to the active Codex run immediately, bypassing queued chat work. |
+| `/answer <reply-code> <value>` | Answer the current non-secret Codex `requestUserInput` question. The reply code is shown on the question card; answers bypass queued chat work and are not echoed. |
 | `/summary` | Show the most recent run summary for this chat. |
 | `/files` | Show changed files from the most recent run. |
 | `/diff` | Show the latest captured diff from the most recent run. |
@@ -358,14 +367,16 @@ constrained to canonical paths under `CODEX_GROUP_ALLOWED_ROOTS`, or under
 `CODEX_WORKDIR` when that list is empty; symlinks cannot bypass the boundary.
 
 Incoming events are persisted to a pending inbox before the long-connection
-handler returns. They become processed only after handling and reply delivery,
-and pending events are replayed after restart. Codex runs targeting the same
-workspace are serialized across chats, while different workspaces can run in
-parallel; `/status` and `/stop` also cover runs waiting for a workspace lock.
-Only one bridge process may use a given `BRIDGE_STATE_PATH`. Recovery is
-at-least-once: a rare interruption after Codex side
-effects but before reply delivery can replay the task, so keep approvals and Git
-review enabled for sensitive work.
+handler returns. Codex prompts also create durable jobs before execution. A
+queued job can resume after restart; a job that had reached `running` is marked
+interrupted and is not automatically executed again because its side effects
+cannot be inferred safely. Terminal replies are delivered from a durable outbox
+with stable idempotency keys, so a chat-delivery failure does not rerun Codex.
+Codex runs targeting the same workspace are serialized across chats, while
+different workspaces can run in parallel; `/status` and `/stop` also cover runs
+waiting for a workspace lock. Only one bridge process may use a given
+`BRIDGE_STATE_PATH`. Keep approvals and Git review enabled for sensitive work,
+and inspect the thread/worktree before manually retrying an interrupted job.
 
 The instance lock is removed on normal shutdown. A `SIGKILL` or fatal runtime
 crash can leave `<BRIDGE_STATE_PATH>.lock`; after confirming that no bridge
@@ -403,9 +414,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local development and pull request
 guidance. See [SECURITY.md](SECURITY.md) before running Chat2Codex in a shared
 chat or reporting a security issue.
 
-## Next Features To Add
+## Version Roadmap
 
-1. Fork from a selected historical turn with `thread/fork.lastTurnId`, leaving
-   the source thread unchanged. This is not a filesystem rollback and does not
-   restore local file changes.
-2. A chat-adapter boundary before adding Slack, Discord, or other platforms.
+1. **v0.5:** finish the interaction and production-hardening line: MCP
+   elicitation, additional-permission approval, bounded concurrency and queues,
+   attachment quotas, output limits, durable-delivery retention, and log
+   rotation. `requestUserInput` plus the first durable job/outbox slice are in
+   the current Unreleased work.
+2. **v0.6:** fork from a selected historical turn with
+   `thread/fork.lastTurnId`, leaving the source thread unchanged. This is not a
+   filesystem rollback and does not restore local file changes.
+3. Later: introduce a chat-adapter boundary before adding Slack, Discord, or
+   other platforms.

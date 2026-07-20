@@ -11,6 +11,8 @@ import type {
   CodexProgressUpdate,
   CodexRunInput,
   CodexRunResult,
+  CodexUserInputRequest,
+  CodexUserInputResponse,
   CodexThread,
   CodexThreadItem,
   CodexThreadListInput,
@@ -28,6 +30,7 @@ import type {
   ApprovalCardInput,
   LarkInteractiveCard,
   RunStatusCardInput,
+  UserInputCardInput,
 } from "../src/bot/lark-card.js";
 import {
   MessageRouter,
@@ -73,6 +76,56 @@ class FailingDeliverySender implements ChatSender {
   }
 }
 
+class FinalFailingSender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendMarkdown(
+    _chatId: string,
+    _markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+    }
+    throw new Error("simulated final delivery failure");
+  }
+}
+
+class TransientFinalDeliverySender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+  attempts = 0;
+
+  override async sendMarkdown(
+    chatId: string,
+    markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    this.attempts += 1;
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+    }
+    if (this.attempts === 1) {
+      throw new Error("simulated transient final delivery failure");
+    }
+    await super.sendMarkdown(chatId, markdown);
+  }
+}
+
+class IdempotencyCollectingSender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendMarkdown(
+    chatId: string,
+    markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+    }
+    await super.sendMarkdown(chatId, markdown);
+  }
+}
+
 class CardCollectingSender extends CollectingSender {
   readonly interactiveCards: Array<{
     chatId: string;
@@ -96,6 +149,15 @@ class CardCollectingSender extends CollectingSender {
   readonly approvalCardUpdates: Array<{
     handle: StatusCardHandle;
     input: ApprovalCardInput;
+  }> = [];
+  readonly userInputCards: Array<{
+    chatId: string;
+    input: UserInputCardInput;
+    handle: StatusCardHandle;
+  }> = [];
+  readonly userInputCardUpdates: Array<{
+    handle: StatusCardHandle;
+    input: UserInputCardInput;
   }> = [];
 
   async createStatusCard(chatId: string, input: RunStatusCardInput): Promise<StatusCardHandle> {
@@ -124,6 +186,40 @@ class CardCollectingSender extends CollectingSender {
 
   async updateApprovalCard(handle: StatusCardHandle, input: ApprovalCardInput): Promise<void> {
     this.approvalCardUpdates.push({ handle, input });
+  }
+
+  async createUserInputCard(
+    chatId: string,
+    input: UserInputCardInput,
+  ): Promise<StatusCardHandle> {
+    const handle = { messageId: `omu_${this.userInputCards.length + 1}` };
+    this.userInputCards.push({ chatId, input, handle });
+    return handle;
+  }
+
+  async updateUserInputCard(
+    handle: StatusCardHandle,
+    input: UserInputCardInput,
+  ): Promise<void> {
+    this.userInputCardUpdates.push({ handle, input });
+  }
+}
+
+class FailingUserInputCardSender extends CardCollectingSender {
+  readonly userInputCardAttempts: Array<{ chatId: string; input: UserInputCardInput }> = [];
+
+  override async createUserInputCard(
+    chatId: string,
+    input: UserInputCardInput,
+  ): Promise<StatusCardHandle> {
+    this.userInputCardAttempts.push({ chatId, input });
+    throw new Error("simulated user-input card failure");
+  }
+}
+
+class FailingUserInputPresentationSender extends FailingUserInputCardSender {
+  override async sendText(): Promise<void> {
+    throw new Error("simulated user-input fallback failure");
   }
 }
 
@@ -428,6 +524,58 @@ class ApprovalCodex implements CodexClient {
     return {
       threadId: "thread_test",
       finalText: `decision=${formatDecisionForTest(this.decision)}`,
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+}
+
+class UserInputCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly requestStarted = deferred<void>();
+  response: CodexUserInputResponse | undefined;
+  private requestController: AbortController | undefined;
+
+  constructor(private readonly request: CodexUserInputRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    this.requestController = new AbortController();
+    const abortRequest = () => this.requestController?.abort();
+    input.signal?.addEventListener("abort", abortRequest, { once: true });
+    this.requestStarted.resolve();
+    try {
+      this.response = await input.onUserInputRequest?.(this.request, {
+        signal: this.requestController.signal,
+      });
+    } finally {
+      input.signal?.removeEventListener("abort", abortRequest);
+    }
+    return {
+      threadId: "thread_test",
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  abortRequest(): void {
+    this.requestController?.abort();
+  }
+}
+
+class FireAndForgetUserInputCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+
+  constructor(private readonly request: CodexUserInputRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const controller = new AbortController();
+    void input.onUserInputRequest?.(this.request, { signal: controller.signal });
+    return {
+      threadId: "thread_test",
+      finalText: "done",
       stderr: "",
       exitCode: 0,
     };
@@ -836,8 +984,10 @@ describe("MessageRouter access control", () => {
     });
   });
 
-  test("keeps failed deliveries pending and replays them after restart", async () => {
+  test("replays a failed final delivery after restart without rerunning Codex", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-delivery-"));
+    let failedRouter: MessageRouter | undefined;
+    let replayRouter: MessageRouter | undefined;
     try {
       const config = loadConfig({
         FEISHU_APP_ID: "cli_test",
@@ -847,12 +997,14 @@ describe("MessageRouter access control", () => {
         ALLOWED_USER_IDS: "ou_user",
       });
       const store = new JsonStateStore(config.bridgeStatePath);
-      const failedRouter = new MessageRouter(
+      const failedSender = new FinalFailingSender();
+      const firstCodex = new FakeCodex();
+      failedRouter = new MessageRouter(
         config,
         store,
-        new FailingDeliverySender(),
+        failedSender,
         silentLogger,
-        new FakeCodex(),
+        firstCodex,
       );
       await failedRouter.start();
       await failedRouter.accept({
@@ -863,26 +1015,155 @@ describe("MessageRouter access control", () => {
         text: "retry after restart",
       });
 
-      await waitForState(store, (state) => state.pendingMessages.m_replay?.attempts === 1);
+      await waitForState(store, (state) =>
+        Object.values(state.outbox).some(
+          (delivery) =>
+            delivery.jobId === "m_replay" &&
+            delivery.attempts === 1 &&
+            delivery.status === "pending",
+        ),
+      );
       const failed = await store.load();
-      expect(failed.pendingMessages.m_replay?.lastError).toContain("simulated delivery failure");
-      expect(failed.processedMessageIds).not.toContain("m_replay");
+      expect(firstCodex.runs).toHaveLength(1);
+      expect(failed.jobs.m_replay?.status).toBe("completed");
+      expect(failed.pendingMessages.m_replay).toBeUndefined();
+      expect(failed.processedMessageIds).toContain("m_replay");
+      const failedDelivery = Object.values(failed.outbox).find(
+        (delivery) => delivery.jobId === "m_replay",
+      );
+      expect(failedDelivery?.status).toBe("pending");
+      expect(failedDelivery?.lastError).toContain("simulated final delivery failure");
+      expect(failedSender.idempotencyKeys).toEqual([failedDelivery?.idempotencyKey]);
+      failedRouter.dispose();
+      failedRouter = undefined;
 
       const replayCodex = new FakeCodex();
-      const replayRouter = new MessageRouter(
+      const replaySender = new IdempotencyCollectingSender();
+      replayRouter = new MessageRouter(
         config,
         new JsonStateStore(config.bridgeStatePath),
-        new CollectingSender(),
+        replaySender,
         silentLogger,
         replayCodex,
       );
       await replayRouter.start();
-      await waitFor(() => replayCodex.runs.length === 1);
-      await waitForState(store, (state) => state.processedMessageIds.includes("m_replay"));
+      await waitForState(store, (state) =>
+        Object.values(state.outbox).some(
+          (delivery) => delivery.jobId === "m_replay" && delivery.status === "delivered",
+        ),
+      );
 
       const replayed = await store.load();
+      expect(replayCodex.runs).toHaveLength(0);
+      expect(replaySender.messages.map((message) => message.text)).toEqual(["done"]);
+      expect(replaySender.idempotencyKeys).toEqual([failedDelivery?.idempotencyKey]);
       expect(replayed.pendingMessages.m_replay).toBeUndefined();
       expect(replayed.processedMessageIds).toContain("m_replay");
+      expect(
+        Object.values(replayed.outbox).find((delivery) => delivery.jobId === "m_replay")?.text,
+      ).toBe("");
+    } finally {
+      failedRouter?.dispose();
+      replayRouter?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("retries a transient final delivery in-process without rerunning Codex", async () => {
+    const sender = new TransientFinalDeliverySender();
+    const codex = new FakeCodex();
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.accept({
+        messageId: "m_retry_in_process",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "retry the reply only",
+      });
+
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await waitForState(store, (state) =>
+        Object.values(state.outbox).some(
+          (delivery) =>
+            delivery.jobId === "m_retry_in_process" && delivery.status === "delivered",
+        ),
+      );
+
+      expect(codex.runs).toHaveLength(1);
+      expect(sender.attempts).toBe(2);
+      expect(
+        sender.messages
+          .filter((message) => message.kind === "markdown")
+          .map((message) => message.text),
+      ).toEqual(["done"]);
+      expect(sender.idempotencyKeys).toHaveLength(2);
+      expect(new Set(sender.idempotencyKeys).size).toBe(1);
+    });
+  });
+
+  test("marks a running durable job interrupted on restart without rerunning Codex", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-interrupted-"));
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: tempDir,
+            chatType: "direct",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+          },
+        },
+        jobs: {
+          m_interrupted: {
+            id: "m_interrupted",
+            kind: "codex_run",
+            messageId: "m_interrupted",
+            chatId: "oc_chat",
+            chatType: "direct",
+            cwd: tempDir,
+            prompt: "may already have side effects",
+            status: "running",
+            createdAt: "2026-07-20T00:00:00.000Z",
+            updatedAt: "2026-07-20T00:00:01.000Z",
+            startedAt: "2026-07-20T00:00:01.000Z",
+            deliveryIds: [],
+          },
+        },
+        outbox: {},
+        pendingMessages: {
+          m_interrupted: {
+            messageId: "m_interrupted",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "may already have side effects",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      const sender = new IdempotencyCollectingSender();
+      const router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitForState(store, (state) => state.jobs.m_interrupted?.status === "interrupted");
+      await waitFor(() => sender.messages.length === 1);
+
+      const recovered = await store.load();
+      expect(codex.runs).toHaveLength(0);
+      expect(recovered.pendingMessages.m_interrupted).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_interrupted");
+      expect(sender.messages[0]?.text).toContain("不会自动重新执行");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -3119,6 +3400,521 @@ describe("MessageRouter access control", () => {
     );
   });
 
+  test("answers requestUserInput cards one question at a time and validates card context", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_1",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [
+        {
+          id: "environment",
+          header: "Environment",
+          question: "Which environment should be used?",
+          isOther: false,
+          isSecret: false,
+          options: [
+            { label: "Staging", description: "Use staging." },
+            { label: "Production", description: "Use production." },
+          ],
+        },
+        {
+          id: "note",
+          header: "Note",
+          question: "Any extra note?",
+          isOther: true,
+          isSecret: false,
+          options: null,
+        },
+      ],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_input_card",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCards.length === 1);
+      const handle = sender.userInputCards[0]!.handle;
+
+      const wrongSender = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_other" },
+      });
+      expect(expectToast(wrongSender).toast.type).toBe("error");
+
+      const wrongCard = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: "om_forged",
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(wrongCard).toast.type).toBe("warning");
+
+      const wrongQuestion = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "note",
+        optionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(wrongQuestion).toast.type).toBe("warning");
+
+      const wrongOption = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 9,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(wrongOption).toast.type).toBe("warning");
+
+      const nextQuestion = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      expect(nextQuestion).toHaveProperty("card");
+      expect(JSON.stringify(nextQuestion)).toContain("Any extra note?");
+      expect(codex.response).toBeUndefined();
+      expect(sender.userInputCardUpdates.at(-1)?.input).toMatchObject({
+        status: "pending",
+        answers: { environment: { answers: [] } },
+      });
+
+      const resolved = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "note",
+        sender: { openId: "ou_user" },
+      });
+      expect(resolved).toHaveProperty("card");
+      await running;
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({
+        answers: {
+          environment: { answers: ["Production"] },
+          note: { answers: [] },
+        },
+      });
+      expect(sender.userInputCardUpdates.at(-1)?.input).toMatchObject({
+        status: "resolved",
+        answers: {
+          environment: { answers: [] },
+          note: { answers: [] },
+        },
+      });
+    });
+  });
+
+  test("binds requestUserInput cancellation to the original group sender", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_group",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "confirm",
+        header: "Confirm",
+        question: "Continue?",
+        isOther: false,
+        isSecret: false,
+        options: [{ label: "Yes", description: "Continue." }],
+      }],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      {
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        ALLOWED_USER_IDS: "ou_user,ou_other",
+      },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_input_group",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: "ask me",
+        });
+        await waitFor(() => sender.userInputCards.length === 1);
+        const handle = sender.userInputCards[0]!.handle;
+
+        const rejected = await router.handleCardAction({
+          action: "cancel_user_input",
+          chatId: "oc_group",
+          messageId: handle.messageId,
+          userInputId: request.id,
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(rejected).toast.type).toBe("error");
+        expect(codex.response).toBeUndefined();
+
+        const cancelled = await router.handleCardAction({
+          action: "cancel_user_input",
+          chatId: "oc_group",
+          messageId: handle.messageId,
+          userInputId: request.id,
+          sender: { openId: "ou_user" },
+        });
+        expect(cancelled).toHaveProperty("card");
+        await running;
+
+        expect(codex.response).toEqual({ answers: {} });
+        expect(sender.userInputCardUpdates.at(-1)?.input.status).toBe("cancelled");
+      },
+    );
+  });
+
+  test("handles /answer immediately without persisting or echoing answer content", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_text",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [
+        {
+          id: "color",
+          header: "Color",
+          question: "Choose a color.",
+          isOther: false,
+          isSecret: false,
+          options: [
+            { label: "Red", description: "Use red." },
+            { label: "Blue", description: "Use blue." },
+          ],
+        },
+        {
+          id: "detail",
+          header: "Detail",
+          question: "Give a detail.",
+          isOther: true,
+          isSecret: false,
+          options: null,
+        },
+      ],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router, config }) => {
+      const running = router.enqueue({
+        messageId: "m_input_text",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCards.length === 1);
+      const replyCode = sender.userInputCards[0]!.input.replyCode;
+
+      await router.enqueue({
+        messageId: "m_wrong_user_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_other" },
+        text: `/answer ${replyCode} Blue`,
+      });
+      expect(codex.response).toBeUndefined();
+      expect(sender.messages.at(-1)?.text).toContain("发起当前 Codex 任务的用户");
+
+      await router.enqueue({
+        messageId: "m_long_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} ${"x".repeat(4_001)}`,
+      });
+      expect(codex.response).toBeUndefined();
+      expect(sender.messages.at(-1)?.text).toContain("4000");
+
+      await router.enqueue({
+        messageId: "m_bad_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} Purple`,
+      });
+      expect(codex.response).toBeUndefined();
+      expect(sender.messages.at(-1)?.text).toContain("可选项");
+
+      await router.enqueue({
+        messageId: "m_color_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} Blue`,
+      });
+      expect(codex.response).toBeUndefined();
+
+      const privateAnswer = "private phrase 93f15";
+      const answerMessage: IncomingTextMessage = {
+        messageId: "m_private_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} ${privateAnswer}`,
+      };
+      await router.accept(answerMessage);
+      await router.accept(answerMessage);
+      await running;
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({
+        answers: {
+          color: { answers: ["Blue"] },
+          detail: { answers: [privateAnswer] },
+        },
+      });
+      expect(sender.messages.every((message) => !message.text.includes(privateAnswer))).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(privateAnswer);
+      expect(persisted.processedMessageIds.filter((id) => id === answerMessage.messageId)).toHaveLength(1);
+      },
+    );
+  });
+
+  test("fails secret requestUserInput closed without creating a card", async () => {
+    const secretQuestion = "Paste the production password";
+    const codex = new UserInputCodex({
+      id: "input_secret",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "password",
+        header: "Password",
+        question: secretQuestion,
+        isOther: true,
+        isSecret: true,
+        options: null,
+      }],
+    });
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.enqueue({
+        messageId: "m_input_secret",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask for a secret",
+      });
+
+      expect(codex.response).toEqual({ answers: {} });
+      expect(sender.userInputCards).toHaveLength(0);
+      expect(sender.messages.some((message) => message.text.includes("敏感输入"))).toBe(true);
+      expect(sender.messages.every((message) => !message.text.includes(secretQuestion))).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(secretQuestion);
+    });
+  });
+
+  test("expires requestUserInput on its request signal and rejects late answers", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_expired",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: 10_000,
+      questions: [{
+        id: "choice",
+        header: "Choice",
+        question: "Choose.",
+        isOther: false,
+        isSecret: false,
+        options: [{ label: "One", description: "The first option." }],
+      }],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_input_expired",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCards.length === 1);
+      const handle = sender.userInputCards[0]!.handle;
+
+      codex.abortRequest();
+      await running;
+      expect(codex.response).toEqual({ answers: {} });
+      expect(sender.userInputCardUpdates.at(-1)?.input.status).toBe("expired");
+
+      const late = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "choice",
+        optionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
+  });
+
+  test("falls back to /answer text when requestUserInput card creation fails", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_fallback",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "detail",
+        header: "Detail",
+        question: "Provide a detail.",
+        isOther: true,
+        isSecret: false,
+        options: null,
+      }],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new FailingUserInputCardSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_input_fallback",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCardAttempts.length === 1);
+      await waitFor(() => sender.messages.some((message) => message.text.includes("/answer")));
+      const replyCode = sender.userInputCardAttempts[0]!.input.replyCode;
+
+      await router.enqueue({
+        messageId: "m_fallback_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} fallback detail`,
+      });
+      await running;
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({
+        answers: { detail: { answers: ["fallback detail"] } },
+      });
+    });
+  });
+
+  test("fails requestUserInput closed when neither card nor fallback text can be delivered", async () => {
+    const codex = new UserInputCodex({
+      id: "input_undeliverable",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "detail",
+        header: "Detail",
+        question: "Provide a detail.",
+        isOther: true,
+        isSecret: false,
+        options: null,
+      }],
+    });
+    const sender = new FailingUserInputPresentationSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_input_undeliverable",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({ answers: {} });
+      expect(sender.userInputCardAttempts).toHaveLength(1);
+    });
+  });
+
+  test("cleans up an unawaited requestUserInput when the run finishes", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_unawaited",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "detail",
+        header: "Detail",
+        question: "Provide a detail.",
+        isOther: true,
+        isSecret: false,
+        options: null,
+      }],
+    };
+    const codex = new FireAndForgetUserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_input_unawaited",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCardUpdates.length > 0);
+      expect(sender.userInputCardUpdates.at(-1)?.input.status).toBe("cancelled");
+
+      const late = await router.handleCardAction({
+        action: "cancel_user_input",
+        chatId: "oc_chat",
+        messageId: sender.userInputCards[0]?.handle.messageId,
+        userInputId: request.id,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
+  });
+
   test("card retry action reruns the prompt from the status card context", async () => {
     const codex = new SequencedCodex([
       {
@@ -3243,6 +4039,7 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
   }) => Promise<void>,
 ): Promise<void> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-test-"));
+  let router: MessageRouter | undefined;
   try {
     const config = loadConfig({
       FEISHU_APP_ID: "cli_test",
@@ -3252,7 +4049,7 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
       ALLOWED_USER_IDS: "ou_user",
       ...env,
     });
-    const router = new MessageRouter(
+    router = new MessageRouter(
       config,
       new JsonStateStore(config.bridgeStatePath),
       sender,
@@ -3262,6 +4059,7 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
     await router.start();
     await testBody({ router, sender, codex, config });
   } finally {
+    router?.dispose();
     await rm(tempDir, { recursive: true, force: true });
   }
 }

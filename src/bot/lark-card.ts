@@ -1,8 +1,12 @@
 import type {
   CodexApprovalDecision,
   CodexApprovalRequest,
+  CodexUserInputRequest,
+  CodexUserInputResponse,
 } from "../agent/codex-runner.js";
 import {
+  answerUserInputCardAction,
+  cancelUserInputCardAction,
   resolveApprovalCardAction,
   pageProjectsCardAction,
   pageSessionsCardAction,
@@ -17,6 +21,7 @@ import {
 
 export type RunStatusCardStatus = "running" | "success" | "failed" | "stopped";
 export type ApprovalCardStatus = "pending" | "resolved" | "cancelled";
+export type UserInputCardStatus = "pending" | "resolved" | "cancelled" | "expired";
 
 export interface RunStatusCardInput {
   status: RunStatusCardStatus;
@@ -44,6 +49,14 @@ export interface ApprovalCardInput {
   status: ApprovalCardStatus;
   request: CodexApprovalRequest;
   decision?: CodexApprovalDecision;
+  updatedAt: string;
+}
+
+export interface UserInputCardInput {
+  status: UserInputCardStatus;
+  request: CodexUserInputRequest;
+  replyCode: string;
+  answers?: CodexUserInputResponse["answers"];
   updatedAt: string;
 }
 
@@ -137,6 +150,8 @@ const statusMeta: Record<RunStatusCardStatus, { title: string; template: string 
   },
 };
 const defaultListPageSize = 5;
+const maxUserInputOptionButtons = 5;
+const maxUserInputOptionsDisplayed = 10;
 
 export function buildRunStatusCard(input: RunStatusCardInput): LarkInteractiveCard {
   const meta = statusMeta[input.status];
@@ -323,6 +338,107 @@ export function buildApprovalCard(input: ApprovalCardInput): LarkInteractiveCard
               ? `审批详情无法完整安全展示（${disclosureIssue}）；仅保留拒绝/取消操作。`
               : "按钮来自 Codex 当前审批请求的 availableDecisions。"
             : "这条 Codex 审批请求已处理。",
+      },
+    ],
+  });
+
+  return {
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      template: meta.template,
+      title: {
+        tag: "plain_text",
+        content: meta.title,
+      },
+    },
+    elements,
+  };
+}
+
+export function buildUserInputCard(input: UserInputCardInput): LarkInteractiveCard {
+  const meta = userInputStatusMeta[input.status];
+  const question = firstUnansweredUserInputQuestion(input);
+  const secretQuestionBlocked = input.status === "pending" && Boolean(question?.isSecret);
+  const elements: Array<Record<string, unknown>> = [
+    {
+      tag: "div",
+      text: plain(userInputDetail(input.status, Boolean(question), secretQuestionBlocked), 500),
+    },
+    {
+      tag: "div",
+      fields: [
+        field("updated", input.updatedAt, 80),
+        field("reply_code", input.replyCode, 40),
+        field("progress", userInputProgress(input), 80),
+      ],
+    },
+  ];
+
+  if (input.status === "pending" && question && !secretQuestionBlocked) {
+    elements.push(
+      { tag: "hr" },
+      {
+        tag: "div",
+        text: markdown(
+          [
+            `**${escapeLarkMarkdown(truncate(question.header, 80))}**`,
+            escapeLarkMarkdown(truncate(question.question, 500)),
+          ].join("\n"),
+        ),
+      },
+    );
+
+    const displayedOptions = (question.options ?? []).slice(0, maxUserInputOptionsDisplayed);
+    const buttonOptions = displayedOptions.slice(0, maxUserInputOptionButtons);
+    for (const [index, option] of displayedOptions.entries()) {
+      elements.push({
+        tag: "div",
+        text: markdown(
+          [
+            `**${index + 1}. ${escapeLarkMarkdown(truncate(option.label, 80))}**`,
+            escapeLarkMarkdown(truncate(option.description, 180)),
+          ].join("\n"),
+        ),
+      });
+    }
+    if (buttonOptions.length > 0) {
+      elements.push(userInputOptionActions(input.request.id, question.id, buttonOptions));
+    }
+
+    if (
+      displayedOptions.length === 0 ||
+      question.isOther ||
+      (question.options?.length ?? 0) > buttonOptions.length
+    ) {
+      elements.push({
+        tag: "note",
+        elements: [
+          {
+            tag: "plain_text",
+            content: truncate(
+              `可发送 /answer ${truncate(input.replyCode, 40)} <内容> 回答当前问题。`,
+              160,
+            ),
+          },
+        ],
+      });
+    }
+
+    elements.push(userInputControlActions(input.request.id, question.id));
+  }
+
+  elements.push({
+    tag: "note",
+    elements: [
+      {
+        tag: "plain_text",
+        content:
+          input.status === "pending" && question
+            ? "选项会在服务端按原始 requestUserInput 请求重新校验。"
+            : "这条 Codex 用户输入请求已结束。",
       },
     ],
   });
@@ -664,6 +780,57 @@ function approvalActionElement(
   };
 }
 
+function userInputOptionActions(
+  userInputId: string,
+  questionId: string,
+  options: Array<{ label: string }>,
+): Record<string, unknown> {
+  return {
+    tag: "action",
+    actions: options.map((option, optionIndex) => ({
+      tag: "button",
+      text: plain(option.label, 48),
+      type: "primary",
+      value: {
+        app: runCardActionApp,
+        action: answerUserInputCardAction,
+        userInputId,
+        questionId,
+        optionIndex,
+      },
+    })),
+  };
+}
+
+function userInputControlActions(userInputId: string, questionId: string): Record<string, unknown> {
+  return {
+    tag: "action",
+    actions: [
+      {
+        tag: "button",
+        text: plain("跳过", 48),
+        type: "default",
+        value: {
+          app: runCardActionApp,
+          action: answerUserInputCardAction,
+          userInputId,
+          questionId,
+        },
+      },
+      {
+        tag: "button",
+        text: plain("取消", 48),
+        type: "danger",
+        value: {
+          app: runCardActionApp,
+          action: cancelUserInputCardAction,
+          userInputId,
+        },
+      },
+    ],
+  };
+}
+
 function projectSummaryElements(
   project: ProjectCardItem,
   index: number,
@@ -877,6 +1044,59 @@ function approvalStatusMeta(
     title: request.kind === "command" ? "Codex 请求执行命令" : "Codex 请求修改文件",
     template: "orange",
   };
+}
+
+const userInputStatusMeta: Record<UserInputCardStatus, { title: string; template: string }> = {
+  pending: {
+    title: "Codex 需要你的回答",
+    template: "orange",
+  },
+  resolved: {
+    title: "Codex 已收到回答",
+    template: "green",
+  },
+  cancelled: {
+    title: "Codex 提问已取消",
+    template: "grey",
+  },
+  expired: {
+    title: "Codex 提问已过期",
+    template: "grey",
+  },
+};
+
+function firstUnansweredUserInputQuestion(input: UserInputCardInput) {
+  const answers = input.answers ?? {};
+  return input.request.questions.find((question) => !Object.hasOwn(answers, question.id));
+}
+
+function userInputProgress(input: UserInputCardInput): string {
+  const answered = input.request.questions.filter((question) =>
+    Object.hasOwn(input.answers ?? {}, question.id),
+  ).length;
+  return `${answered}/${input.request.questions.length}`;
+}
+
+function userInputDetail(
+  status: UserInputCardStatus,
+  hasPendingQuestion: boolean,
+  secretQuestionBlocked = false,
+): string {
+  if (status === "resolved") {
+    return "回答已提交给 Codex；为避免泄露，卡片不会回显回答内容。";
+  }
+  if (status === "cancelled") {
+    return "这条用户输入请求已取消。";
+  }
+  if (status === "expired") {
+    return "这条用户输入请求已过期，迟到的回答不会提交给 Codex。";
+  }
+  if (secretQuestionBlocked) {
+    return "这个问题要求敏感输入；聊天消息无法提供不留痕的安全输入通道，因此不会收集或提交回答。";
+  }
+  return hasPendingQuestion
+    ? "Codex 暂停当前任务，正在等待你回答下面的问题。"
+    : "所有问题均已回答，正在提交给 Codex。";
 }
 
 function approvalDetail(input: ApprovalCardInput): string {

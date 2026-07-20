@@ -14,14 +14,17 @@ import {
 import { adaptLarkCardActionEvent, cardActionToast } from "./lark-card-action.js";
 import {
   buildApprovalCard,
+  buildUserInputCard,
   type LarkInteractiveCard,
   buildRunStatusCard,
   type ApprovalCardInput,
   type RunStatusCardInput,
+  type UserInputCardInput,
 } from "./lark-card.js";
 import { buildMarkdownPost } from "./lark-post.js";
 import {
   MessageRouter,
+  type ChatDeliveryOptions,
   type DownloadedAttachment,
   type IncomingAttachment,
   type IncomingTextMessage,
@@ -41,7 +44,7 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
     domain,
   });
 
-  const sendText = async (chatId: string, text: string) => {
+  const sendText = async (chatId: string, text: string, options?: ChatDeliveryOptions) => {
     await client.im.v1.message.create({
       params: {
         receive_id_type: "chat_id",
@@ -50,13 +53,14 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
         receive_id: chatId,
         msg_type: "text",
         content: JSON.stringify({ text }),
+        ...(options?.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
       },
     });
   };
 
   const sender = {
     sendText,
-    async sendMarkdown(chatId: string, markdown: string) {
+    async sendMarkdown(chatId: string, markdown: string, options?: ChatDeliveryOptions) {
       try {
         await client.im.v1.message.create({
           params: {
@@ -66,11 +70,12 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
             receive_id: chatId,
             msg_type: "post",
             content: JSON.stringify(buildMarkdownPost(markdown)),
+            ...(options?.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
           },
         });
       } catch (error) {
         logger.warn("Failed to send markdown post; falling back to text", error);
-        await sendText(chatId, markdown);
+        await sendText(chatId, markdown, options);
       }
     },
     async sendInteractiveCard(chatId: string, card: LarkInteractiveCard) {
@@ -188,6 +193,39 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
         },
         data: {
           content: JSON.stringify(buildApprovalCard(input)),
+        },
+      });
+    },
+    async createUserInputCard(
+      chatId: string,
+      input: UserInputCardInput,
+    ): Promise<StatusCardHandle> {
+      const response = await client.im.v1.message.create({
+        params: {
+          receive_id_type: "chat_id",
+        },
+        data: {
+          receive_id: chatId,
+          msg_type: "interactive",
+          content: JSON.stringify(buildUserInputCard(input)),
+        },
+      });
+      const messageId = response.data?.message_id;
+      if (!messageId) {
+        throw new Error("Feishu/Lark did not return a message_id for the user-input card.");
+      }
+      return { messageId };
+    },
+    async updateUserInputCard(
+      handle: StatusCardHandle,
+      input: UserInputCardInput,
+    ): Promise<void> {
+      await client.im.v1.message.patch({
+        path: {
+          message_id: handle.messageId,
+        },
+        data: {
+          content: JSON.stringify(buildUserInputCard(input)),
         },
       });
     },

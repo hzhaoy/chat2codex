@@ -140,8 +140,55 @@ export interface PendingMessageDelivery {
   lastError?: string;
 }
 
+export type DurableCodexJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface DurableCodexJob {
+  id: string;
+  kind: "codex_run";
+  messageId: string;
+  chatId: string;
+  chatType: "direct" | "group";
+  cwd: string;
+  prompt: string;
+  threadId?: string;
+  status: DurableCodexJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  result?: LastRunSummary;
+  deliveryIds: string[];
+  interruptionReason?: string;
+}
+
+export type DurableOutboxStatus = "pending" | "sending" | "delivered";
+
+export interface DurableOutboxMessage {
+  id: string;
+  jobId: string;
+  chatId: string;
+  kind: "text" | "markdown";
+  text: string;
+  sequence: number;
+  status: DurableOutboxStatus;
+  idempotencyKey: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  deliveredAt?: string;
+  lastError?: string;
+}
+
 export interface BridgeState {
   chats: Record<string, ChatSession>;
+  jobs: Record<string, DurableCodexJob>;
+  outbox: Record<string, DurableOutboxMessage>;
   pendingMessages: Record<string, PendingMessageDelivery>;
   processedMessageIds: string[];
   diagnostics: BridgeDiagnostics;
@@ -149,6 +196,8 @@ export interface BridgeState {
 
 export const emptyState = (): BridgeState => ({
   chats: {},
+  jobs: {},
+  outbox: {},
   pendingMessages: {},
   processedMessageIds: [],
   diagnostics: {},
