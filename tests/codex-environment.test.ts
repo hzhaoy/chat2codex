@@ -38,6 +38,7 @@ describe("Codex child environment", () => {
       LOG_FILE_MAX_FILES: "3",
       JOB_RETENTION_COUNT: "500",
       OUTBOX_RETENTION_COUNT: "500",
+      CHAT2CODEX_LOG_FILE: "/tmp/chat2codex.log",
     });
 
     expect(childEnv).toMatchObject({
@@ -76,6 +77,7 @@ describe("Codex child environment", () => {
       "LOG_FILE_MAX_FILES",
       "JOB_RETENTION_COUNT",
       "OUTBOX_RETENTION_COUNT",
+      "CHAT2CODEX_LOG_FILE",
     ]) {
       expect(childEnv[key]).toBeUndefined();
     }

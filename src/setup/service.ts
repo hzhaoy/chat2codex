@@ -122,6 +122,8 @@ export function renderLaunchdPlist(options: ServiceOptions): string {
   <dict>
     <key>CHAT2CODEX_ENV</key>
     <string>${escapeXml(options.envFile)}</string>
+    <key>CHAT2CODEX_LOG_FILE</key>
+    <string>${escapeXml(options.stderrPath)}</string>
     <key>NODE_ENV</key>
     <string>production</string>
     <key>PATH</key>
@@ -132,9 +134,9 @@ export function renderLaunchdPlist(options: ServiceOptions): string {
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${escapeXml(options.stdoutPath)}</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>${escapeXml(options.stderrPath)}</string>
+  <string>/dev/null</string>
 </dict>
 </plist>
 `;
@@ -182,7 +184,7 @@ async function installLaunchd(options: ServiceOptions): Promise<void> {
   assertPlatform("darwin", "launchd");
   const plistPath = launchdPlistPath(options.launchdLabel);
   await fs.mkdir(path.dirname(plistPath), { recursive: true });
-  await fs.mkdir(path.dirname(options.stdoutPath), { recursive: true });
+  await fs.mkdir(path.dirname(options.stderrPath), { recursive: true });
   await fs.writeFile(plistPath, renderLaunchdPlist(options));
 
   const domain = launchdDomain();
@@ -193,7 +195,7 @@ async function installLaunchd(options: ServiceOptions): Promise<void> {
 
   console.log(`Installed launchd service: ${options.launchdLabel}`);
   console.log(`Plist: ${plistPath}`);
-  console.log(`Logs: ${options.stdoutPath} / ${options.stderrPath}`);
+  console.log(`Rotating log: ${options.stderrPath}`);
 }
 
 async function uninstallLaunchd(options: ServiceOptions): Promise<void> {
@@ -433,9 +435,9 @@ Options:
                                   Defaults to a stable service PATH
   --launchd-label <label>        Defaults to com.chat2codex.bridge
   --systemd-name <name>          Defaults to chat2codex
-  --stdout <path>                launchd stdout log path; defaults under
-                                  ~/.chat2codex/.data/logs
-  --stderr <path>                launchd stderr log path; defaults under
-                                  ~/.chat2codex/.data/logs
+  --stdout <path>                Legacy launchd stdout path option; service output
+                                  is discarded in favor of the rotating log
+  --stderr <path>                launchd rotating application log path; defaults
+                                  under ~/.chat2codex/.data/logs
 `);
 }

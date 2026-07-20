@@ -45,6 +45,7 @@ const bridgeOnlyEnvironmentKeys = new Set([
   "LOG_FILE_MAX_FILES",
   "JOB_RETENTION_COUNT",
   "OUTBOX_RETENTION_COUNT",
+  "CHAT2CODEX_LOG_FILE",
 ]);
 
 export function buildCodexChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

@@ -141,7 +141,12 @@ Options:
 
   loadRuntimeEnv(options.envFile);
   const config = loadConfig(process.env);
-  const logger = new ConsoleLogger(config.logLevel);
+  const logger = new ConsoleLogger(config.logLevel, {
+    filePath: process.env.CHAT2CODEX_LOG_FILE,
+    maxEntryBytes: config.logEntryMaxBytes,
+    maxFileBytes: config.logFileMaxBytes,
+    maxFiles: config.logFileMaxFiles,
+  });
 
   process.on("unhandledRejection", (error) => {
     logger.error("Unhandled rejection", error);
