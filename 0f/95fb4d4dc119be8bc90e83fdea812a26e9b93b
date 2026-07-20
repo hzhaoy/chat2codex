@@ -1,0 +1,27 @@
+.env.example
+  s_bc0331dd4e9203::t_a6e863a2c76c6b 38-40
+CHANGELOG.md
+  s_bc0331dd4e9203::t_610de19165bf19 16-22,28-44,51-57
+README.md
+  s_bc0331dd4e9203::t_034ec6e02a8a37 107-108,122-129,208-219,320-322,348-349,370-383,408-412,414-417,459-464
+README.zh-CN.md
+  s_bc0331dd4e9203::t_54df5d77c180a3 75,81-82,137-139,209,235-236,251-252,259,292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0f95fb4d4dc119be8bc90e83fdea812a26e9b93b",
+  "prompts": {},
+  "sessions": {
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
