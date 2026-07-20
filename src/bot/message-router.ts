@@ -1030,13 +1030,14 @@ export class MessageRouter {
         summary: result.summary,
         finalText: result.finalText,
       });
+      const chatOutput = truncateChatOutput(result.finalText, this.config.chatOutputMaxChars);
       const durable = await this.persistRunTerminal({
         chatId,
         messageId: queuedRun.messageId,
         status: "completed",
         lastRun,
         threadId: resultThreadId,
-        deliveries: splitForChat(result.finalText).map((text) => ({
+        deliveries: splitForChat(chatOutput).map((text) => ({
           kind: "markdown" as const,
           text,
         })),
@@ -1053,7 +1054,7 @@ export class MessageRouter {
       if (durable) {
         await this.drainOutboxForJob(queuedRun.messageId!);
       } else {
-        for (const chunk of splitForChat(result.finalText)) {
+        for (const chunk of splitForChat(chatOutput)) {
           await this.sendMarkdown(chatId, chunk);
         }
       }
@@ -4200,6 +4201,31 @@ function summarizeFailureOutput(output: string): string {
     return normalized;
   }
   return `${normalized.slice(0, maxLength).trimEnd()}\n...（已截断，完整输出请查看服务日志）`;
+}
+
+function truncateChatOutput(value: string, maxChars: number): string {
+  let prefix = "";
+  let count = 0;
+  let truncated = false;
+  for (const character of value) {
+    if (count >= maxChars) {
+      truncated = true;
+      break;
+    }
+    prefix += character;
+    count += 1;
+  }
+  if (!truncated) {
+    return value;
+  }
+
+  const marker = "\n\n…（输出已截断）";
+  const markerChars = [...marker];
+  if (maxChars <= markerChars.length) {
+    return markerChars.slice(0, maxChars).join("");
+  }
+  const contentChars = [...prefix];
+  return `${contentChars.slice(0, maxChars - markerChars.length).join("").trimEnd()}${marker}`;
 }
 
 function inferCodexFailureHint(finalText: string, stderr: string): string | null {

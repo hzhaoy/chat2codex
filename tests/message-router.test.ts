@@ -1269,6 +1269,43 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("caps the total final answer before creating durable chat deliveries", async () => {
+    const codex = new SequencedCodex([{
+      threadId: "thread_bounded_output",
+      finalText: `开头-${"结果".repeat(200)}-结尾不应出现`,
+      stderr: "",
+      exitCode: 0,
+    }]);
+    await withRouterAndCodex(
+      { CHAT_OUTPUT_MAX_CHARS: "64" },
+      codex,
+      async ({ router, config, sender }) => {
+        await router.accept({
+          messageId: "m_bounded_chat_output",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "produce a large answer",
+        });
+
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await waitForState(
+          store,
+          (state) => state.jobs.m_bounded_chat_output?.status === "completed",
+        );
+        await waitFor(() => sender.messages.some((message) => message.kind === "markdown"));
+
+        const delivered = sender.messages
+          .filter((message) => message.kind === "markdown")
+          .map((message) => message.text)
+          .join("");
+        expect([...delivered].length).toBeLessThanOrEqual(64);
+        expect(delivered).toContain("输出已截断");
+        expect(delivered).not.toContain("结尾不应出现");
+      },
+    );
+  });
+
   test("marks a running durable job interrupted on restart without rerunning Codex", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-interrupted-"));
     try {
