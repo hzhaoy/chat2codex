@@ -4,6 +4,11 @@ export const runCardActionApp = "chat2codex";
 export const stopRunCardAction = "stop_run";
 export const retryRunCardAction = "retry_run";
 export const resolveApprovalCardAction = "resolve_approval";
+export const answerUserInputCardAction = "answer_user_input";
+export const cancelUserInputCardAction = "cancel_user_input";
+export const resolvePermissionApprovalCardAction = "resolve_permission_approval";
+export const answerMcpElicitationCardAction = "answer_mcp_elicitation";
+export const resolveMcpElicitationCardAction = "resolve_mcp_elicitation";
 export const selectProjectCardAction = "select_project";
 export const resumeThreadCardAction = "resume_thread";
 export const pageProjectsCardAction = "page_projects";
@@ -22,6 +27,11 @@ export type RunCardActionKind =
   | typeof stopRunCardAction
   | typeof retryRunCardAction
   | typeof resolveApprovalCardAction
+  | typeof answerUserInputCardAction
+  | typeof cancelUserInputCardAction
+  | typeof resolvePermissionApprovalCardAction
+  | typeof answerMcpElicitationCardAction
+  | typeof resolveMcpElicitationCardAction
   | typeof selectProjectCardAction
   | typeof resumeThreadCardAction
   | typeof pageProjectsCardAction
@@ -29,6 +39,11 @@ export type RunCardActionKind =
   | typeof showRunDetailCardAction;
 export type CardActionToastType = "success" | "warning" | "error" | "info";
 export type RunDetailKind = "summary" | "files" | "diff" | "logs";
+export type PermissionApprovalCardDecision = "deny" | "grantTurn" | "grantSession";
+export type McpElicitationCardDecision = "accept" | "decline" | "cancel" | "skip";
+export type InteractiveCardDecision =
+  | PermissionApprovalCardDecision
+  | McpElicitationCardDecision;
 
 export interface IncomingCardAction {
   action: RunCardActionKind;
@@ -37,6 +52,12 @@ export interface IncomingCardAction {
   sender: SenderIdentity;
   approvalId?: string;
   decisionIndex?: number;
+  userInputId?: string;
+  questionId?: string;
+  optionIndex?: number;
+  requestId?: string;
+  fieldId?: string;
+  decision?: InteractiveCardDecision;
   detailKind?: RunDetailKind;
   projectIndex?: number;
   threadIndex?: number;
@@ -108,6 +129,12 @@ export function adaptLarkCardActionEvent(event: unknown): IncomingCardAction | n
     },
     approvalId: getString(value, "approvalId"),
     decisionIndex: getNumber(value, "decisionIndex"),
+    userInputId: getString(value, "userInputId"),
+    questionId: getString(value, "questionId"),
+    optionIndex: getBoundedIndex(value, "optionIndex", 9),
+    requestId: getBoundedString(value, "requestId", 128),
+    fieldId: getBoundedString(value, "fieldId", 128),
+    decision: getInteractiveCardDecision(actionKind, value),
     detailKind: getRunDetailKind(value),
     projectIndex: getNumber(value, "projectIndex"),
     threadIndex: getNumber(value, "threadIndex"),
@@ -134,6 +161,11 @@ function getRunCardActionKind(value: unknown): RunCardActionKind | null {
     action === stopRunCardAction ||
     action === retryRunCardAction ||
     action === resolveApprovalCardAction ||
+    action === answerUserInputCardAction ||
+    action === cancelUserInputCardAction ||
+    action === resolvePermissionApprovalCardAction ||
+    action === answerMcpElicitationCardAction ||
+    action === resolveMcpElicitationCardAction ||
     action === selectProjectCardAction ||
     action === resumeThreadCardAction ||
     action === pageProjectsCardAction ||
@@ -143,6 +175,29 @@ function getRunCardActionKind(value: unknown): RunCardActionKind | null {
     return action;
   }
   return null;
+}
+
+function getInteractiveCardDecision(
+  action: RunCardActionKind,
+  record: Record<string, unknown> | null,
+): InteractiveCardDecision | undefined {
+  const value = getString(record, "decision");
+  if (
+    action === resolvePermissionApprovalCardAction &&
+    (value === "deny" || value === "grantTurn" || value === "grantSession")
+  ) {
+    return value;
+  }
+  if (
+    action === resolveMcpElicitationCardAction &&
+    (value === "accept" || value === "decline" || value === "cancel")
+  ) {
+    return value;
+  }
+  if (action === answerMcpElicitationCardAction && value === "skip") {
+    return value;
+  }
+  return undefined;
 }
 
 function getRunDetailKind(record: Record<string, unknown> | null): RunDetailKind | undefined {
@@ -162,7 +217,25 @@ function getString(record: Record<string, unknown> | null, key: string): string 
   return typeof value === "string" && value ? value : undefined;
 }
 
+function getBoundedString(
+  record: Record<string, unknown> | null,
+  key: string,
+  maxLength: number,
+): string | undefined {
+  const value = getString(record, key);
+  return value !== undefined && value.length <= maxLength ? value : undefined;
+}
+
 function getNumber(record: Record<string, unknown> | null, key: string): number | undefined {
   const value = record?.[key];
   return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+function getBoundedIndex(
+  record: Record<string, unknown> | null,
+  key: string,
+  max: number,
+): number | undefined {
+  const value = getNumber(record, key);
+  return value !== undefined && value >= 0 && value <= max ? value : undefined;
 }

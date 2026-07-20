@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { config as loadDotenv } from "dotenv";
 import { ZodError } from "zod";
@@ -10,8 +9,14 @@ import { buildCodexChildEnv } from "./agent/codex-environment.js";
 import { runBridge } from "./bot/lark-bot.js";
 import { loadConfig } from "./config/env.js";
 import { defaultChat2CodexHome, defaultEnvPath } from "./config/paths.js";
+import {
+  packageRoot,
+  protocolManifestPath,
+  readBundledProtocolManifest,
+  readPackageVersion,
+} from "./package-info.js";
 import { acquireBridgeInstanceLock } from "./state/instance-lock.js";
-import { ConsoleLogger } from "./util/logger.js";
+import { ConsoleLogger, type Logger } from "./util/logger.js";
 
 type CliCommand =
   | "doctor"
@@ -24,10 +29,15 @@ type CliCommand =
   | "start"
   | "version";
 
-interface DoctorCheck {
+export interface DoctorCheck {
   label: string;
   status: "ok" | "warn" | "error";
   detail?: string;
+}
+
+interface CommandCheckResult {
+  check: DoctorCheck;
+  output: string | null;
 }
 
 interface InitOptions {
@@ -42,6 +52,25 @@ interface EnvBackedOptions {
   help: boolean;
 }
 
+type ShutdownSignal = "SIGINT" | "SIGTERM";
+
+export interface GracefulShutdownController {
+  done: Promise<void>;
+  request(signal: ShutdownSignal): void;
+}
+
+interface GracefulShutdownOptions {
+  forceExit?: (code: number) => void;
+  timeoutMs?: number;
+}
+
+interface UncaughtExceptionHandlerOptions {
+  forceExit?: (code: number) => void;
+  setExitCode?: (code: number) => void;
+}
+
+const defaultShutdownTimeoutMs = 10_000;
+
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const { command, args } = parseCommand(argv);
 
@@ -50,7 +79,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       printHelp();
       return;
     case "version":
-      console.log(await packageVersion());
+      console.log(await readPackageVersion());
       return;
     case "start":
       await runStart(args);
@@ -131,26 +160,167 @@ Options:
 
   loadRuntimeEnv(options.envFile);
   const config = loadConfig(process.env);
-  const logger = new ConsoleLogger(config.logLevel);
+  const logger = new ConsoleLogger(config.logLevel, {
+    filePath: process.env.CHAT2CODEX_LOG_FILE,
+    maxEntryBytes: config.logEntryMaxBytes,
+    maxFileBytes: config.logFileMaxBytes,
+    maxFiles: config.logFileMaxFiles,
+  });
 
-  process.on("unhandledRejection", (error) => {
+  let runtime: Awaited<ReturnType<typeof runBridge>> | undefined;
+  let instanceLock: Awaited<ReturnType<typeof acquireBridgeInstanceLock>> | undefined;
+  let shutdown: GracefulShutdownController | undefined;
+  let instanceLockCompromised = false;
+  const onUnhandledRejection = (error: unknown) => {
     logger.error("Unhandled rejection", error);
-  });
-  process.on("uncaughtException", (error) => {
-    logger.error("Uncaught exception", error);
-    process.exitCode = 1;
+  };
+  const onUncaughtException = createUncaughtExceptionHandler(() => shutdown, logger);
+  process.on("unhandledRejection", onUnhandledRejection);
+  process.on("uncaughtException", onUncaughtException);
+
+  const onSigint = () => shutdown?.request("SIGINT");
+  const onSigterm = () => shutdown?.request("SIGTERM");
+  try {
+    instanceLock = await acquireBridgeInstanceLock(config.bridgeStatePath, (error) => {
+      logger.error("Chat2Codex instance lock was compromised; stopping the bridge", error);
+      instanceLockCompromised = true;
+      process.exitCode = 1;
+      shutdown?.request("SIGTERM");
+    });
+    let resolveRuntimeReady!: (
+      runtime: Awaited<ReturnType<typeof runBridge>> | undefined,
+    ) => void;
+    const runtimeReady = new Promise<Awaited<ReturnType<typeof runBridge>> | undefined>(
+      (resolve) => {
+        resolveRuntimeReady = resolve;
+      },
+    );
+    shutdown = createGracefulShutdownController(async () => {
+      await (await runtimeReady)?.dispose();
+    }, logger);
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+    if (instanceLockCompromised) {
+      shutdown.request("SIGTERM");
+    }
+    try {
+      runtime = await runBridge(config, logger);
+    } finally {
+      resolveRuntimeReady(runtime);
+    }
+    await shutdown.done;
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    process.removeListener("uncaughtException", onUncaughtException);
+    try {
+      await runtime?.dispose();
+    } finally {
+      await instanceLock?.release();
+    }
+  }
+}
+
+export function createGracefulShutdownController(
+  dispose: () => Promise<void>,
+  logger: Logger,
+  options: GracefulShutdownOptions = {},
+): GracefulShutdownController {
+  const timeoutMs = options.timeoutMs ?? defaultShutdownTimeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Graceful shutdown timeout must be a positive safe integer.");
+  }
+
+  const forceExit = options.forceExit ?? ((code: number) => process.exit(code));
+  let firstSignal: ShutdownSignal | undefined;
+  let settled = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let resolveDone!: () => void;
+  let rejectDone!: (error: unknown) => void;
+  const done = new Promise<void>((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
   });
 
-  const instanceLock = await acquireBridgeInstanceLock(config.bridgeStatePath, (error) => {
-    logger.error("Chat2Codex instance lock was compromised; stopping the bridge", error);
-    process.exit(1);
-  });
-  try {
-    await runBridge(config, logger);
-  } catch (error) {
-    await instanceLock.release();
-    throw error;
-  }
+  const clearShutdownTimer = () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
+  const request = (signal: ShutdownSignal) => {
+    if (settled) {
+      return;
+    }
+    if (firstSignal) {
+      logger.warn("Received a second shutdown signal; forcing exit", { signal });
+      forceExit(shutdownExitCode(signal));
+      return;
+    }
+
+    firstSignal = signal;
+    logger.info("Received shutdown signal; stopping the bridge", { signal, timeoutMs });
+    timer = setTimeout(() => {
+      logger.error("Graceful shutdown timed out; forcing exit", { signal, timeoutMs });
+      forceExit(shutdownExitCode(signal));
+    }, timeoutMs);
+
+    void Promise.resolve()
+      .then(dispose)
+      .then(
+        () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearShutdownTimer();
+          logger.info("Bridge shutdown complete");
+          resolveDone();
+        },
+        (error: unknown) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearShutdownTimer();
+          logger.error("Bridge shutdown failed", error);
+          rejectDone(error);
+        },
+      );
+  };
+
+  return { done, request };
+}
+
+export function createUncaughtExceptionHandler(
+  getShutdown: () => GracefulShutdownController | undefined,
+  logger: Logger,
+  options: UncaughtExceptionHandlerOptions = {},
+): (error: Error) => void {
+  const forceExit = options.forceExit ?? ((code: number) => process.exit(code));
+  const setExitCode =
+    options.setExitCode ??
+    ((code: number) => {
+      process.exitCode = code;
+    });
+
+  return (error: Error) => {
+    logger.error("Uncaught exception", error);
+    setExitCode(1);
+    const activeShutdown = getShutdown();
+    if (!activeShutdown) {
+      logger.error("Uncaught exception occurred before graceful shutdown was available");
+      forceExit(1);
+      return;
+    }
+    activeShutdown.request("SIGTERM");
+  };
+}
+
+function shutdownExitCode(signal: ShutdownSignal): number {
+  return signal === "SIGINT" ? 130 : 143;
 }
 
 async function runSetup(args: string[]): Promise<void> {
@@ -208,7 +378,7 @@ Options:
 
 async function runDoctor(args: string[]): Promise<void> {
   const options = parseEnvBackedArgs(args, "doctor");
-  if (args[0] === "-h" || args[0] === "--help") {
+  if (options.help) {
     console.log(`Usage: chat2codex doctor [options]
 
 Checks .env, Node.js, Codex CLI, CODEX_WORKDIR, and runtime directories.
@@ -240,7 +410,9 @@ Options:
   }
 
   const codexBin = config?.codexBin ?? process.env.CODEX_BIN ?? "codex";
-  checks.push(checkCommand(codexBin, ["--version"], "Codex CLI"));
+  const codexCommand = checkCommand(codexBin, ["--version"], "Codex CLI");
+  checks.push(codexCommand.check);
+  checks.push(await checkCodexProtocolCompatibility(codexCommand.output));
 
   if (config) {
     checks.push(await checkDirectory(config.codexWorkdir, "CODEX_WORKDIR"));
@@ -355,13 +527,6 @@ function requireValue(argv: string[], index: number, flag: string): string {
   return value;
 }
 
-async function packageVersion(): Promise<string> {
-  const packageJson = JSON.parse(await fs.readFile(path.join(packageRoot(), "package.json"), "utf8")) as {
-    version?: string;
-  };
-  return packageJson.version ?? "unknown";
-}
-
 async function readEnvExample(): Promise<string> {
   const local = path.resolve(".env.example");
   const bundled = path.join(packageRoot(), ".env.example");
@@ -379,8 +544,44 @@ function loadRuntimeEnv(envFile: string): void {
   process.env.CHAT2CODEX_HOME ??= defaultChat2CodexHome();
 }
 
-function packageRoot(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export async function checkCodexProtocolCompatibility(
+  actualVersion: string | null,
+  manifestPath = protocolManifestPath(),
+): Promise<DoctorCheck> {
+  let expectedVersion: string;
+  try {
+    const manifest = await readBundledProtocolManifest(manifestPath);
+    expectedVersion = manifest.codexVersion.trim();
+  } catch (error) {
+    return {
+      label: "Codex protocol",
+      status: "warn",
+      detail: `could not read the bundled protocol manifest at ${manifestPath}: ${formatError(error)}. Reinstall Chat2Codex or, from a source checkout, run chat2codex protocol generate; then run chat2codex smoke.`,
+    };
+  }
+
+  if (actualVersion === null) {
+    return {
+      label: "Codex protocol",
+      status: "warn",
+      detail: `could not compare against the bundled app-server schema for ${expectedVersion} because codex --version failed`,
+    };
+  }
+
+  const installedVersion = actualVersion.trim();
+  if (installedVersion === expectedVersion) {
+    return {
+      label: "Codex protocol",
+      status: "ok",
+      detail: `${installedVersion} matches the bundled app-server schema`,
+    };
+  }
+
+  return {
+    label: "Codex protocol",
+    status: "warn",
+    detail: `installed ${installedVersion || "Codex CLI returned no version"}; the bundled app-server schema was generated with ${expectedVersion}. Run chat2codex smoke; if the upgrade is intentional, run chat2codex protocol generate and review the schema diff.`,
+  };
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -422,22 +623,29 @@ function checkNodeVersion(version: string): DoctorCheck {
   };
 }
 
-function checkCommand(command: string, args: string[], label: string): DoctorCheck {
+function checkCommand(command: string, args: string[], label: string): CommandCheckResult {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     env: buildCodexChildEnv(),
   });
   if (result.status === 0) {
+    const output = result.stdout.trim();
     return {
-      label,
-      status: "ok",
-      detail: result.stdout.trim() || command,
+      check: {
+        label,
+        status: "ok",
+        detail: output || command,
+      },
+      output,
     };
   }
   return {
-    label,
-    status: "error",
-    detail: `failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout || "not found"}`,
+    check: {
+      label,
+      status: "error",
+      detail: `failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout || "not found"}`,
+    },
+    output: null,
   };
 }
 
@@ -523,6 +731,10 @@ function formatConfigError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatEnvValue(value: string): string {

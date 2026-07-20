@@ -7,6 +7,108 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.5.0 - 2026-07-20
+
+### Added
+
+- `/plan <task>` now runs one turn with the app-server Plan collaboration mode,
+  making Codex `request_user_input` available without leaving later ordinary
+  messages in Plan mode.
+- Codex `item/tool/requestUserInput` requests can now pause a turn for
+  sender-bound Feishu/Lark card answers or an explicit
+  `/answer <reply-code> <value>` text reply. Multi-question requests support
+  option selection, free-form answers, skip, cancel, and server-side validation.
+- Standard MCP form and URL elicitations now use sender-bound Feishu/Lark cards.
+  Typed form fields support
+  `/mcp-answer <reply-code> <JSON-quoted-field-id> <value>` and are revalidated
+  against the original schema before submission.
+- Codex `item/permissions/requestApproval` requests now use complete-profile
+  approval cards with deny, turn-scoped grant, and session-scoped grant
+  decisions.
+- Codex runs now persist a durable job and terminal-reply outbox. A reply-send
+  failure retries the stored delivery with a stable idempotency key instead of
+  executing the Codex turn again; runs interrupted by a bridge restart are
+  reported for manual inspection rather than replayed automatically.
+- Consecutive turns in the same chat/thread scope now reuse one Codex app-server
+  process, preserving session-scoped grants until the sender, cwd, thread,
+  policy, or session epoch changes. Idle TTL and LRU session-cap settings bound
+  the resident process pool.
+
+### Changed
+
+- Added configurable global Codex concurrency and global/per-chat durable queue
+  limits. Admission counts active jobs, undelivered replies, and pending control
+  messages; tasks that exceed a limit are rejected before Codex runs, while
+  in-turn approval/input waits share the same pending-count ceilings.
+- Restart recovery replays read-only control commands, but does not replay
+  mutating or run-targeted controls such as `/new`, `/stop`, or `/steer` onto a
+  different task. Previously non-Codex messages cannot be promoted into a Codex
+  run solely because access or routing configuration changed during restart.
+- Added attachment count, per-file, per-message, and store quotas with streamed
+  downloads, atomic finalization, and lazy retention cleanup.
+- Bounded chat replies, Codex stderr, captured command count/output, run diffs,
+  and structured log entries. File logs now rotate by configured size/count.
+- Terminal jobs and delivered outbox records now use configurable count-based
+  retention while active jobs and undelivered replies remain protected.
+- `SIGINT` and `SIGTERM` now stop the Lark connection and all reusable,
+  single-use, and transient Codex children before releasing the instance lock;
+  queued durable jobs remain available for restart recovery.
+
+### Fixed
+
+- Reusable sessions now restart once when an app-server exits before the next
+  turn is submitted, closing an idle-process exit race without replaying turns
+  that may already have started.
+
+### Security
+
+- Secret `requestUserInput` questions fail closed because ordinary chat
+  messages cannot provide a non-persistent masked-input channel. User-input
+  request fields are bounded, withdrawn requests suppress late callbacks, and
+  answers are neither echoed in terminal cards nor retained in bridge state.
+- `requestUserInput` and MCP text answers bypass durable message/job storage and
+  are not echoed by the bridge. Secret or sensitive fields fail closed.
+- Additional-permission grants accept only `grantTurn` or `grantSession` and
+  always clone the runner's original requested profile; card payloads cannot
+  substitute permissions or enable `strictAutoReview`. Permission and MCP card
+  callbacks are bound to the original sender and card message, and late or
+  malformed actions fail closed.
+- Reusable sessions are keyed by stable sender identity and canonical execution
+  scope. Thread ownership is exclusive, late turn/request events are generation
+  checked, and messages without a stable sender identity fall back to a
+  single-turn process so they cannot inherit session grants.
+
+## 0.4.1 - 2026-07-19
+
+### Changed
+
+- GitHub Releases now use the matching `CHANGELOG.md` version section for
+  structured Added, Changed, and Fixed notes while retaining the full compare
+  link.
+- `chat2codex doctor` now compares the detected Codex CLI version with the
+  bundled app-server protocol snapshot and warns when compatibility needs to be
+  verified with smoke tests.
+- Replaced the deprecated rollback roadmap item with non-destructive
+  fork-from-history-turn guidance and updated the security support policy for
+  versioned releases.
+
+### Fixed
+
+- Unknown app-server server requests now return a method-not-found error, while
+  malformed approval requests fail closed without exposing or inventing an
+  approval option; MCP elicitations and additional-permission requests receive
+  explicit safe cancellation/denial responses.
+- Approval cards now disclose additional permissions and exact exec/network
+  policy rules, suppressing allow actions whenever security details cannot be
+  rendered completely. File-change requests without target/patch disclosure are
+  limited to decline/cancel, and card callbacks recheck the same decision filter
+  server-side.
+- Approval callbacks now fail closed for synchronous and asynchronous errors,
+  and each request receives a globally unique internal card key so concurrent
+  app-server connections cannot collide on reused JSON-RPC ids.
+
+## 0.4.0 - 2026-07-17
+
 ### Added
 
 - New chat commands: `/history`, `/search <term>`, `/fork`, and `/compact` for

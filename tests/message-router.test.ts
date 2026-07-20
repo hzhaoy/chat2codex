@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -7,10 +7,16 @@ import { describe, expect, test } from "bun:test";
 import type {
   CodexApprovalDecision,
   CodexApprovalRequest,
+  CodexMcpElicitationRequest,
+  CodexMcpElicitationResponse,
+  CodexPermissionApprovalDecision,
+  CodexPermissionApprovalRequest,
   CodexRunControl,
   CodexProgressUpdate,
   CodexRunInput,
   CodexRunResult,
+  CodexUserInputRequest,
+  CodexUserInputResponse,
   CodexThread,
   CodexThreadItem,
   CodexThreadListInput,
@@ -27,7 +33,10 @@ import type {
 import type {
   ApprovalCardInput,
   LarkInteractiveCard,
+  McpElicitationCardInput,
+  PermissionApprovalCardInput,
   RunStatusCardInput,
+  UserInputCardInput,
 } from "../src/bot/lark-card.js";
 import {
   MessageRouter,
@@ -51,6 +60,17 @@ const silentLogger: Logger = {
   error() {},
 };
 
+class ToggleFailingStateStore extends JsonStateStore {
+  failSaves = false;
+
+  override async save(state: Parameters<JsonStateStore["save"]>[0]): Promise<void> {
+    if (this.failSaves) {
+      throw new Error("simulated state save failure");
+    }
+    await super.save(state);
+  }
+}
+
 class CollectingSender implements ChatSender {
   readonly messages: Array<{ chatId: string; text: string; kind: "text" | "markdown" }> = [];
 
@@ -70,6 +90,104 @@ class FailingDeliverySender implements ChatSender {
 
   async sendMarkdown(): Promise<void> {
     throw new Error("simulated delivery failure");
+  }
+}
+
+class FinalFailingSender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendMarkdown(
+    _chatId: string,
+    _markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+    }
+    throw new Error("simulated final delivery failure");
+  }
+}
+
+class TransientFinalDeliverySender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+  attempts = 0;
+
+  override async sendMarkdown(
+    chatId: string,
+    markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    this.attempts += 1;
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+    }
+    if (this.attempts === 1) {
+      throw new Error("simulated transient final delivery failure");
+    }
+    await super.sendMarkdown(chatId, markdown);
+  }
+}
+
+class PersistentDurableDeliveryFailingSender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendText(
+    chatId: string,
+    text: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+      throw new Error("simulated persistent durable delivery failure");
+    }
+    await super.sendText(chatId, text);
+  }
+
+  override async sendMarkdown(
+    chatId: string,
+    markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+      throw new Error("simulated persistent durable delivery failure");
+    }
+    await super.sendMarkdown(chatId, markdown);
+  }
+}
+
+class ToggleControlDeliverySender extends CollectingSender {
+  failControl = false;
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendText(
+    chatId: string,
+    text: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+      throw new Error("simulated persistent durable delivery failure");
+    }
+    if (this.failControl) {
+      throw new Error("simulated transient control delivery failure");
+    }
+    await super.sendText(chatId, text);
+  }
+}
+
+class IdempotencyCollectingSender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendMarkdown(
+    chatId: string,
+    markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+    }
+    await super.sendMarkdown(chatId, markdown);
   }
 }
 
@@ -96,6 +214,33 @@ class CardCollectingSender extends CollectingSender {
   readonly approvalCardUpdates: Array<{
     handle: StatusCardHandle;
     input: ApprovalCardInput;
+  }> = [];
+  readonly userInputCards: Array<{
+    chatId: string;
+    input: UserInputCardInput;
+    handle: StatusCardHandle;
+  }> = [];
+  readonly userInputCardUpdates: Array<{
+    handle: StatusCardHandle;
+    input: UserInputCardInput;
+  }> = [];
+  readonly permissionApprovalCards: Array<{
+    chatId: string;
+    input: PermissionApprovalCardInput;
+    handle: StatusCardHandle;
+  }> = [];
+  readonly permissionApprovalCardUpdates: Array<{
+    handle: StatusCardHandle;
+    input: PermissionApprovalCardInput;
+  }> = [];
+  readonly mcpElicitationCards: Array<{
+    chatId: string;
+    input: McpElicitationCardInput;
+    handle: StatusCardHandle;
+  }> = [];
+  readonly mcpElicitationCardUpdates: Array<{
+    handle: StatusCardHandle;
+    input: McpElicitationCardInput;
   }> = [];
 
   async createStatusCard(chatId: string, input: RunStatusCardInput): Promise<StatusCardHandle> {
@@ -124,6 +269,87 @@ class CardCollectingSender extends CollectingSender {
 
   async updateApprovalCard(handle: StatusCardHandle, input: ApprovalCardInput): Promise<void> {
     this.approvalCardUpdates.push({ handle, input });
+  }
+
+  async createUserInputCard(
+    chatId: string,
+    input: UserInputCardInput,
+  ): Promise<StatusCardHandle> {
+    const handle = { messageId: `omu_${this.userInputCards.length + 1}` };
+    this.userInputCards.push({ chatId, input, handle });
+    return handle;
+  }
+
+  async updateUserInputCard(
+    handle: StatusCardHandle,
+    input: UserInputCardInput,
+  ): Promise<void> {
+    this.userInputCardUpdates.push({ handle, input });
+  }
+
+  async createPermissionApprovalCard(
+    chatId: string,
+    input: PermissionApprovalCardInput,
+  ): Promise<StatusCardHandle> {
+    const handle = { messageId: `omp_${this.permissionApprovalCards.length + 1}` };
+    this.permissionApprovalCards.push({ chatId, input, handle });
+    return handle;
+  }
+
+  async updatePermissionApprovalCard(
+    handle: StatusCardHandle,
+    input: PermissionApprovalCardInput,
+  ): Promise<void> {
+    this.permissionApprovalCardUpdates.push({ handle, input });
+  }
+
+  async createMcpElicitationCard(
+    chatId: string,
+    input: McpElicitationCardInput,
+  ): Promise<StatusCardHandle> {
+    const handle = { messageId: `omm_${this.mcpElicitationCards.length + 1}` };
+    this.mcpElicitationCards.push({ chatId, input, handle });
+    return handle;
+  }
+
+  async updateMcpElicitationCard(
+    handle: StatusCardHandle,
+    input: McpElicitationCardInput,
+  ): Promise<void> {
+    this.mcpElicitationCardUpdates.push({ handle, input });
+  }
+}
+
+class FailingUserInputCardSender extends CardCollectingSender {
+  readonly userInputCardAttempts: Array<{ chatId: string; input: UserInputCardInput }> = [];
+
+  override async createUserInputCard(
+    chatId: string,
+    input: UserInputCardInput,
+  ): Promise<StatusCardHandle> {
+    this.userInputCardAttempts.push({ chatId, input });
+    throw new Error("simulated user-input card failure");
+  }
+}
+
+class FailingUserInputPresentationSender extends FailingUserInputCardSender {
+  override async sendText(): Promise<void> {
+    throw new Error("simulated user-input fallback failure");
+  }
+}
+
+class FailingPermissionApprovalCardSender extends CardCollectingSender {
+  readonly permissionApprovalCardAttempts: Array<{
+    chatId: string;
+    input: PermissionApprovalCardInput;
+  }> = [];
+
+  override async createPermissionApprovalCard(
+    chatId: string,
+    input: PermissionApprovalCardInput,
+  ): Promise<StatusCardHandle> {
+    this.permissionApprovalCardAttempts.push({ chatId, input });
+    throw new Error("simulated permission-approval card failure");
   }
 }
 
@@ -155,18 +381,44 @@ class DelayedStatusCardSender extends CardCollectingSender {
   }
 }
 
+class DelayedTextSender extends CollectingSender {
+  readonly sendStarted = deferred<void>();
+  readonly releaseSend = deferred<void>();
+
+  override async sendText(chatId: string, text: string): Promise<void> {
+    this.sendStarted.resolve();
+    await this.releaseSend.promise;
+    await super.sendText(chatId, text);
+  }
+}
+
 class AttachmentCollectingSender extends CollectingSender {
   readonly downloads: Array<{ messageId: string; attachment: IncomingAttachment }> = [];
+  readonly downloadedPaths: string[] = [];
+  readonly contentsByKey = new Map<string, string>();
+  private attachmentRoot = "/tmp/chat2codex-downloads";
+
+  setAttachmentRoot(attachmentRoot: string): void {
+    this.attachmentRoot = attachmentRoot;
+  }
 
   async downloadAttachment(
     message: IncomingTextMessage,
     attachment: IncomingAttachment,
   ): Promise<DownloadedAttachment> {
     this.downloads.push({ messageId: message.messageId, attachment });
+    const filePath = path.join(
+      this.attachmentRoot,
+      message.messageId,
+      attachment.name ?? attachment.key,
+    );
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, this.contentsByKey.get(attachment.key) ?? "attachment");
+    this.downloadedPaths.push(filePath);
     return {
       kind: attachment.kind,
       name: attachment.name,
-      path: `/tmp/chat2codex-downloads/${attachment.name ?? attachment.key}`,
+      path: filePath,
     };
   }
 }
@@ -187,6 +439,61 @@ class FakeCodex implements CodexClient {
       stderr: "",
       exitCode: 0,
     };
+  }
+}
+
+class SessionAwareCodex extends FakeCodex {
+  readonly invalidations: Array<{ chatId: string; reason?: string }> = [];
+  disposeCount = 0;
+
+  override async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const threadId = input.threadId ?? "thread_session";
+    await input.onThreadBound?.(threadId);
+    return {
+      threadId,
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  async invalidateChatSession(chatId: string, reason?: string): Promise<void> {
+    this.invalidations.push({ chatId, reason });
+  }
+
+  async dispose(): Promise<void> {
+    this.disposeCount += 1;
+  }
+}
+
+class EarlyBindingCodex extends SessionAwareCodex {
+  readonly threadBound = deferred<void>();
+  readonly continueTurn = deferred<void>();
+  turnContinued = false;
+
+  override async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const threadId = input.threadId ?? "thread_early_bound";
+    await input.onThreadBound?.(threadId);
+    this.threadBound.resolve();
+    await Promise.race([
+      this.continueTurn.promise,
+      new Promise<void>((resolve) => input.signal?.addEventListener("abort", () => resolve(), { once: true })),
+    ]);
+    this.turnContinued = true;
+    return {
+      threadId,
+      finalText: input.signal?.aborted ? "" : "done",
+      stderr: "",
+      exitCode: input.signal?.aborted ? null : 0,
+      cancelled: input.signal?.aborted,
+    };
+  }
+
+  override async dispose(): Promise<void> {
+    this.continueTurn.resolve();
+    await super.dispose();
   }
 }
 
@@ -285,6 +592,14 @@ class ListingCodex extends FakeCodex {
   }
 }
 
+class LifecycleCodex extends ListingCodex {
+  readonly invalidations: Array<{ chatId: string; reason?: string }> = [];
+
+  async invalidateChatSession(chatId: string, reason?: string): Promise<void> {
+    this.invalidations.push({ chatId, reason });
+  }
+}
+
 class ResumeReadFailingCodex extends ListingCodex {
   override async run(input: CodexRunInput): Promise<CodexRunResult> {
     this.runs.push(input);
@@ -344,6 +659,14 @@ class BlockingCodex implements CodexClient {
       }
       input.signal?.addEventListener("abort", finishCancelled, { once: true });
     });
+  }
+}
+
+class DisposableBlockingCodex extends BlockingCodex {
+  disposeCount = 0;
+
+  async dispose(): Promise<void> {
+    this.disposeCount += 1;
   }
 }
 
@@ -418,16 +741,139 @@ class FirstBlockingThenDoneCodex implements CodexClient {
 
 class ApprovalCodex implements CodexClient {
   readonly runs: CodexRunInput[] = [];
+  readonly decisions: Array<{ prompt: string; decision: CodexApprovalDecision | undefined }> = [];
   decision: CodexApprovalDecision | undefined;
 
   constructor(private readonly request: CodexApprovalRequest) {}
 
   async run(input: CodexRunInput): Promise<CodexRunResult> {
     this.runs.push(input);
-    this.decision = await input.onApprovalRequest?.(this.request);
+    const decision = await input.onApprovalRequest?.(this.request);
+    this.decision = decision;
+    this.decisions.push({ prompt: input.prompt, decision });
     return {
       threadId: "thread_test",
-      finalText: `decision=${formatDecisionForTest(this.decision)}`,
+      finalText: `decision=${formatDecisionForTest(decision)}`,
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+}
+
+class UserInputCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly requestStarted = deferred<void>();
+  response: CodexUserInputResponse | undefined;
+  private requestController: AbortController | undefined;
+
+  constructor(private readonly request: CodexUserInputRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    this.requestController = new AbortController();
+    const abortRequest = () => this.requestController?.abort();
+    input.signal?.addEventListener("abort", abortRequest, { once: true });
+    this.requestStarted.resolve();
+    try {
+      this.response = await input.onUserInputRequest?.(this.request, {
+        signal: this.requestController.signal,
+      });
+    } finally {
+      input.signal?.removeEventListener("abort", abortRequest);
+    }
+    return {
+      threadId: "thread_test",
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  abortRequest(): void {
+    this.requestController?.abort();
+  }
+}
+
+class PermissionApprovalCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly requestStarted = deferred<void>();
+  decision: CodexPermissionApprovalDecision | undefined;
+  private requestController: AbortController | undefined;
+
+  constructor(private readonly request: CodexPermissionApprovalRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    this.requestController = new AbortController();
+    const abortRequest = () => this.requestController?.abort();
+    input.signal?.addEventListener("abort", abortRequest, { once: true });
+    this.requestStarted.resolve();
+    try {
+      this.decision = await input.onPermissionApprovalRequest?.(this.request, {
+        signal: this.requestController.signal,
+      });
+    } finally {
+      input.signal?.removeEventListener("abort", abortRequest);
+    }
+    return {
+      threadId: "thread_test",
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  abortRequest(): void {
+    this.requestController?.abort();
+  }
+}
+
+class McpElicitationCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly requestStarted = deferred<void>();
+  response: CodexMcpElicitationResponse | undefined;
+  private requestController: AbortController | undefined;
+
+  constructor(private readonly request: CodexMcpElicitationRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    this.requestController = new AbortController();
+    const abortRequest = () => this.requestController?.abort();
+    input.signal?.addEventListener("abort", abortRequest, { once: true });
+    this.requestStarted.resolve();
+    try {
+      this.response = await input.onMcpElicitationRequest?.(this.request, {
+        signal: this.requestController.signal,
+      });
+    } finally {
+      input.signal?.removeEventListener("abort", abortRequest);
+    }
+    return {
+      threadId: "thread_test",
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  abortRequest(): void {
+    this.requestController?.abort();
+  }
+}
+
+class FireAndForgetUserInputCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+
+  constructor(private readonly request: CodexUserInputRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const controller = new AbortController();
+    void input.onUserInputRequest?.(this.request, { signal: controller.signal });
+    return {
+      threadId: "thread_test",
+      finalText: "done",
       stderr: "",
       exitCode: 0,
     };
@@ -612,6 +1058,38 @@ class ThrowingCodex implements CodexClient {
 }
 
 describe("MessageRouter access control", () => {
+  test("routes /plan as a single Plan turn and restores Default mode afterward", async () => {
+    await withRouter({}, async ({ router, codex, sender }) => {
+      await router.enqueue({
+        messageId: "m_plan_turn",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/plan ask one question",
+      });
+      await router.enqueue({
+        messageId: "m_default_turn",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "continue normally",
+      });
+      await router.enqueue({
+        messageId: "m_plan_usage",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/plan",
+      });
+
+      expect(codex.runs.map(({ prompt, collaborationMode }) => ({ prompt, collaborationMode }))).toEqual([
+        { prompt: "ask one question", collaborationMode: "plan" },
+        { prompt: "continue normally", collaborationMode: "default" },
+      ]);
+      expect(sender.messages.at(-1)?.text).toBe("用法：/plan <任务>（以 Plan 模式执行这一轮）");
+    });
+  });
+
   test("persists accepted events without waiting for a long Codex run", async () => {
     const codex = new BlockingCodex();
     await withRouterAndCodex({}, codex, async ({ router, config }) => {
@@ -644,6 +1122,80 @@ describe("MessageRouter access control", () => {
       expect(completed.pendingMessages.m_durable).toBeUndefined();
       expect(completed.processedMessageIds).toContain("m_durable");
     });
+  });
+
+  test("graceful disposal interrupts only running jobs and preserves queued inbox work", async () => {
+    const codex = new DisposableBlockingCodex();
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await router.accept({
+        messageId: "m_shutdown_running",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "running during shutdown",
+      });
+      await waitFor(() => codex.runs.length === 1);
+      await waitForState(store, (state) => state.jobs.m_shutdown_running?.status === "running");
+
+      await router.accept({
+        messageId: "m_shutdown_queued",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "queued for restart",
+      });
+      await waitForState(store, (state) => state.jobs.m_shutdown_queued?.status === "queued");
+
+      await router.dispose();
+      await router.dispose();
+
+      const stopped = await store.load();
+      expect(codex.disposeCount).toBe(1);
+      expect(stopped.jobs.m_shutdown_running).toMatchObject({
+        status: "interrupted",
+        interruptionReason: "bridge_shutdown",
+      });
+      expect(stopped.pendingMessages.m_shutdown_running).toBeUndefined();
+      expect(stopped.processedMessageIds).toContain("m_shutdown_running");
+      expect(stopped.jobs.m_shutdown_queued?.status).toBe("queued");
+      expect(stopped.pendingMessages.m_shutdown_queued?.text).toBe("queued for restart");
+      expect(stopped.processedMessageIds).not.toContain("m_shutdown_queued");
+
+      await router.recordEventDiagnostic("routed", {
+        chatId: "oc_chat",
+        mentionCount: 0,
+        startsWithMention: false,
+        attachmentCount: 0,
+        textLength: 4,
+        botIdentityResolved: true,
+      });
+      expect((await store.load()).diagnostics).toEqual(stopped.diagnostics);
+    });
+  });
+
+  test("still disposes Codex children when shutdown state persistence fails", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-dispose-failure-"));
+    const config = loadConfig({
+      FEISHU_APP_ID: "cli_test",
+      FEISHU_APP_SECRET: "secret",
+      CODEX_WORKDIR: tempDir,
+      BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+      ALLOWED_USER_IDS: "ou_user",
+    });
+    const store = new ToggleFailingStateStore(config.bridgeStatePath);
+    const codex = new SessionAwareCodex();
+    const router = new MessageRouter(config, store, new CollectingSender(), silentLogger, codex);
+    try {
+      await router.start();
+      store.failSaves = true;
+      await expect(router.dispose()).rejects.toThrow("simulated state save failure");
+      expect(codex.disposeCount).toBe(1);
+    } finally {
+      store.failSaves = false;
+      await router.dispose().catch(() => undefined);
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   test("serializes Codex runs from different chats that target the same workspace", async () => {
@@ -836,8 +1388,467 @@ describe("MessageRouter access control", () => {
     });
   });
 
-  test("keeps failed deliveries pending and replays them after restart", async () => {
+  test("bounds concurrent Codex runs globally while preserving workspace scheduling", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex(
+      { CODEX_MAX_CONCURRENT_RUNS: "1" },
+      codex,
+      async ({ router, config, sender }) => {
+        const secondWorkspace = path.join(config.codexWorkdir, "globally-limited-workspace");
+        await mkdir(secondWorkspace);
+        await router.enqueue({
+          messageId: "m_global_limit_cd",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: `/cd ${secondWorkspace}`,
+        });
+
+        const first = router.enqueue({
+          messageId: "m_global_limit_1",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "first globally limited task",
+        });
+        const second = router.enqueue({
+          messageId: "m_global_limit_2",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "second globally limited task",
+        });
+
+        await waitFor(() => codex.runs.length === 1);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(codex.runs).toHaveLength(1);
+
+        await router.enqueue({
+          messageId: "m_global_limit_status",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        expect(sender.messages.at(-1)?.text).toContain("state=waiting_for_global_capacity");
+
+        codex.complete(0, "thread_global_limit_1");
+        await waitFor(() => codex.runs.length === 2);
+        codex.complete(1, "thread_global_limit_2");
+        await Promise.all([first, second]);
+      },
+    );
+  });
+
+  test("rejects excess durable jobs atomically without blocking control commands", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "1",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      async ({ router, config, sender }) => {
+        await router.accept({
+          messageId: "m_capacity_running",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "occupy the only queue slot",
+        });
+        await waitFor(() => codex.runs.length === 1);
+
+        await Promise.all([
+          router.accept({
+            messageId: "m_capacity_rejected_1",
+            chatId: "oc_chat_2",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "must not run one",
+          }),
+          router.accept({
+            messageId: "m_capacity_rejected_2",
+            chatId: "oc_chat_3",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "must not run two",
+          }),
+        ]);
+        await waitFor(
+          () => sender.messages.filter((message) => message.text.includes("队列已满")).length === 1,
+        );
+
+        await router.accept({
+          messageId: "m_capacity_status",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitFor(() => sender.messages.some((message) => message.text.includes("active_run:")));
+
+        const store = new JsonStateStore(config.bridgeStatePath);
+        const state = await store.load();
+        expect(state.jobs.m_capacity_rejected_1).toMatchObject({
+          status: "cancelled",
+          interruptionReason: "queue_capacity_reached",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        expect(state.jobs.m_capacity_rejected_2).toBeUndefined();
+        for (const messageId of ["m_capacity_rejected_1", "m_capacity_rejected_2"]) {
+          expect(state.pendingMessages[messageId]).toBeUndefined();
+          expect(state.processedMessageIds).toContain(messageId);
+        }
+        expect(
+          Object.values(state.outbox).find(
+            (delivery) => delivery.jobId === "m_capacity_rejected_1",
+          )?.status,
+        ).toBe("delivered");
+        expect(
+          Object.values(state.outbox).some(
+            (delivery) => delivery.jobId === "m_capacity_rejected_2",
+          ),
+        ).toBe(false);
+        expect(codex.runs).toHaveLength(1);
+
+        codex.complete(0, "thread_capacity_running");
+        await waitForState(store, (saved) => saved.jobs.m_capacity_running?.status === "completed");
+      },
+    );
+  });
+
+  test("applies the pending-job cap per chat without rejecting another chat", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "3",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      async ({ router, config, sender }) => {
+        await router.accept({
+          messageId: "m_per_chat_running",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "occupy this chat slot",
+        });
+        await waitFor(() => codex.runs.length === 1);
+
+        await router.accept({
+          messageId: "m_per_chat_rejected",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "same chat should be rejected",
+        });
+        await router.accept({
+          messageId: "m_other_chat_accepted",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "other chat may queue",
+        });
+        await waitFor(() => sender.messages.some((message) => message.text.includes("队列已满")));
+
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await waitForState(store, (state) => state.jobs.m_other_chat_accepted?.status === "queued");
+        const queued = await store.load();
+        expect(queued.jobs.m_per_chat_rejected?.status).toBe("cancelled");
+        expect(queued.jobs.m_other_chat_accepted?.status).toBe("queued");
+
+        codex.complete(0, "thread_per_chat_running");
+        await waitFor(() => codex.runs.length === 2);
+        codex.complete(1, "thread_other_chat");
+        await waitForState(store, (state) => state.jobs.m_other_chat_accepted?.status === "completed");
+      },
+    );
+  });
+
+  test("bounds durable jobs and outbox retries while delivery keeps failing", async () => {
+    const sender = new PersistentDurableDeliveryFailingSender();
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "1",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await router.accept({
+          messageId: "m_delivery_blocked",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "finish but keep the reply undelivered",
+        });
+        await waitForState(store, (state) =>
+          Object.values(state.outbox).some(
+            (delivery) =>
+              delivery.jobId === "m_delivery_blocked" &&
+              delivery.status === "pending" &&
+              delivery.attempts >= 1,
+          ),
+        );
+
+        const overflowIds = Array.from({ length: 12 }, (_, index) => `m_overflow_${index}`);
+        await Promise.all(
+          overflowIds.map((messageId) =>
+            router.accept({
+              messageId,
+              chatId: "oc_chat",
+              chatType: "direct",
+              sender: { openId: "ou_user" },
+              text: `overflow ${messageId}`,
+            }),
+          ),
+        );
+        await waitForState(store, (state) =>
+          Object.values(state.outbox).some(
+            (delivery) =>
+              delivery.jobId === overflowIds[0] &&
+              delivery.status === "pending" &&
+              delivery.attempts >= 1,
+          ),
+        );
+
+        const blocked = await store.load();
+        expect(codex.runs).toHaveLength(1);
+        expect(Object.keys(blocked.jobs).sort()).toEqual(
+          ["m_delivery_blocked", overflowIds[0]!].sort(),
+        );
+        expect(Object.values(blocked.outbox)).toHaveLength(2);
+        expect(blocked.jobs[overflowIds[0]!]).toMatchObject({
+          status: "cancelled",
+          interruptionReason: "queue_capacity_reached",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        for (const messageId of overflowIds) {
+          expect(blocked.pendingMessages[messageId]).toBeUndefined();
+          expect(blocked.processedMessageIds).toContain(messageId);
+        }
+        expect(sender.idempotencyKeys.length).toBeGreaterThanOrEqual(2);
+      },
+    );
+  });
+
+  test("bounds pending control inbox records while the sender keeps failing", async () => {
+    const sender = new PersistentDurableDeliveryFailingSender();
+    sender.sendText = async (_chatId, _text, options) => {
+      if (options?.idempotencyKey) {
+        sender.idempotencyKeys.push(options.idempotencyKey);
+      }
+      throw new Error("simulated persistent control delivery failure");
+    };
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "1",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await router.accept({
+          messageId: "m_status_blocked",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitForState(
+          store,
+          (state) => state.pendingMessages.m_status_blocked?.attempts === 1,
+        );
+
+        const overflowIds = Array.from(
+          { length: 12 },
+          (_, index) => `m_status_overflow_${index}`,
+        );
+        await Promise.all(
+          overflowIds.map((messageId) =>
+            router.accept({
+              messageId,
+              chatId: "oc_chat",
+              chatType: "direct",
+              sender: { openId: "ou_user" },
+              text: "/status",
+            }),
+          ),
+        );
+        await waitForState(
+          store,
+          (state) =>
+            Object.values(state.outbox).some(
+              (delivery) =>
+                delivery.jobId === overflowIds[0] &&
+                delivery.status === "pending" &&
+                delivery.attempts >= 1,
+            ),
+        );
+
+        const blocked = await store.load();
+        expect(codex.runs).toHaveLength(0);
+        expect(Object.keys(blocked.pendingMessages)).toEqual(["m_status_blocked"]);
+        expect(Object.keys(blocked.jobs)).toEqual([overflowIds[0]]);
+        expect(Object.values(blocked.outbox)).toHaveLength(1);
+        expect(blocked.jobs[overflowIds[0]!]).toMatchObject({
+          kind: "control_recovery",
+          status: "cancelled",
+          interruptionReason: "inbox_capacity_reached",
+          capacityNoticeKind: "inbox",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        for (const messageId of overflowIds) {
+          expect(blocked.processedMessageIds).toContain(messageId);
+        }
+      },
+    );
+  });
+
+  test("applies the pending control inbox cap per chat", async () => {
+    const sender = new FailingDeliverySender();
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "3",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await router.accept({
+          messageId: "m_chat_status_blocked",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitForState(
+          store,
+          (state) => state.pendingMessages.m_chat_status_blocked?.attempts === 1,
+        );
+
+        await router.accept({
+          messageId: "m_chat_status_overflow",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await router.accept({
+          messageId: "m_other_chat_status",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitForState(
+          store,
+          (state) => state.pendingMessages.m_other_chat_status?.attempts === 1,
+        );
+
+        const blocked = await store.load();
+        expect(Object.keys(blocked.pendingMessages).sort()).toEqual(
+          ["m_chat_status_blocked", "m_other_chat_status"].sort(),
+        );
+        expect(blocked.jobs.m_chat_status_overflow).toMatchObject({
+          kind: "control_recovery",
+          interruptionReason: "inbox_capacity_reached",
+          capacityNoticeKind: "inbox",
+          capacityNoticeScope: "chat",
+          capacityNoticeActive: true,
+        });
+        expect(codex.runs).toHaveLength(0);
+      },
+    );
+  });
+
+  test("retries the same control delivery without letting failed notices grow across chats", async () => {
+    const sender = new ToggleControlDeliverySender();
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "3",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        for (const suffix of ["a", "b", "c"]) {
+          const chatId = `oc_chat_${suffix}`;
+          const pendingId = `m_status_${suffix}`;
+          const overflowId = `m_status_overflow_${suffix}`;
+          const pendingMessage = {
+            messageId: pendingId,
+            chatId,
+            chatType: "direct" as const,
+            sender: { openId: "ou_user" },
+            text: "/status",
+          };
+
+          sender.failControl = true;
+          await router.accept(pendingMessage);
+          await waitForState(
+            store,
+            (state) => state.pendingMessages[pendingId]?.attempts === 1,
+          );
+          await router.accept({ ...pendingMessage, messageId: overflowId });
+          await waitForState(
+            store,
+            (state) =>
+              Object.values(state.outbox).some(
+                (delivery) =>
+                  delivery.jobId === overflowId &&
+                  delivery.status === "pending" &&
+                  delivery.attempts >= 1,
+              ),
+          );
+
+          sender.failControl = false;
+          await router.accept(pendingMessage);
+          await waitForState(
+            store,
+            (state) => state.pendingMessages[pendingId] === undefined,
+          );
+        }
+
+        sender.failControl = true;
+        await router.accept({
+          messageId: "m_status_after_global_cap",
+          chatId: "oc_chat_d",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+
+        const bounded = await store.load();
+        expect(Object.keys(bounded.pendingMessages)).toHaveLength(0);
+        expect(Object.keys(bounded.jobs)).toHaveLength(3);
+        expect(Object.keys(bounded.outbox)).toHaveLength(3);
+        expect(bounded.jobs.m_status_overflow_c).toMatchObject({
+          capacityNoticeKind: "inbox",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        expect(bounded.processedMessageIds).toContain("m_status_after_global_cap");
+        expect(codex.runs).toHaveLength(0);
+      },
+    );
+  });
+
+  test("replays a failed final delivery after restart without rerunning Codex", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-delivery-"));
+    let failedRouter: MessageRouter | undefined;
+    let replayRouter: MessageRouter | undefined;
     try {
       const config = loadConfig({
         FEISHU_APP_ID: "cli_test",
@@ -847,12 +1858,14 @@ describe("MessageRouter access control", () => {
         ALLOWED_USER_IDS: "ou_user",
       });
       const store = new JsonStateStore(config.bridgeStatePath);
-      const failedRouter = new MessageRouter(
+      const failedSender = new FinalFailingSender();
+      const firstCodex = new FakeCodex();
+      failedRouter = new MessageRouter(
         config,
         store,
-        new FailingDeliverySender(),
+        failedSender,
         silentLogger,
-        new FakeCodex(),
+        firstCodex,
       );
       await failedRouter.start();
       await failedRouter.accept({
@@ -863,26 +1876,466 @@ describe("MessageRouter access control", () => {
         text: "retry after restart",
       });
 
-      await waitForState(store, (state) => state.pendingMessages.m_replay?.attempts === 1);
+      await waitForState(store, (state) =>
+        Object.values(state.outbox).some(
+          (delivery) =>
+            delivery.jobId === "m_replay" &&
+            delivery.attempts === 1 &&
+            delivery.status === "pending",
+        ),
+      );
       const failed = await store.load();
-      expect(failed.pendingMessages.m_replay?.lastError).toContain("simulated delivery failure");
-      expect(failed.processedMessageIds).not.toContain("m_replay");
+      expect(firstCodex.runs).toHaveLength(1);
+      expect(failed.jobs.m_replay?.status).toBe("completed");
+      expect(failed.pendingMessages.m_replay).toBeUndefined();
+      expect(failed.processedMessageIds).toContain("m_replay");
+      const failedDelivery = Object.values(failed.outbox).find(
+        (delivery) => delivery.jobId === "m_replay",
+      );
+      expect(failedDelivery?.status).toBe("pending");
+      expect(failedDelivery?.lastError).toContain("simulated final delivery failure");
+      expect(failedSender.idempotencyKeys).toEqual([failedDelivery?.idempotencyKey]);
+      await failedRouter.dispose();
+      failedRouter = undefined;
 
       const replayCodex = new FakeCodex();
-      const replayRouter = new MessageRouter(
+      const replaySender = new IdempotencyCollectingSender();
+      replayRouter = new MessageRouter(
         config,
         new JsonStateStore(config.bridgeStatePath),
-        new CollectingSender(),
+        replaySender,
         silentLogger,
         replayCodex,
       );
       await replayRouter.start();
-      await waitFor(() => replayCodex.runs.length === 1);
-      await waitForState(store, (state) => state.processedMessageIds.includes("m_replay"));
+      await waitForState(store, (state) =>
+        Object.values(state.outbox).some(
+          (delivery) => delivery.jobId === "m_replay" && delivery.status === "delivered",
+        ),
+      );
 
       const replayed = await store.load();
+      expect(replayCodex.runs).toHaveLength(0);
+      expect(replaySender.messages.map((message) => message.text)).toEqual(["done"]);
+      expect(replaySender.idempotencyKeys).toEqual([failedDelivery?.idempotencyKey]);
       expect(replayed.pendingMessages.m_replay).toBeUndefined();
       expect(replayed.processedMessageIds).toContain("m_replay");
+      expect(
+        Object.values(replayed.outbox).find((delivery) => delivery.jobId === "m_replay")?.text,
+      ).toBe("");
+    } finally {
+      await failedRouter?.dispose();
+      await replayRouter?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("retries a transient final delivery in-process without rerunning Codex", async () => {
+    const sender = new TransientFinalDeliverySender();
+    const codex = new FakeCodex();
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.accept({
+        messageId: "m_retry_in_process",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "retry the reply only",
+      });
+
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await waitForState(store, (state) =>
+        Object.values(state.outbox).some(
+          (delivery) =>
+            delivery.jobId === "m_retry_in_process" && delivery.status === "delivered",
+        ),
+      );
+
+      expect(codex.runs).toHaveLength(1);
+      expect(sender.attempts).toBe(2);
+      expect(
+        sender.messages
+          .filter((message) => message.kind === "markdown")
+          .map((message) => message.text),
+      ).toEqual(["done"]);
+      expect(sender.idempotencyKeys).toHaveLength(2);
+      expect(new Set(sender.idempotencyKeys).size).toBe(1);
+    });
+  });
+
+  test("caps the total final answer before creating durable chat deliveries", async () => {
+    const codex = new SequencedCodex([{
+      threadId: "thread_bounded_output",
+      finalText: `开头-${"结果".repeat(200)}-结尾不应出现`,
+      stderr: "",
+      exitCode: 0,
+    }]);
+    await withRouterAndCodex(
+      { CHAT_OUTPUT_MAX_CHARS: "64" },
+      codex,
+      async ({ router, config, sender }) => {
+        await router.accept({
+          messageId: "m_bounded_chat_output",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "produce a large answer",
+        });
+
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await waitForState(
+          store,
+          (state) => state.jobs.m_bounded_chat_output?.status === "completed",
+        );
+        await waitFor(() => sender.messages.some((message) => message.kind === "markdown"));
+
+        const delivered = sender.messages
+          .filter((message) => message.kind === "markdown")
+          .map((message) => message.text)
+          .join("");
+        expect([...delivered].length).toBeLessThanOrEqual(64);
+        expect(delivered).toContain("输出已截断");
+        expect(delivered).not.toContain("结尾不应出现");
+      },
+    );
+  });
+
+  test("replays a pending status command after restart instead of inventing a Codex job", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-status-recovery-"));
+    const sender = new DelayedTextSender();
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {},
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_status_restart: {
+            messageId: "m_status_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/status",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await sender.sendStarted.promise;
+
+      const replaying = await store.load();
+      expect(replaying.pendingMessages.m_status_restart?.route).toBe("control_replay_safe");
+      expect(replaying.jobs.m_status_restart).toBeUndefined();
+
+      sender.releaseSend.resolve();
+      await waitForState(
+        store,
+        (state) => state.pendingMessages.m_status_restart === undefined,
+      );
+      const recovered = await store.load();
+      expect(codex.runs).toHaveLength(0);
+      expect(recovered.jobs.m_status_restart).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_status_restart");
+      expect(sender.messages[0]?.text).toContain("当前 chat");
+    } finally {
+      sender.releaseSend.resolve();
+      await router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not promote a persisted non-Codex message after access changes", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-route-recovery-"));
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_newly_allowed",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {},
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_previously_denied: {
+            messageId: "m_previously_denied",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_newly_allowed" },
+            text: "must not become a Codex run after restart",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 1,
+            route: "message",
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      const sender = new CollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+
+      const recovered = await store.load();
+      expect(recovered.pendingMessages.m_previously_denied).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_previously_denied");
+      expect(recovered.jobs.m_previously_denied).toBeUndefined();
+      expect(codex.runs).toHaveLength(0);
+      expect(sender.messages).toHaveLength(0);
+    } finally {
+      await router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers a pending side-effect control without replaying or blaming Codex", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-control-recovery-"));
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: tempDir,
+            chatType: "direct",
+            threadId: "thread_before_restart",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+          },
+        },
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_new_restart: {
+            messageId: "m_new_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/new",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      const sender = new IdempotencyCollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitFor(() => sender.messages.length === 1);
+
+      const recovered = await store.load();
+      expect(codex.runs).toHaveLength(0);
+      expect(recovered.chats.oc_chat?.threadId).toBe("thread_before_restart");
+      expect(recovered.pendingMessages.m_new_restart).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_new_restart");
+      expect(recovered.jobs.m_new_restart).toMatchObject({
+        kind: "control_recovery",
+        status: "interrupted",
+        interruptionReason: "control_command_not_replayed",
+        prompt: "/new",
+      });
+      expect(sender.messages[0]?.text).toContain("不会自动重放");
+      expect(sender.messages[0]?.text).not.toContain("Codex");
+    } finally {
+      await router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not replay stale stop or steer commands onto a recovered queued run", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-control-race-"));
+    const codex = new ControlledCodex();
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: tempDir,
+            chatType: "direct",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+          },
+        },
+        jobs: {
+          m_queued_restart: {
+            id: "m_queued_restart",
+            kind: "codex_run",
+            messageId: "m_queued_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            cwd: tempDir,
+            prompt: "continue the queued task",
+            status: "queued",
+            createdAt: "2026-07-20T00:00:00.000Z",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+            deliveryIds: [],
+          },
+        },
+        outbox: {},
+        pendingMessages: {
+          m_queued_restart: {
+            messageId: "m_queued_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "continue the queued task",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+          m_stop_restart: {
+            messageId: "m_stop_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/stop",
+            acceptedAt: "2026-07-20T00:00:01.000Z",
+            attempts: 0,
+          },
+          m_steer_restart: {
+            messageId: "m_steer_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/steer private recovery instruction",
+            acceptedAt: "2026-07-20T00:00:02.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const sender = new IdempotencyCollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitFor(() => codex.runs.length === 1);
+      await waitFor(
+        () => sender.messages.filter((message) => message.text.includes("不会自动重放")).length === 2,
+      );
+
+      const recovered = await store.load();
+      expect(codex.runs[0]?.signal?.aborted).toBe(false);
+      expect(recovered.jobs.m_stop_restart).toMatchObject({
+        kind: "control_recovery",
+        prompt: "/stop",
+      });
+      expect(recovered.jobs.m_steer_restart).toMatchObject({
+        kind: "control_recovery",
+        prompt: "/steer",
+      });
+      expect(sender.messages.map((message) => message.text).join("\n")).not.toContain(
+        "private recovery instruction",
+      );
+
+      codex.complete(0, "thread_recovered_queue");
+      await waitForState(
+        store,
+        (state) => state.jobs.m_queued_restart?.status === "completed",
+      );
+    } finally {
+      codex.complete(0, "thread_recovered_queue");
+      await router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("marks a running durable job interrupted on restart without rerunning Codex", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-interrupted-"));
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: tempDir,
+            chatType: "direct",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+          },
+        },
+        jobs: {
+          m_interrupted: {
+            id: "m_interrupted",
+            kind: "codex_run",
+            messageId: "m_interrupted",
+            chatId: "oc_chat",
+            chatType: "direct",
+            cwd: tempDir,
+            prompt: "may already have side effects",
+            status: "running",
+            createdAt: "2026-07-20T00:00:00.000Z",
+            updatedAt: "2026-07-20T00:00:01.000Z",
+            startedAt: "2026-07-20T00:00:01.000Z",
+            deliveryIds: [],
+          },
+        },
+        outbox: {},
+        pendingMessages: {
+          m_interrupted: {
+            messageId: "m_interrupted",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "may already have side effects",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      const sender = new IdempotencyCollectingSender();
+      const router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitForState(store, (state) => state.jobs.m_interrupted?.status === "interrupted");
+      await waitFor(() => sender.messages.length === 1);
+
+      const recovered = await store.load();
+      expect(codex.runs).toHaveLength(0);
+      expect(recovered.pendingMessages.m_interrupted).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_interrupted");
+      expect(sender.messages[0]?.text).toContain("不会自动重新执行");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -1938,6 +3391,131 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("persists an app-server thread binding before the first turn continues", async () => {
+    const codex = new EarlyBindingCodex();
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      await router.accept({
+        messageId: "m_early_bind",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "bind before turn",
+      });
+      await codex.threadBound.promise;
+
+      const state = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(codex.turnContinued).toBe(false);
+      expect(state.chats.oc_chat?.threadId).toBe("thread_early_bound");
+      expect(state.jobs.m_early_bind).toMatchObject({
+        status: "running",
+        threadId: "thread_early_bound",
+      });
+      expect(codex.runs[0]?.sessionScope?.sessionEpoch).toBe(
+        state.chats.oc_chat?.sessionEpoch,
+      );
+
+      codex.continueTurn.resolve();
+      await waitForState(
+        new JsonStateStore(config.bridgeStatePath),
+        (current) => current.jobs.m_early_bind?.status === "completed",
+      );
+    });
+  });
+
+  test("keeps one scope across turns and rotates the principal without trusting missing ids", async () => {
+    const codex = new SessionAwareCodex();
+    await withRouterAndCodex(
+      {
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        ALLOWED_USER_IDS: "ou_user,ou_other",
+      },
+      codex,
+      async ({ router }) => {
+        await router.enqueue({
+          messageId: "m_scope_1",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: "first turn",
+        });
+        await router.enqueue({
+          messageId: "m_scope_2",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: "second turn",
+        });
+        await router.enqueue({
+          messageId: "m_scope_3",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_other" },
+          text: "new principal",
+        });
+        await router.enqueue({
+          messageId: "m_scope_no_id",
+          chatId: "oc_direct_without_id",
+          chatType: "direct",
+          sender: {},
+          text: "single use only",
+        });
+
+        expect(codex.runs[0]?.sessionScope).toBeDefined();
+        expect(codex.runs[1]?.sessionScope?.sessionEpoch).toBe(
+          codex.runs[0]?.sessionScope?.sessionEpoch,
+        );
+        expect(codex.runs[1]?.threadId).toBe("thread_session");
+        expect(codex.runs[2]?.sessionScope?.sessionEpoch).toBe(
+          codex.runs[0]?.sessionScope?.sessionEpoch,
+        );
+        expect(codex.runs[2]?.sessionScope?.principal.openId).toBe("ou_other");
+        expect(codex.runs[3]?.sessionScope).toBeUndefined();
+      },
+    );
+  });
+
+  test("rotates and invalidates app-server sessions at every thread or cwd lifecycle boundary", async () => {
+    const codex = new LifecycleCodex([
+      {
+        id: "thread_source",
+        cwd: "/repo/a",
+        name: "Source thread",
+        updatedAt: 3_000,
+      },
+    ]);
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      const projectDir = path.join(config.codexWorkdir, "project-next");
+      const cdDir = path.join(config.codexWorkdir, "cwd-next");
+      await mkdir(projectDir);
+      await mkdir(cdDir);
+      const command = (messageId: string, text: string): IncomingTextMessage => ({
+        messageId,
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text,
+      });
+
+      await router.enqueue(command("m_resume_lifecycle", "/resume thread_source"));
+      await router.enqueue(command("m_compact_lifecycle", "/compact"));
+      await router.enqueue(command("m_fork_lifecycle", "/fork"));
+      await router.enqueue(command("m_new_lifecycle", "/new"));
+      await router.enqueue(command("m_project_lifecycle", `/project ${projectDir}`));
+      await router.enqueue(command("m_cd_lifecycle", `/cd ${cdDir}`));
+
+      expect(codex.invalidations).toEqual([
+        { chatId: "oc_chat", reason: "thread_changed" },
+        { chatId: "oc_chat", reason: "thread_compact" },
+        { chatId: "oc_chat", reason: "thread_fork" },
+        { chatId: "oc_chat", reason: "thread_changed" },
+        { chatId: "oc_chat", reason: "session_reset" },
+        { chatId: "oc_chat", reason: "project_changed" },
+        { chatId: "oc_chat", reason: "cwd_changed" },
+      ]);
+    });
+  });
+
   test("runs Codex for allowlisted group messages", async () => {
     await withRouter(
       { ALLOW_GROUPS: "true", ALLOWED_CHAT_IDS: "oc_group" },
@@ -2336,7 +3914,7 @@ describe("MessageRouter access control", () => {
 
   test("downloads attachments and appends local paths to the Codex prompt", async () => {
     const sender = new AttachmentCollectingSender();
-    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex }) => {
+    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex, config }) => {
       await router.enqueue({
         messageId: "m1",
         chatId: "oc_chat",
@@ -2367,7 +3945,7 @@ describe("MessageRouter access control", () => {
           "summarize this",
           "",
           "本地附件路径：",
-          "- 文件 report.pdf: /tmp/chat2codex-downloads/report.pdf",
+          `- 文件 report.pdf: ${path.join(config.attachmentDownloadDir, "m1", "report.pdf")}`,
         ].join("\n"),
       );
     });
@@ -2375,7 +3953,7 @@ describe("MessageRouter access control", () => {
 
   test("uses a default prompt for attachment-only messages", async () => {
     const sender = new AttachmentCollectingSender();
-    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex }) => {
+    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex, config }) => {
       await router.enqueue({
         messageId: "m1",
         chatId: "oc_chat",
@@ -2395,10 +3973,71 @@ describe("MessageRouter access control", () => {
           "请查看并处理下面的图片。",
           "",
           "本地附件路径：",
-          "- 图片: /tmp/chat2codex-downloads/img_v3_test",
+          `- 图片: ${path.join(config.attachmentDownloadDir, "m1", "img_v3_test")}`,
         ].join("\n"),
       );
     });
+  });
+
+  test("rejects attachment counts before starting any download", async () => {
+    const sender = new AttachmentCollectingSender();
+    await withRouterAndSender(
+      { ATTACHMENT_MAX_COUNT: "1" },
+      new FakeCodex(),
+      sender,
+      async ({ router, codex }) => {
+        await router.enqueue({
+          messageId: "m_too_many_attachments",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "process both",
+          attachments: [
+            { kind: "file", key: "first", name: "first.txt" },
+            { kind: "file", key: "second", name: "second.txt" },
+          ],
+        });
+
+        expect(sender.downloads).toHaveLength(0);
+        expect(codex.runs).toHaveLength(0);
+        expect(sender.messages.at(-1)?.text).toContain("附件数量超过上限");
+      },
+    );
+  });
+
+  test("removes the current batch when attachment message bytes exceed the quota", async () => {
+    const sender = new AttachmentCollectingSender();
+    sender.contentsByKey.set("first", "1234");
+    sender.contentsByKey.set("second", "5678");
+    await withRouterAndSender(
+      {
+        ATTACHMENT_MAX_FILE_BYTES: "5",
+        ATTACHMENT_MAX_TOTAL_BYTES: "6",
+        ATTACHMENT_STORE_MAX_BYTES: "100",
+      },
+      new FakeCodex(),
+      sender,
+      async ({ router, codex }) => {
+        await router.enqueue({
+          messageId: "m_attachment_total",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "process both",
+          attachments: [
+            { kind: "file", key: "first", name: "first.txt" },
+            { kind: "file", key: "second", name: "second.txt" },
+          ],
+        });
+
+        expect(sender.downloads).toHaveLength(2);
+        expect(codex.runs).toHaveLength(0);
+        expect(sender.messages.at(-1)?.text).toContain("per-message limit");
+        for (const filePath of sender.downloadedPaths) {
+          await expect(Bun.file(filePath).exists()).resolves.toBe(false);
+        }
+      },
+    );
   });
 
   test("does not run Codex when the sender cannot download attachments", async () => {
@@ -2805,6 +4444,179 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("approval card action rejects a mismatched card message id", async () => {
+    const codex = new ApprovalCodex({
+      id: "approval_1",
+      kind: "command",
+      command: "rm -rf build",
+      decisions: ["accept", "decline"],
+    });
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "run command",
+      });
+      await waitFor(() => sender.approvalCards.length === 1);
+
+      const rejected = await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: "oma_wrong",
+        approvalId: "approval_1",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+
+      expect(expectToast(rejected).toast).toMatchObject({
+        type: "warning",
+        content: "无法处理审批：卡片上下文不匹配。",
+      });
+      expect(codex.decision).toBeUndefined();
+
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_1",
+        decisionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      await running;
+      expect(codex.decision).toBe("decline");
+    });
+  });
+
+  test("keeps identical approval request ids isolated by chat", async () => {
+    const codex = new ApprovalCodex({
+      id: "approval_shared",
+      kind: "command",
+      command: "rm -rf build",
+      decisions: ["accept", "decline"],
+    });
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      const firstCwd = path.join(config.codexWorkdir, "first");
+      const secondCwd = path.join(config.codexWorkdir, "second");
+      await Promise.all([
+        mkdir(firstCwd, { recursive: true }),
+        mkdir(secondCwd, { recursive: true }),
+      ]);
+      await Promise.all([
+        router.enqueue({
+          messageId: "m_cd_first",
+          chatId: "oc_first",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: `/cd ${firstCwd}`,
+        }),
+        router.enqueue({
+          messageId: "m_cd_second",
+          chatId: "oc_second",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: `/cd ${secondCwd}`,
+        }),
+      ]);
+
+      const firstRun = router.enqueue({
+        messageId: "m_first",
+        chatId: "oc_first",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "first command",
+      });
+      const secondRun = router.enqueue({
+        messageId: "m_second",
+        chatId: "oc_second",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "second command",
+      });
+      await waitFor(() => sender.approvalCards.length === 2);
+
+      const firstCard = sender.approvalCards.find((card) => card.chatId === "oc_first");
+      const secondCard = sender.approvalCards.find((card) => card.chatId === "oc_second");
+      expect(firstCard).toBeDefined();
+      expect(secondCard).toBeDefined();
+
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_first",
+        messageId: firstCard?.handle.messageId,
+        approvalId: "approval_shared",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_second",
+        messageId: secondCard?.handle.messageId,
+        approvalId: "approval_shared",
+        decisionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      await Promise.all([firstRun, secondRun]);
+
+      expect(codex.decisions).toEqual(
+        expect.arrayContaining([
+          { prompt: "first command", decision: "accept" },
+          { prompt: "second command", decision: "decline" },
+        ]),
+      );
+    });
+  });
+
+  test("rejects card callbacks for approval decisions hidden by disclosure guards", async () => {
+    const request: CodexApprovalRequest = {
+      id: "approval_file_1",
+      kind: "file_change",
+      reason: "write outside the current root",
+      grantRoot: "/private/project",
+      decisions: ["accept", "acceptForSession", "decline", "cancel"],
+    };
+    const codex = new ApprovalCodex(request);
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "edit file",
+      });
+      await waitFor(() => sender.approvalCards.length === 1);
+
+      const rejected = await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_file_1",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(rejected).toast).toMatchObject({
+        type: "warning",
+        content: "无法处理审批：该选项未通过安全披露校验。",
+      });
+      expect(codex.decision).toBeUndefined();
+
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_file_1",
+        decisionIndex: 2,
+        sender: { openId: "ou_user" },
+      });
+      await running;
+      expect(codex.decision).toBe("decline");
+    });
+  });
+
   test("status reports pending approval wait details", async () => {
     const request: CodexApprovalRequest = {
       id: "approval_1",
@@ -2920,6 +4732,60 @@ describe("MessageRouter access control", () => {
     );
   });
 
+  test("an allowlisted group member cannot approve another member's Codex request", async () => {
+    const codex = new ApprovalCodex({
+      id: "approval_1",
+      kind: "command",
+      command: "rm -rf build",
+      decisions: ["accept", "decline"],
+    });
+    const sender = new CardCollectingSender();
+    await withRouterAndSender(
+      {
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        ALLOWED_USER_IDS: "ou_origin,ou_other",
+      },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m1",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_origin" },
+          text: "@_user_1 run command",
+        });
+        await waitFor(() => sender.approvalCards.length === 1);
+
+        const rejected = await router.handleCardAction({
+          action: "resolve_approval",
+          chatId: "oc_group",
+          messageId: sender.approvalCards[0]?.handle.messageId,
+          approvalId: "approval_1",
+          decisionIndex: 0,
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(rejected).toast).toMatchObject({
+          type: "error",
+          content: "只有发起当前 Codex 任务的用户可以处理这条审批请求。",
+        });
+        expect(codex.decision).toBeUndefined();
+
+        await router.handleCardAction({
+          action: "resolve_approval",
+          chatId: "oc_group",
+          messageId: sender.approvalCards[0]?.handle.messageId,
+          approvalId: "approval_1",
+          decisionIndex: 1,
+          sender: { openId: "ou_origin" },
+        });
+        await running;
+        expect(codex.decision).toBe("decline");
+      },
+    );
+  });
+
   test("marks a late approval card cancelled when the Codex run already finished", async () => {
     const request: CodexApprovalRequest = {
       id: "approval_1",
@@ -2963,7 +4829,7 @@ describe("MessageRouter access control", () => {
     });
   });
 
-  test("marks a late approval card resolved when the user clicks before card creation returns", async () => {
+  test("rejects approval actions until the card message id is known", async () => {
     const request: CodexApprovalRequest = {
       id: "approval_1",
       kind: "command",
@@ -2992,26 +4858,23 @@ describe("MessageRouter access control", () => {
         sender: { openId: "ou_user" },
       });
 
-      expect(response).toMatchObject({
-        card: {
-          type: "raw",
-          data: {
-            header: {
-              title: {
-                content: "Codex 审批已处理",
-              },
-            },
-          },
-        },
+      expect(expectToast(response).toast).toMatchObject({
+        type: "warning",
+        content: "无法处理审批：卡片上下文不匹配。",
       });
-      expect(JSON.stringify(response)).toContain("已选择：Approve。");
-      expect(JSON.stringify(response)).not.toContain("resolve_approval");
+      expect(codex.decision).toBeUndefined();
       expect(sender.approvalCardUpdates).toHaveLength(0);
 
       sender.releaseCreate.resolve();
-      await waitFor(
-        () => sender.approvalCards.length === 1 && sender.approvalCardUpdates.length === 1,
-      );
+      await waitFor(() => sender.approvalCards.length === 1);
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_1",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
       await running;
 
       expect(codex.decision).toBe("accept");
@@ -3070,6 +4933,1104 @@ describe("MessageRouter access control", () => {
         expect(codex.decision).toBe("decline");
       },
     );
+  });
+
+  test("answers requestUserInput cards one question at a time and validates card context", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_1",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [
+        {
+          id: "environment",
+          header: "Environment",
+          question: "Which environment should be used?",
+          isOther: false,
+          isSecret: false,
+          options: [
+            { label: "Staging", description: "Use staging." },
+            { label: "Production", description: "Use production." },
+          ],
+        },
+        {
+          id: "note",
+          header: "Note",
+          question: "Any extra note?",
+          isOther: true,
+          isSecret: false,
+          options: null,
+        },
+      ],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_input_card",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCards.length === 1);
+      const handle = sender.userInputCards[0]!.handle;
+
+      const wrongSender = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_other" },
+      });
+      expect(expectToast(wrongSender).toast.type).toBe("error");
+
+      const wrongCard = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: "om_forged",
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(wrongCard).toast.type).toBe("warning");
+
+      const wrongQuestion = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "note",
+        optionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(wrongQuestion).toast.type).toBe("warning");
+
+      const wrongOption = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 9,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(wrongOption).toast.type).toBe("warning");
+
+      const nextQuestion = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      expect(nextQuestion).toHaveProperty("card");
+      expect(JSON.stringify(nextQuestion)).toContain("Any extra note?");
+      expect(codex.response).toBeUndefined();
+      expect(sender.userInputCardUpdates.at(-1)?.input).toMatchObject({
+        status: "pending",
+        answers: { environment: { answers: [] } },
+      });
+
+      const resolved = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "note",
+        sender: { openId: "ou_user" },
+      });
+      expect(resolved).toHaveProperty("card");
+      await running;
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({
+        answers: {
+          environment: { answers: ["Production"] },
+          note: { answers: [] },
+        },
+      });
+      expect(sender.userInputCardUpdates.at(-1)?.input).toMatchObject({
+        status: "resolved",
+        answers: {
+          environment: { answers: [] },
+          note: { answers: [] },
+        },
+      });
+    });
+  });
+
+  test("binds requestUserInput cancellation to the original group sender", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_group",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "confirm",
+        header: "Confirm",
+        question: "Continue?",
+        isOther: false,
+        isSecret: false,
+        options: [{ label: "Yes", description: "Continue." }],
+      }],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      {
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        ALLOWED_USER_IDS: "ou_user,ou_other",
+      },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_input_group",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: "ask me",
+        });
+        await waitFor(() => sender.userInputCards.length === 1);
+        const handle = sender.userInputCards[0]!.handle;
+
+        const rejected = await router.handleCardAction({
+          action: "cancel_user_input",
+          chatId: "oc_group",
+          messageId: handle.messageId,
+          userInputId: request.id,
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(rejected).toast.type).toBe("error");
+        expect(codex.response).toBeUndefined();
+
+        const cancelled = await router.handleCardAction({
+          action: "cancel_user_input",
+          chatId: "oc_group",
+          messageId: handle.messageId,
+          userInputId: request.id,
+          sender: { openId: "ou_user" },
+        });
+        expect(cancelled).toHaveProperty("card");
+        await running;
+
+        expect(codex.response).toEqual({ answers: {} });
+        expect(sender.userInputCardUpdates.at(-1)?.input.status).toBe("cancelled");
+      },
+    );
+  });
+
+  test("handles /answer immediately without persisting or echoing answer content", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_text",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [
+        {
+          id: "color",
+          header: "Color",
+          question: "Choose a color.",
+          isOther: false,
+          isSecret: false,
+          options: [
+            { label: "Red", description: "Use red." },
+            { label: "Blue", description: "Use blue." },
+          ],
+        },
+        {
+          id: "detail",
+          header: "Detail",
+          question: "Give a detail.",
+          isOther: true,
+          isSecret: false,
+          options: null,
+        },
+      ],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router, config }) => {
+      const running = router.enqueue({
+        messageId: "m_input_text",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCards.length === 1);
+      const replyCode = sender.userInputCards[0]!.input.replyCode;
+
+      await router.enqueue({
+        messageId: "m_wrong_user_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_other" },
+        text: `/answer ${replyCode} Blue`,
+      });
+      expect(codex.response).toBeUndefined();
+      expect(sender.messages.at(-1)?.text).toContain("发起当前 Codex 任务的用户");
+
+      await router.enqueue({
+        messageId: "m_long_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} ${"x".repeat(4_001)}`,
+      });
+      expect(codex.response).toBeUndefined();
+      expect(sender.messages.at(-1)?.text).toContain("4000");
+
+      await router.enqueue({
+        messageId: "m_bad_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} Purple`,
+      });
+      expect(codex.response).toBeUndefined();
+      expect(sender.messages.at(-1)?.text).toContain("可选项");
+
+      await router.enqueue({
+        messageId: "m_color_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} Blue`,
+      });
+      expect(codex.response).toBeUndefined();
+
+      const privateAnswer = "private phrase 93f15";
+      const answerMessage: IncomingTextMessage = {
+        messageId: "m_private_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} ${privateAnswer}`,
+      };
+      await router.accept(answerMessage);
+      await router.accept(answerMessage);
+      await running;
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({
+        answers: {
+          color: { answers: ["Blue"] },
+          detail: { answers: [privateAnswer] },
+        },
+      });
+      expect(sender.messages.every((message) => !message.text.includes(privateAnswer))).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(privateAnswer);
+      expect(persisted.processedMessageIds.filter((id) => id === answerMessage.messageId)).toHaveLength(1);
+      },
+    );
+  });
+
+  test("fails secret requestUserInput closed without creating a card", async () => {
+    const secretQuestion = "Paste the production password";
+    const codex = new UserInputCodex({
+      id: "input_secret",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "password",
+        header: "Password",
+        question: secretQuestion,
+        isOther: true,
+        isSecret: true,
+        options: null,
+      }],
+    });
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.enqueue({
+        messageId: "m_input_secret",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask for a secret",
+      });
+
+      expect(codex.response).toEqual({ answers: {} });
+      expect(sender.userInputCards).toHaveLength(0);
+      expect(sender.messages.some((message) => message.text.includes("敏感输入"))).toBe(true);
+      expect(sender.messages.every((message) => !message.text.includes(secretQuestion))).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(secretQuestion);
+    });
+  });
+
+  test("expires requestUserInput on its request signal and rejects late answers", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_expired",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: 10_000,
+      questions: [{
+        id: "choice",
+        header: "Choice",
+        question: "Choose.",
+        isOther: false,
+        isSecret: false,
+        options: [{ label: "One", description: "The first option." }],
+      }],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_input_expired",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCards.length === 1);
+      const handle = sender.userInputCards[0]!.handle;
+
+      codex.abortRequest();
+      await running;
+      expect(codex.response).toEqual({ answers: {} });
+      expect(sender.userInputCardUpdates.at(-1)?.input.status).toBe("expired");
+
+      const late = await router.handleCardAction({
+        action: "answer_user_input",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        userInputId: request.id,
+        questionId: "choice",
+        optionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
+  });
+
+  test("falls back to /answer text when requestUserInput card creation fails", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_fallback",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "detail",
+        header: "Detail",
+        question: "Provide a detail.",
+        isOther: true,
+        isSecret: false,
+        options: null,
+      }],
+    };
+    const codex = new UserInputCodex(request);
+    const sender = new FailingUserInputCardSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_input_fallback",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCardAttempts.length === 1);
+      await waitFor(() => sender.messages.some((message) => message.text.includes("/answer")));
+      const replyCode = sender.userInputCardAttempts[0]!.input.replyCode;
+
+      await router.enqueue({
+        messageId: "m_fallback_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/answer ${replyCode} fallback detail`,
+      });
+      await running;
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({
+        answers: { detail: { answers: ["fallback detail"] } },
+      });
+    });
+  });
+
+  test("fails requestUserInput closed when neither card nor fallback text can be delivered", async () => {
+    const codex = new UserInputCodex({
+      id: "input_undeliverable",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "detail",
+        header: "Detail",
+        question: "Provide a detail.",
+        isOther: true,
+        isSecret: false,
+        options: null,
+      }],
+    });
+    const sender = new FailingUserInputPresentationSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_input_undeliverable",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+
+      expect(codex.runs).toHaveLength(1);
+      expect(codex.response).toEqual({ answers: {} });
+      expect(sender.userInputCardAttempts).toHaveLength(1);
+    });
+  });
+
+  test("cleans up an unawaited requestUserInput when the run finishes", async () => {
+    const request: CodexUserInputRequest = {
+      id: "input_unawaited",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      itemId: "item_1",
+      autoResolutionMs: null,
+      questions: [{
+        id: "detail",
+        header: "Detail",
+        question: "Provide a detail.",
+        isOther: true,
+        isSecret: false,
+        options: null,
+      }],
+    };
+    const codex = new FireAndForgetUserInputCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_input_unawaited",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "ask me",
+      });
+      await waitFor(() => sender.userInputCardUpdates.length > 0);
+      expect(sender.userInputCardUpdates.at(-1)?.input.status).toBe("cancelled");
+
+      const late = await router.handleCardAction({
+        action: "cancel_user_input",
+        chatId: "oc_chat",
+        messageId: sender.userInputCards[0]?.handle.messageId,
+        userInputId: request.id,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
+  });
+
+  test("binds extra permission approval to the original sender and card", async () => {
+    const request: CodexPermissionApprovalRequest = {
+      id: "permission_1",
+      cwd: "/repo",
+      itemId: "item_1",
+      permissions: {
+        fileSystem: {
+          entries: [{ access: "write", path: { type: "path", path: "/repo/output" } }],
+        },
+        network: { enabled: true },
+      },
+      startedAtMs: 1_750_000_000_000,
+      threadId: "thread_test",
+      turnId: "turn_1",
+      environmentId: null,
+      reason: "Publish the generated artifact.",
+    };
+    const codex = new PermissionApprovalCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_permission",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "publish artifact",
+        });
+        await waitFor(() => sender.permissionApprovalCards.length === 1);
+        const handle = sender.permissionApprovalCards[0]!.handle;
+
+        const wrongSender = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "grantTurn",
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(wrongSender).toast.type).toBe("error");
+        expect(codex.decision).toBeUndefined();
+
+        const wrongCard = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: "om_permission_forged",
+          requestId: request.id,
+          decision: "grantTurn",
+          sender: { openId: "ou_user" },
+        });
+        expect(expectToast(wrongCard).toast.type).toBe("warning");
+        expect(codex.decision).toBeUndefined();
+
+        const forgedDecision = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "accept",
+          sender: { openId: "ou_user" },
+        });
+        expect(expectToast(forgedDecision).toast.type).toBe("warning");
+        expect(codex.decision).toBeUndefined();
+
+        const resolved = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "grantSession",
+          sender: { openId: "ou_user" },
+        });
+        expect(resolved).toHaveProperty("card");
+        await running;
+
+        expect(codex.decision).toBe("grantSession");
+        expect(sender.permissionApprovalCardUpdates.at(-1)).toMatchObject({
+          handle,
+          input: {
+            status: "resolved",
+            request,
+            decision: "grantSession",
+          },
+        });
+      },
+    );
+  });
+
+  test("denies extra permissions when approval cards are unavailable or fail to send", async () => {
+    const request: CodexPermissionApprovalRequest = {
+      id: "permission_unavailable",
+      cwd: "/repo",
+      itemId: "item_1",
+      permissions: { network: { enabled: true } },
+      startedAtMs: 1_750_000_000_000,
+      threadId: "thread_test",
+      turnId: "turn_1",
+      environmentId: null,
+      reason: "Access the release endpoint.",
+    };
+
+    const unavailableCodex = new PermissionApprovalCodex(request);
+    const unavailableSender = new CollectingSender();
+    await withRouterAndSender({}, unavailableCodex, unavailableSender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_permission_unavailable",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "request permission",
+      });
+
+      expect(unavailableCodex.decision).toBe("deny");
+      expect(unavailableSender.messages.some((message) => message.text.includes("已拒绝"))).toBe(
+        true,
+      );
+    });
+
+    const failingCodex = new PermissionApprovalCodex({
+      ...request,
+      id: "permission_failed_card",
+    });
+    const failingSender = new FailingPermissionApprovalCardSender();
+    await withRouterAndSender({}, failingCodex, failingSender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_permission_failed_card",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "request permission",
+      });
+
+      expect(failingCodex.decision).toBe("deny");
+      expect(failingSender.permissionApprovalCardAttempts).toHaveLength(1);
+      expect(failingSender.messages.some((message) => message.text.includes("安全策略拒绝"))).toBe(
+        true,
+      );
+    });
+  });
+
+  test("expires extra permission approval on abort and rejects late card actions", async () => {
+    const request: CodexPermissionApprovalRequest = {
+      id: "permission_expired",
+      cwd: "/repo",
+      itemId: "item_1",
+      permissions: { network: { enabled: true } },
+      startedAtMs: 1_750_000_000_000,
+      threadId: "thread_test",
+      turnId: "turn_1",
+      environmentId: null,
+      reason: "Access the release endpoint.",
+    };
+    const codex = new PermissionApprovalCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_permission_expired",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "request permission",
+      });
+      await waitFor(() => sender.permissionApprovalCards.length === 1);
+      const handle = sender.permissionApprovalCards[0]!.handle;
+
+      codex.abortRequest();
+      await running;
+      expect(codex.decision).toBe("deny");
+      expect(sender.permissionApprovalCardUpdates.at(-1)?.input.status).toBe("expired");
+
+      const late = await router.handleCardAction({
+        action: "resolve_permission_approval",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        requestId: request.id,
+        decision: "grantTurn",
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
+  });
+
+  test("submits an MCP form from a card option and a private text answer", async () => {
+    const request: CodexMcpElicitationRequest = {
+      id: "mcp_form_1",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Collect release settings.",
+      mode: "form",
+      fields: [
+        {
+          name: "environment",
+          title: "Environment",
+          description: "Select a deployment target.",
+          required: true,
+          type: "enum",
+          default: null,
+          options: [
+            { value: "staging", title: "Staging" },
+            { value: "production", title: "Production" },
+          ],
+        },
+        {
+          name: "release_note",
+          title: "Release note",
+          description: "Provide a private note.",
+          required: true,
+          type: "string",
+          default: null,
+          format: null,
+          minLength: 1,
+          maxLength: 200,
+        },
+      ],
+    };
+    const codex = new McpElicitationCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const running = router.enqueue({
+        messageId: "m_mcp_form",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "collect release settings",
+      });
+      await waitFor(() => sender.mcpElicitationCards.length === 1);
+      const initial = sender.mcpElicitationCards[0]!;
+
+      const selected = await router.handleCardAction({
+        action: "answer_mcp_elicitation",
+        chatId: "oc_chat",
+        messageId: initial.handle.messageId,
+        requestId: request.id,
+        fieldId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      expect(selected).toHaveProperty("card");
+      expect(sender.mcpElicitationCardUpdates.at(-1)?.input).toMatchObject({
+        status: "pending",
+        answeredFieldIds: ["environment"],
+      });
+
+      await router.accept({
+        messageId: "m_mcp_wrong_sender_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_other" },
+        text: `/mcp-answer ${initial.input.replyCode} release_note forged-value`,
+      });
+      await waitFor(() =>
+        sender.messages.some((message) => message.text.includes("只有发起当前 Codex 任务的用户")),
+      );
+      expect(codex.response).toBeUndefined();
+
+      const privateAnswer = "private release phrase 48f31";
+      const answerMessage: IncomingTextMessage = {
+        messageId: "m_mcp_private_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/mcp-answer ${initial.input.replyCode} release_note ${privateAnswer}`,
+      };
+      await router.accept(answerMessage);
+      await router.accept(answerMessage);
+      await running;
+
+      expect(codex.response).toEqual({
+        action: "accept",
+        content: {
+          environment: "production",
+          release_note: privateAnswer,
+        },
+      });
+      expect(sender.messages.every((message) => !message.text.includes(privateAnswer))).toBe(true);
+      expect(
+        sender.mcpElicitationCardUpdates.every(
+          (update) => !JSON.stringify(update.input).includes(privateAnswer),
+        ),
+      ).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(privateAnswer);
+      expect(
+        persisted.processedMessageIds.filter((id) => id === answerMessage.messageId),
+      ).toHaveLength(1);
+      },
+    );
+  });
+
+  test("answers a leading-whitespace MCP field id and keeps required /skip as data", async () => {
+    const fieldId = " release note";
+    const codex = new McpElicitationCodex({
+      id: "mcp_quoted_field",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Collect a release marker.",
+      mode: "form",
+      fields: [
+        {
+          name: fieldId,
+          title: "Release marker",
+          description: null,
+          required: true,
+          type: "string",
+          default: null,
+          format: null,
+          minLength: 1,
+          maxLength: 20,
+        },
+      ],
+    });
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_mcp_quoted_field",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "collect marker",
+      });
+      await waitFor(() => sender.mcpElicitationCards.length === 1);
+      const card = sender.mcpElicitationCards[0]!;
+
+      await router.accept({
+        messageId: "m_mcp_quoted_field_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/mcp-answer ${card.input.replyCode} ${JSON.stringify(fieldId)} /skip`,
+      });
+      await running;
+
+      expect(codex.response).toEqual({
+        action: "accept",
+        content: { [fieldId]: "/skip" },
+      });
+    });
+  });
+
+  test("bounds pending interactive requests with the configured per-chat limit", async () => {
+    const responses: CodexMcpElicitationResponse[] = [];
+    const request = (id: string): CodexMcpElicitationRequest => ({
+      id,
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Confirm release.",
+      mode: "form",
+      fields: [
+        {
+          name: "confirmed",
+          title: "Confirmed",
+          description: null,
+          required: true,
+          type: "boolean",
+          default: null,
+        },
+      ],
+    });
+    const codex: CodexClient = {
+      async run(input: CodexRunInput): Promise<CodexRunResult> {
+        const first = input.onMcpElicitationRequest!(request("mcp_limit_1"), {
+          signal: new AbortController().signal,
+        });
+        responses.push(
+          await input.onMcpElicitationRequest!(request("mcp_limit_2"), {
+            signal: new AbortController().signal,
+          }),
+        );
+        responses.unshift(await first);
+        return {
+          threadId: "thread_test",
+          finalText: "done",
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+    };
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "2",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_mcp_limit",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "trigger parallel requests",
+        });
+        await waitFor(() => sender.mcpElicitationCards.length === 1);
+        expect(sender.mcpElicitationCards).toHaveLength(1);
+        expect(responses).toEqual([{ action: "cancel" }]);
+
+        const card = sender.mcpElicitationCards[0]!;
+        await router.handleCardAction({
+          action: "resolve_mcp_elicitation",
+          chatId: "oc_chat",
+          messageId: card.handle.messageId,
+          requestId: "mcp_limit_1",
+          decision: "cancel",
+          sender: { openId: "ou_user" },
+        });
+        await running;
+        expect(responses).toEqual([{ action: "cancel" }, { action: "cancel" }]);
+      },
+    );
+  });
+
+  test("fails an MCP form with a required secret-like field closed", async () => {
+    const secretPrompt = "Paste the production credential.";
+    const codex = new McpElicitationCodex({
+      id: "mcp_secret",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: secretPrompt,
+      mode: "form",
+      fields: [
+        {
+          name: "api_token",
+          title: "API token",
+          description: "Used to access production.",
+          required: true,
+          type: "string",
+          default: null,
+          format: null,
+          minLength: 1,
+          maxLength: 200,
+        },
+      ],
+    });
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.enqueue({
+        messageId: "m_mcp_secret",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "invoke secure MCP form",
+      });
+
+      expect(codex.response).toEqual({ action: "cancel" });
+      expect(sender.mcpElicitationCards).toHaveLength(0);
+      expect(sender.messages.some((message) => message.text.includes("secret/password-like"))).toBe(
+        true,
+      );
+      expect(sender.messages.every((message) => !message.text.includes(secretPrompt))).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(secretPrompt);
+    });
+  });
+
+  test("binds URL MCP acceptance to the original sender", async () => {
+    const request: CodexMcpElicitationRequest = {
+      id: "mcp_url_1",
+      serverName: "oauth-provider",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Authorize access in the browser.",
+      mode: "url",
+      elicitationId: "elicit_1",
+      url: "https://auth.example.test/authorize?flow=release",
+    };
+    const codex = new McpElicitationCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_mcp_url",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "authorize release provider",
+        });
+        await waitFor(() => sender.mcpElicitationCards.length === 1);
+        const handle = sender.mcpElicitationCards[0]!.handle;
+
+        const rejected = await router.handleCardAction({
+          action: "resolve_mcp_elicitation",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "accept",
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(rejected).toast.type).toBe("error");
+        expect(codex.response).toBeUndefined();
+
+        const accepted = await router.handleCardAction({
+          action: "resolve_mcp_elicitation",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "accept",
+          sender: { openId: "ou_user" },
+        });
+        expect(accepted).toHaveProperty("card");
+        await running;
+
+        expect(codex.response).toEqual({ action: "accept", content: null });
+        expect(sender.mcpElicitationCardUpdates.at(-1)).toMatchObject({
+          handle,
+          input: { status: "resolved", request },
+        });
+      },
+    );
+  });
+
+  test("expires MCP elicitation on abort and rejects late card actions", async () => {
+    const request: CodexMcpElicitationRequest = {
+      id: "mcp_expired",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Confirm the release.",
+      mode: "form",
+      fields: [
+        {
+          name: "confirmed",
+          title: "Confirmed",
+          description: null,
+          required: true,
+          type: "boolean",
+          default: null,
+        },
+      ],
+    };
+    const codex = new McpElicitationCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_mcp_expired",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "confirm release",
+      });
+      await waitFor(() => sender.mcpElicitationCards.length === 1);
+      const handle = sender.mcpElicitationCards[0]!.handle;
+
+      codex.abortRequest();
+      await running;
+      expect(codex.response).toEqual({ action: "cancel" });
+      expect(sender.mcpElicitationCardUpdates.at(-1)?.input.status).toBe("expired");
+
+      const late = await router.handleCardAction({
+        action: "answer_mcp_elicitation",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        requestId: request.id,
+        fieldId: "confirmed",
+        optionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
   });
 
   test("card retry action reruns the prompt from the status card context", async () => {
@@ -3196,16 +6157,21 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
   }) => Promise<void>,
 ): Promise<void> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-test-"));
+  let router: MessageRouter | undefined;
   try {
     const config = loadConfig({
       FEISHU_APP_ID: "cli_test",
       FEISHU_APP_SECRET: "secret",
       CODEX_WORKDIR: tempDir,
       BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+      ATTACHMENT_DOWNLOAD_DIR: path.join(tempDir, "attachments"),
       ALLOWED_USER_IDS: "ou_user",
       ...env,
     });
-    const router = new MessageRouter(
+    if (sender instanceof AttachmentCollectingSender) {
+      sender.setAttachmentRoot(config.attachmentDownloadDir);
+    }
+    router = new MessageRouter(
       config,
       new JsonStateStore(config.bridgeStatePath),
       sender,
@@ -3215,6 +6181,7 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
     await router.start();
     await testBody({ router, sender, codex, config });
   } finally {
+    await router?.dispose();
     await rm(tempDir, { recursive: true, force: true });
   }
 }

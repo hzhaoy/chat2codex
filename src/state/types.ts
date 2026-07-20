@@ -1,4 +1,8 @@
+import { randomUUID } from "node:crypto";
+
 export interface ChatSession {
+  /** Rotated whenever the chat starts or selects a different logical Codex session. */
+  sessionEpoch: string;
   threadId?: string;
   cwd: string;
   chatType?: "direct" | "group";
@@ -8,6 +12,12 @@ export interface ChatSession {
   lastTurns?: TurnSelection[];
   lastRun?: LastRunSummary;
 }
+
+/**
+ * Creates an opaque, non-sensitive identity for one logical chat session.
+ * Runtime app-server handles and permission grants must never be persisted here.
+ */
+export const createSessionEpoch = (): string => randomUUID();
 
 export interface ProjectSelection {
   cwd: string;
@@ -120,6 +130,12 @@ export interface RecentFailureDiagnostic {
   hint?: string;
 }
 
+export type PendingMessageRoute =
+  | "codex"
+  | "control_replay_safe"
+  | "control_no_replay"
+  | "message";
+
 export interface PendingMessageDelivery {
   messageId: string;
   chatId: string;
@@ -138,10 +154,68 @@ export interface PendingMessageDelivery {
   acceptedAt: string;
   attempts: number;
   lastError?: string;
+  /**
+   * Added after the initial durable-inbox rollout. Missing values are
+   * classified conservatively during recovery for state-file compatibility.
+   */
+  route?: PendingMessageRoute;
+}
+
+export type DurableCodexJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface DurableCodexJob {
+  id: string;
+  kind: "codex_run" | "control_recovery";
+  messageId: string;
+  chatId: string;
+  chatType: "direct" | "group";
+  cwd: string;
+  prompt: string;
+  /** Missing on pre-v0.5 state files and therefore treated as default mode. */
+  collaborationMode?: "default" | "plan";
+  threadId?: string;
+  status: DurableCodexJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  result?: LastRunSummary;
+  deliveryIds: string[];
+  interruptionReason?: string;
+  /** A durable singleton used to suppress repeated queue-full replies. */
+  capacityNoticeScope?: "global" | "chat";
+  capacityNoticeKind?: "durable" | "inbox";
+  capacityNoticeActive?: boolean;
+}
+
+export type DurableOutboxStatus = "pending" | "sending" | "delivered";
+
+export interface DurableOutboxMessage {
+  id: string;
+  jobId: string;
+  chatId: string;
+  kind: "text" | "markdown";
+  text: string;
+  sequence: number;
+  status: DurableOutboxStatus;
+  idempotencyKey: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  deliveredAt?: string;
+  lastError?: string;
 }
 
 export interface BridgeState {
   chats: Record<string, ChatSession>;
+  jobs: Record<string, DurableCodexJob>;
+  outbox: Record<string, DurableOutboxMessage>;
   pendingMessages: Record<string, PendingMessageDelivery>;
   processedMessageIds: string[];
   diagnostics: BridgeDiagnostics;
@@ -149,6 +223,8 @@ export interface BridgeState {
 
 export const emptyState = (): BridgeState => ({
   chats: {},
+  jobs: {},
+  outbox: {},
   pendingMessages: {},
   processedMessageIds: [],
   diagnostics: {},

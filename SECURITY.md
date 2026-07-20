@@ -5,8 +5,14 @@ as a remote-control surface for the machine running the bridge.
 
 ## Supported Versions
 
-Security fixes target the latest code on `main` until the project starts
-publishing versioned releases.
+Security fixes are developed on `main` and released for the latest published
+minor release line. Earlier minor release lines do not receive security fixes;
+upgrade before reporting or validating a suspected vulnerability.
+
+| Version | Supported |
+| --- | --- |
+| `0.5.x` | Yes |
+| `<= 0.4.x` | No |
 
 ## Reporting a Vulnerability
 
@@ -38,6 +44,29 @@ paths, screenshots of private chats, or attached documents in public reports.
 - Rotate `FEISHU_APP_SECRET` if `.env` or a service log may have been shared.
 - Platform credentials are removed from the environment passed to Codex child
   processes. Keep unrelated secrets out of the bridge service environment too.
+- After installing or upgrading Codex CLI, run `chat2codex doctor`. An exact
+  version mismatch with the bundled app-server protocol snapshot is a warning;
+  run `chat2codex smoke` before treating that CLI version as compatible.
+- Unknown app-server server-request methods are rejected, and malformed
+  approval requests return an invalid-params error without offering an
+  approval action. Supported `requestUserInput`, standard MCP form/URL
+  elicitation, and additional-permission requests are revalidated against the
+  runner's original request before a response is returned. Callbacks are bound
+  to the original sender and card message; malformed, withdrawn, late, secret,
+  or incompletely rendered requests fail closed. Interactive answer values are
+  not persisted or echoed by the bridge. Investigate compatibility warnings
+  instead of weakening this behavior.
+- Session-scoped command and permission grants remain only in the reusable
+  app-server process that received them. The bridge rotates that process when
+  the sender identity, canonical cwd, thread, policy, or session epoch changes;
+  messages without a stable sender identity use a single-turn process and
+  cannot inherit session grants.
+- Approval cards disclose additional permission profiles and every complete
+  exec/network policy rule. If any security-relevant detail cannot be rendered
+  completely, allow actions are removed and only decline/cancel remain, and the
+  same filter is enforced server-side for card callbacks. File-change approval
+  requests currently omit target files and patch details, so they are limited
+  to decline/cancel until complete disclosure is available.
 - Pending events are replayed with at-least-once semantics. Review sensitive
   side effects after an interrupted run before allowing an automatic retry.
 - Run only one bridge process for each `BRIDGE_STATE_PATH`; startup rejects a

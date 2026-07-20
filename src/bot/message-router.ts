@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -8,13 +9,22 @@ import {
   type CodexApprovalDecision,
   type CodexApprovalRequest,
   type CodexCommandSummary,
+  type CodexCollaborationMode,
   type CodexForkThreadInput,
+  type CodexMcpElicitationField,
+  type CodexMcpElicitationRequest,
+  type CodexMcpElicitationResponse,
+  type CodexMcpElicitationValue,
+  type CodexPermissionApprovalDecision,
+  type CodexPermissionApprovalRequest,
   CodexRunner,
   type CodexProgressUpdate,
   type CodexRunControl,
   type CodexRunInput,
   type CodexRunResult,
   type CodexRunSummary,
+  type CodexUserInputRequest,
+  type CodexUserInputResponse,
   type CodexThread,
   type CodexThreadItem,
   type CodexThreadListInput,
@@ -32,6 +42,10 @@ import { BridgeConfig } from "../config/env.js";
 import { JsonStateStore } from "../state/store.js";
 import {
   BridgeState,
+  createSessionEpoch,
+  type DurableCodexJob,
+  type DurableCodexJobStatus,
+  type DurableOutboxMessage,
   type ChatDiagnostics,
   type EventDiagnosticOutcome,
   type EventDiagnosticSnapshot,
@@ -41,6 +55,7 @@ import {
   type LastRunStatus,
   type LastRunSummary,
   type PendingMessageDelivery,
+  type PendingMessageRoute,
   type ProjectSelection,
   type RecentFailureDiagnostic,
   type ThreadSelection,
@@ -57,6 +72,13 @@ import {
   type SenderIdentity,
 } from "./access-control.js";
 import {
+  enforceAttachmentStoreLimits,
+  removeAttachmentFiles,
+} from "./attachment-store.js";
+import {
+  answerUserInputCardAction,
+  answerMcpElicitationCardAction,
+  cancelUserInputCardAction,
   cardActionCard,
   cardActionToast,
   pageProjectsCardAction,
@@ -64,6 +86,8 @@ import {
   retryRunCardAction,
   resumeThreadCardAction,
   resolveApprovalCardAction,
+  resolveMcpElicitationCardAction,
+  resolvePermissionApprovalCardAction,
   selectProjectCardAction,
   showRunDetailCardAction,
   stopRunCardAction,
@@ -74,19 +98,33 @@ import {
 import {
   buildApprovalCard,
   buildHostHealthCard,
+  buildMcpElicitationCard,
+  buildPermissionApprovalCard,
   buildProjectListCard,
   buildSessionListCard,
+  buildUserInputCard,
+  getMcpElicitationCardOptionValue,
+  isApprovalDecisionIndexAllowed,
+  isMcpElicitationCardDecisionAllowed,
+  isMcpElicitationCardSkipAllowed,
+  isPermissionApprovalCardDecisionAllowed,
   type ApprovalCardInput,
   type HostHealthCardInput,
   type LarkInteractiveCard,
+  type McpElicitationCardInput,
+  type PermissionApprovalCardInput,
   type RunResultCardInput,
   type RunStatusCardInput,
+  type UserInputCardInput,
 } from "./lark-card.js";
 
 const minProgressIntervalMs = 15_000;
 const maxRememberedStatusCards = 100;
 const pendingRunSteerTtlMs = 30_000;
 const maxPendingSteers = 5;
+const maxUserInputAnswerLength = 4_000;
+const maxMcpTextAnswerLength = 16_384;
+const outboxRetryDelaysMs = [250, 1_000, 5_000, 30_000, 120_000] as const;
 const pendingSteerLimitMessage = "已有 5 条补充指令等待发送，请先等当前 Codex 任务接收后再试。";
 
 export interface IncomingTextMessage {
@@ -124,8 +162,8 @@ export interface IncomingEventDiagnostic {
 }
 
 export interface ChatSender {
-  sendText(chatId: string, text: string): Promise<void>;
-  sendMarkdown?(chatId: string, markdown: string): Promise<void>;
+  sendText(chatId: string, text: string, options?: ChatDeliveryOptions): Promise<void>;
+  sendMarkdown?(chatId: string, markdown: string, options?: ChatDeliveryOptions): Promise<void>;
   sendInteractiveCard?(chatId: string, card: LarkInteractiveCard): Promise<void>;
   updateInteractiveCard?(messageId: string, card: LarkInteractiveCard): Promise<void>;
   downloadAttachment?(
@@ -136,6 +174,28 @@ export interface ChatSender {
   updateStatusCard?(handle: StatusCardHandle, input: RunStatusCardInput): Promise<void>;
   createApprovalCard?(chatId: string, input: ApprovalCardInput): Promise<StatusCardHandle>;
   updateApprovalCard?(handle: StatusCardHandle, input: ApprovalCardInput): Promise<void>;
+  createUserInputCard?(chatId: string, input: UserInputCardInput): Promise<StatusCardHandle>;
+  updateUserInputCard?(handle: StatusCardHandle, input: UserInputCardInput): Promise<void>;
+  createPermissionApprovalCard?(
+    chatId: string,
+    input: PermissionApprovalCardInput,
+  ): Promise<StatusCardHandle>;
+  updatePermissionApprovalCard?(
+    handle: StatusCardHandle,
+    input: PermissionApprovalCardInput,
+  ): Promise<void>;
+  createMcpElicitationCard?(
+    chatId: string,
+    input: McpElicitationCardInput,
+  ): Promise<StatusCardHandle>;
+  updateMcpElicitationCard?(
+    handle: StatusCardHandle,
+    input: McpElicitationCardInput,
+  ): Promise<void>;
+}
+
+export interface ChatDeliveryOptions {
+  idempotencyKey?: string;
 }
 
 export interface StatusCardHandle {
@@ -144,6 +204,8 @@ export interface StatusCardHandle {
 
 export interface CodexClient {
   run(input: CodexRunInput): Promise<CodexRunResult>;
+  invalidateChatSession?(chatId: string, reason?: string): Promise<void>;
+  dispose?(): Promise<void>;
   listThreads?(input?: CodexThreadListInput): Promise<CodexThreadListResult>;
   readThread?(threadId: string): Promise<CodexThread | null>;
   searchThreads?(input: CodexThreadSearchInput): Promise<CodexThreadSearchResult>;
@@ -154,7 +216,9 @@ export interface CodexClient {
 }
 
 interface PendingApproval {
+  key: string;
   chatId: string;
+  originSender: SenderIdentity;
   request: CodexApprovalRequest;
   resolve: (decision: CodexApprovalDecision) => void;
   handle: StatusCardHandle | null;
@@ -188,10 +252,63 @@ interface QueuedRunState {
   controller: AbortController;
   cwd: string;
   prompt: string;
+  collaborationMode: CodexCollaborationMode;
+  sessionEpoch: string;
   messageId?: string;
   threadId?: string;
   chatType?: ChatType;
+  originSender?: SenderIdentity;
   queuedAtMs: number;
+  waitingFor: "workspace" | "global_capacity";
+}
+
+interface GlobalRunWaiter {
+  signal: AbortSignal;
+  resolve: (release: (() => void) | null) => void;
+  abortListener: () => void;
+}
+
+interface PendingUserInput {
+  key: string;
+  chatId: string;
+  chatType: ChatType;
+  originSender: SenderIdentity;
+  request: CodexUserInputRequest;
+  replyCode: string;
+  answers: Map<string, { answers: string[] }>;
+  resolve: (response: CodexUserInputResponse) => void;
+  signal: AbortSignal;
+  abortListener: () => void;
+  handle: StatusCardHandle | null;
+  terminalCard?: UserInputCardInput;
+}
+
+interface PendingPermissionApproval {
+  key: string;
+  chatId: string;
+  originSender: SenderIdentity;
+  request: CodexPermissionApprovalRequest;
+  resolve: (decision: CodexPermissionApprovalDecision) => void;
+  signal: AbortSignal;
+  abortListener: () => void;
+  handle: StatusCardHandle | null;
+  timeoutTimer?: NodeJS.Timeout;
+  terminalCard?: PermissionApprovalCardInput;
+}
+
+interface PendingMcpElicitation {
+  key: string;
+  chatId: string;
+  originSender: SenderIdentity;
+  request: CodexMcpElicitationRequest;
+  replyCode: string;
+  answers: Map<string, CodexMcpElicitationValue>;
+  completedFieldIds: Set<string>;
+  resolve: (response: CodexMcpElicitationResponse) => void;
+  signal: AbortSignal;
+  abortListener: () => void;
+  handle: StatusCardHandle | null;
+  terminalCard?: McpElicitationCardInput;
 }
 
 interface PendingSteer {
@@ -205,17 +322,32 @@ interface PendingRunSteers {
 
 export class MessageRouter {
   private state: BridgeState | null = null;
+  private stateMutationTail: Promise<void> = Promise.resolve();
+  private attachmentTaskTail: Promise<void> = Promise.resolve();
   private readonly bridgeStartedAtMs = Date.now();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly workspaceQueues = new Map<string, Promise<void>>();
   private readonly messageTasks = new Map<string, Promise<void>>();
+  private readonly outboxTasks = new Map<string, Promise<void>>();
+  private readonly outboxRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly queueDepths = new Map<string, number>();
   private readonly queuedRuns = new Map<string, QueuedRunState>();
   private readonly activeRuns = new Map<string, ActiveRunState>();
   private readonly pendingRunSteers = new Map<string, PendingRunSteers>();
   private readonly activeApprovals = new Map<string, PendingApproval>();
-  private readonly statusCardRuns = new Map<string, { chatId: string; prompt: string }>();
+  private readonly activeUserInputs = new Map<string, PendingUserInput>();
+  private readonly activePermissionApprovals = new Map<string, PendingPermissionApproval>();
+  private readonly activeMcpElicitations = new Map<string, PendingMcpElicitation>();
+  private readonly statusCardRuns = new Map<
+    string,
+    { chatId: string; prompt: string; collaborationMode: CodexCollaborationMode }
+  >();
+  private readonly globalRunWaiters: GlobalRunWaiter[] = [];
+  private readonly activeCodexRunTasks = new Set<Promise<CodexRunResult>>();
+  private activeGlobalRuns = 0;
   private readonly codex: CodexClient;
+  private disposed = false;
+  private disposePromise: Promise<void> | null = null;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -227,20 +359,261 @@ export class MessageRouter {
     this.codex = codex ?? new CodexRunner(config, logger);
   }
 
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
+    this.disposed = true;
+    for (const timer of this.outboxRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.outboxRetryTimers.clear();
+    for (const pending of this.pendingRunSteers.values()) {
+      clearTimeout(pending.timeoutTimer);
+    }
+    this.pendingRunSteers.clear();
+    for (const queuedRun of this.queuedRuns.values()) {
+      queuedRun.controller.abort();
+    }
+    this.queuedRuns.clear();
+    for (const run of this.activeRuns.values()) {
+      if (run.timeoutTimer) {
+        clearTimeout(run.timeoutTimer);
+      }
+      run.controller.abort();
+    }
+    for (const waiter of this.globalRunWaiters.splice(0)) {
+      waiter.signal.removeEventListener("abort", waiter.abortListener);
+      waiter.resolve(null);
+    }
+    this.disposePromise = (async () => {
+      const errors: unknown[] = [];
+      if (this.state) {
+        const now = new Date().toISOString();
+        try {
+          await this.mutateState((state) => {
+            for (const job of Object.values(state.jobs)) {
+              if (job.status !== "running") {
+                continue;
+              }
+              interruptDurableJob(state, job, now, "bridge_shutdown");
+              markMessageProcessed(state, job.messageId);
+            }
+          });
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      try {
+        await this.codex.dispose?.();
+      } catch (error) {
+        errors.push(error);
+      }
+      const taskResults = await Promise.allSettled([
+        ...this.activeCodexRunTasks,
+        ...this.messageTasks.values(),
+        ...this.queues.values(),
+        ...this.outboxTasks.values(),
+        this.attachmentTaskTail,
+      ]);
+      for (const result of taskResults) {
+        if (result.status === "rejected") {
+          this.logger.warn("Router task failed during bridge shutdown", result.reason);
+        }
+      }
+      await this.stateMutationTail;
+      if (errors.length === 1) {
+        throw errors[0];
+      }
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "Failed to dispose Chat2Codex cleanly");
+      }
+    })();
+    return this.disposePromise;
+  }
+
   async start(): Promise<void> {
+    if (this.disposed) {
+      throw new Error("Cannot start a disposed MessageRouter.");
+    }
     this.state = await this.store.load();
+    await this.recoverDurableState();
+    for (const jobId of new Set(
+      Object.values(this.state.outbox)
+        .filter((delivery) => delivery.status === "pending")
+        .map((delivery) => delivery.jobId),
+    )) {
+      this.scheduleOutboxDrain(jobId);
+    }
     for (const pending of Object.values(this.state.pendingMessages)) {
-      this.scheduleAcceptedMessage(fromPendingMessage(pending));
+      const job = this.state.jobs[pending.messageId];
+      const route = pending.route ?? inferLegacyPendingRoute(this.config, pending, job);
+      if (route === "control_replay_safe" || route === "message") {
+        this.scheduleAcceptedMessage(fromPendingMessage(pending));
+      } else if (route === "codex" && job?.status === "queued") {
+        this.scheduleAcceptedMessage(fromPendingMessage(pending));
+      }
     }
   }
 
   async accept(message: IncomingTextMessage): Promise<void> {
-    const state = this.requireState();
-    if (state.processedMessageIds.includes(message.messageId)) {
+    if (this.disposed) {
       return;
     }
-    state.pendingMessages[message.messageId] ??= toPendingMessage(message);
-    await this.store.save(state);
+    if (this.requireState().processedMessageIds.includes(message.messageId)) {
+      return;
+    }
+    if (
+      !message.attachments?.length &&
+      (isUserInputAnswerCommand(message) || isMcpAnswerCommand(message))
+    ) {
+      // Interactive answers can contain private values. Keep the
+      // command in memory only; processMessage still persists its message id so
+      // successful deliveries remain deduplicated without persisting the answer.
+      this.scheduleAcceptedMessage(message);
+      return;
+    }
+    let retryPending: IncomingTextMessage | undefined;
+    const outcome = await this.mutateState((state) => {
+      if (state.processedMessageIds.includes(message.messageId)) {
+        return "duplicate" as const;
+      }
+      const existingPending = state.pendingMessages[message.messageId];
+      if (existingPending) {
+        retryPending = fromPendingMessage(existingPending);
+        return "retry_pending" as const;
+      }
+      const route = pendingMessageRoute(this.config, message);
+      const durableCandidate = route === "codex";
+      clearResolvedCapacityNotices(state, this.config);
+      if (durableCandidate && !state.jobs[message.messageId]) {
+        const session = this.ensureSession(message.chatId, state, message.chatType);
+        const now = new Date().toISOString();
+        const capacityScope = queueLimitScope(state, message.chatId, this.config);
+        if (capacityScope) {
+          const activeNotice = hasActiveCapacityNotice(
+            state,
+            "durable",
+            capacityScope,
+            message.chatId,
+          );
+          if (activeNotice) {
+            markMessageProcessed(state, message.messageId);
+            return "rejected_silently" as const;
+          }
+          const job: DurableCodexJob = {
+            id: message.messageId,
+            kind: "codex_run",
+            messageId: message.messageId,
+            chatId: message.chatId,
+            chatType: message.chatType,
+            cwd: session.cwd,
+            prompt: "[rejected: queue capacity reached]",
+            threadId: session.threadId,
+            status: "cancelled",
+            createdAt: now,
+            updatedAt: now,
+            completedAt: now,
+            deliveryIds: [],
+            interruptionReason: "queue_capacity_reached",
+            capacityNoticeScope: capacityScope,
+            capacityNoticeKind: "durable",
+            capacityNoticeActive: true,
+          };
+          state.jobs[message.messageId] = job;
+          appendOutboxDeliveries(
+            state,
+            job,
+            [{ kind: "text", text: queueCapacityMessage(this.config) }],
+            now,
+          );
+          markMessageProcessed(state, message.messageId);
+          return "rejected" as const;
+        }
+        const turn = parseCodexTurnRequest(routedText(message));
+        state.jobs[message.messageId] = {
+          id: message.messageId,
+          kind: "codex_run",
+          messageId: message.messageId,
+          chatId: message.chatId,
+          chatType: message.chatType,
+          cwd: session.cwd,
+          prompt: turn.prompt,
+          collaborationMode: turn.collaborationMode,
+          threadId: session.threadId,
+          status: "queued",
+          createdAt: now,
+          updatedAt: now,
+          deliveryIds: [],
+        };
+      } else if (!durableCandidate) {
+        const capacityScope = pendingInboxLimitScope(
+          state,
+          message.chatId,
+          this.config,
+        );
+        if (capacityScope) {
+          const activeNotice = hasActiveCapacityNotice(
+            state,
+            "inbox",
+            capacityScope,
+            message.chatId,
+          );
+          if (activeNotice) {
+            markMessageProcessed(state, message.messageId);
+            return "rejected_silently" as const;
+          }
+          const now = new Date().toISOString();
+          const session = state.chats[message.chatId];
+          const job: DurableCodexJob = {
+            id: message.messageId,
+            kind: "control_recovery",
+            messageId: message.messageId,
+            chatId: message.chatId,
+            chatType: message.chatType,
+            cwd: session?.cwd ?? this.config.codexWorkdir,
+            prompt: "[rejected: inbox capacity reached]",
+            threadId: session?.threadId,
+            status: "cancelled",
+            createdAt: now,
+            updatedAt: now,
+            completedAt: now,
+            deliveryIds: [],
+            interruptionReason: "inbox_capacity_reached",
+            capacityNoticeScope: capacityScope,
+            capacityNoticeKind: "inbox",
+            capacityNoticeActive: true,
+          };
+          state.jobs[job.id] = job;
+          appendOutboxDeliveries(
+            state,
+            job,
+            [{ kind: "text", text: inboxCapacityMessage(this.config) }],
+            now,
+          );
+          markMessageProcessed(state, message.messageId);
+          return "rejected" as const;
+        }
+      }
+      state.pendingMessages[message.messageId] ??= toPendingMessage(message, route);
+      return "accepted" as const;
+    });
+    if (outcome === "duplicate") {
+      return;
+    }
+    if (outcome === "retry_pending") {
+      if (retryPending) {
+        this.scheduleAcceptedMessage(retryPending);
+      }
+      return;
+    }
+    if (outcome === "rejected") {
+      this.scheduleOutboxDrain(message.messageId);
+      return;
+    }
+    if (outcome === "rejected_silently") {
+      return;
+    }
     this.scheduleAcceptedMessage(message);
   }
 
@@ -248,7 +621,9 @@ export class MessageRouter {
     outcome: EventDiagnosticOutcome,
     diagnostic: IncomingEventDiagnostic,
   ): Promise<void> {
-    const state = this.requireState();
+    if (this.disposed) {
+      return;
+    }
     const snapshot: EventDiagnosticSnapshot = {
       at: new Date().toISOString(),
       outcome,
@@ -263,17 +638,21 @@ export class MessageRouter {
       textLength: diagnostic.textLength,
       botIdentityResolved: diagnostic.botIdentityResolved,
     };
-    const diagnostics = diagnostic.chatId
-      ? ensureChatDiagnostics(state, diagnostic.chatId)
-      : state.diagnostics;
-    diagnostics.lastEvent = snapshot;
-    if (outcome === "dropped") {
-      diagnostics.lastDroppedEvent = snapshot;
-    }
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const diagnostics = diagnostic.chatId
+        ? ensureChatDiagnostics(state, diagnostic.chatId)
+        : state.diagnostics;
+      diagnostics.lastEvent = snapshot;
+      if (outcome === "dropped") {
+        diagnostics.lastDroppedEvent = snapshot;
+      }
+    });
   }
 
   enqueue(message: IncomingTextMessage): Promise<void> {
+    if (this.disposed) {
+      return Promise.resolve();
+    }
     if (!message.attachments?.length && isStopCommand(message)) {
       return this.handleImmediateStop(message);
     }
@@ -288,6 +667,12 @@ export class MessageRouter {
     }
     if (!message.attachments?.length && detailCommandKind(message)) {
       return this.handleImmediateRunDetail(message);
+    }
+    if (!message.attachments?.length && isUserInputAnswerCommand(message)) {
+      return this.handleImmediateUserInputAnswer(message);
+    }
+    if (!message.attachments?.length && isMcpAnswerCommand(message)) {
+      return this.handleImmediateMcpAnswer(message);
     }
 
     return this.enqueueTask(message.chatId, () => this.handle(message));
@@ -310,6 +695,9 @@ export class MessageRouter {
   }
 
   async handleCardAction(action: IncomingCardAction): Promise<CardActionResponse | undefined> {
+    if (this.disposed) {
+      return cardActionToast("warning", "Chat2Codex 正在关闭，这个卡片操作已忽略。");
+    }
     const access = decideAccess(this.config.access, {
       chatId: action.chatId,
       chatType: this.chatTypeForAction(action.chatId),
@@ -339,6 +727,21 @@ export class MessageRouter {
     if (action.action === resolveApprovalCardAction) {
       return this.handleApprovalCardAction(action);
     }
+    if (
+      action.action === answerUserInputCardAction ||
+      action.action === cancelUserInputCardAction
+    ) {
+      return this.handleUserInputCardAction(action);
+    }
+    if (action.action === resolvePermissionApprovalCardAction) {
+      return this.handlePermissionApprovalCardAction(action);
+    }
+    if (
+      action.action === answerMcpElicitationCardAction ||
+      action.action === resolveMcpElicitationCardAction
+    ) {
+      return this.handleMcpElicitationCardAction(action);
+    }
     if (action.action === pageProjectsCardAction) {
       return this.handleProjectPageCardAction(action);
     }
@@ -346,10 +749,18 @@ export class MessageRouter {
       return this.handleSessionPageCardAction(action);
     }
     if (action.action === selectProjectCardAction) {
-      return this.handleSelectProjectCardAction(action);
+      return this.enqueueSessionCardAction(
+        action.chatId,
+        "当前 chat 有任务排队或运行中，完成或停止后再切换项目。",
+        () => this.handleSelectProjectCardAction(action),
+      );
     }
     if (action.action === resumeThreadCardAction) {
-      return this.handleResumeThreadCardAction(action);
+      return this.enqueueSessionCardAction(
+        action.chatId,
+        "当前 chat 有任务排队或运行中，完成或停止后再切换会话。",
+        () => this.handleResumeThreadCardAction(action),
+      );
     }
 
     return cardActionToast("warning", "这个卡片操作已被忽略。");
@@ -364,6 +775,9 @@ export class MessageRouter {
       })
       .then(async () => {
         this.decrementQueueDepth(chatId);
+        if (this.disposed) {
+          return;
+        }
         await task();
       })
       .finally(() => {
@@ -374,6 +788,25 @@ export class MessageRouter {
 
     this.queues.set(chatId, next);
     return next;
+  }
+
+  private async enqueueSessionCardAction<T>(
+    chatId: string,
+    busyMessage: string,
+    task: () => Promise<T>,
+  ): Promise<T | CardActionResponse> {
+    if (
+      this.queues.has(chatId) ||
+      this.queuedRuns.has(chatId) ||
+      this.activeRuns.has(chatId)
+    ) {
+      return cardActionToast("warning", busyMessage);
+    }
+    let result!: T;
+    await this.enqueueTask(chatId, async () => {
+      result = await task();
+    });
+    return result;
   }
 
   private processMessage(
@@ -401,19 +834,28 @@ export class MessageRouter {
     const state = this.requireState();
     if (state.processedMessageIds.includes(message.messageId)) {
       if (state.pendingMessages[message.messageId]) {
-        delete state.pendingMessages[message.messageId];
-        await this.store.save(state);
+        await this.mutateState((currentState) => {
+          delete currentState.pendingMessages[message.messageId];
+        });
       }
       this.logger.debug("Skipping duplicate message", { messageId: message.messageId });
       return;
     }
 
     await action();
-    if (!state.processedMessageIds.includes(message.messageId)) {
-      state.processedMessageIds.push(message.messageId);
+    if (this.disposed) {
+      return;
     }
-    delete state.pendingMessages[message.messageId];
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const job = currentState.jobs[message.messageId];
+      if (job?.status === "queued") {
+        job.status = "cancelled";
+        job.prompt = truncateInline(job.prompt, 180);
+        job.updatedAt = new Date().toISOString();
+        job.completedAt = job.updatedAt;
+      }
+      markMessageProcessed(currentState, message.messageId);
+    });
   }
 
   private incrementQueueDepth(chatId: string): void {
@@ -503,6 +945,10 @@ export class MessageRouter {
       await this.compactThread(message.chatId, message.chatType);
       return;
     }
+    if (!hasAttachments && text === "/plan") {
+      await this.sender.sendText(message.chatId, "用法：/plan <任务>（以 Plan 模式执行这一轮）");
+      return;
+    }
     if (!hasAttachments && (text === "/new" || text === "/reset")) {
       await this.resetSession(message.chatId);
       return;
@@ -512,12 +958,20 @@ export class MessageRouter {
       return;
     }
 
-    const prompt = await this.buildCodexPrompt(message, text);
+    const turn = parseCodexTurnRequest(text);
+    const prompt = await this.buildCodexPrompt(message, turn.prompt);
     if (!prompt) {
       return;
     }
 
-    await this.runCodex(message.chatId, prompt, message.chatType, message.messageId);
+    await this.runCodex(
+      message.chatId,
+      prompt,
+      message.chatType,
+      message.messageId,
+      message.sender,
+      turn.collaborationMode,
+    );
   }
 
   private async rejectUnauthorized(
@@ -543,23 +997,62 @@ export class MessageRouter {
     );
   }
 
-  private runCodex(
+  private async runCodex(
     chatId: string,
     prompt: string,
     chatType?: ChatType,
     messageId?: string,
+    originSender?: SenderIdentity,
+    collaborationMode: CodexCollaborationMode = "default",
   ): Promise<void> {
     const state = this.requireState();
     const session = this.ensureSession(chatId, state, chatType);
+    if (messageId) {
+      await this.mutateState((currentState) => {
+        const currentSession = this.ensureSession(chatId, currentState, chatType);
+        const now = new Date().toISOString();
+        const job = currentState.jobs[messageId] ?? {
+          id: messageId,
+          kind: "codex_run" as const,
+          messageId,
+          chatId,
+          chatType: currentSession.chatType ?? chatType ?? "direct",
+          cwd: currentSession.cwd,
+          prompt,
+          status: "queued" as const,
+          createdAt: now,
+          updatedAt: now,
+          deliveryIds: [],
+        };
+        if (isTerminalJobStatus(job.status)) {
+          return;
+        }
+        job.cwd = currentSession.cwd;
+        job.prompt = prompt;
+        job.collaborationMode = collaborationMode;
+        job.threadId = currentSession.threadId;
+        job.updatedAt = now;
+        currentState.jobs[messageId] = job;
+      });
+      const existing = this.requireState().jobs[messageId];
+      if (existing && isTerminalJobStatus(existing.status)) {
+        this.scheduleOutboxDrain(messageId);
+        return;
+      }
+    }
     const workspace = canonicalExistingPath(session.cwd) ?? path.resolve(session.cwd);
     const queuedRun: QueuedRunState = {
       controller: new AbortController(),
       cwd: session.cwd,
       prompt,
+      collaborationMode,
+      sessionEpoch: session.sessionEpoch,
       messageId,
       threadId: session.threadId,
       chatType: session.chatType ?? chatType,
+      originSender: originSender ? { ...originSender } : undefined,
       queuedAtMs: Date.now(),
+      waitingFor: "workspace",
     };
     this.queuedRuns.set(chatId, queuedRun);
     let workspaceTaskStarted = false;
@@ -570,7 +1063,7 @@ export class MessageRouter {
       }
       await this.runCodexInWorkspace(chatId, queuedRun);
     });
-    return waitForTaskOrQueuedAbort(
+    return await waitForTaskOrQueuedAbort(
       workspaceTask,
       queuedRun.controller.signal,
       () => workspaceTaskStarted,
@@ -603,7 +1096,11 @@ export class MessageRouter {
   ): Promise<void> {
     const state = this.requireState();
     const session = this.ensureSession(chatId, state, queuedRun.chatType);
-    if (session.cwd !== queuedRun.cwd || session.threadId !== queuedRun.threadId) {
+    if (
+      session.cwd !== queuedRun.cwd ||
+      session.threadId !== queuedRun.threadId ||
+      session.sessionEpoch !== queuedRun.sessionEpoch
+    ) {
       await this.sender.sendText(
         chatId,
         "任务排队期间项目或会话已变化；为避免在错误工作区执行，这次任务已取消。",
@@ -617,6 +1114,27 @@ export class MessageRouter {
     }
     await this.store.save(state);
 
+    queuedRun.waitingFor = "global_capacity";
+    const releaseGlobalRun = await this.acquireGlobalRunPermit(queuedRun.controller.signal);
+    if (!releaseGlobalRun) {
+      return;
+    }
+    try {
+      await this.runCodexWithGlobalPermit(chatId, queuedRun);
+    } finally {
+      releaseGlobalRun();
+    }
+  }
+
+  private async runCodexWithGlobalPermit(
+    chatId: string,
+    queuedRun: QueuedRunState,
+  ): Promise<void> {
+    const state = this.requireState();
+    const session = this.ensureSession(chatId, state, queuedRun.chatType);
+    const prompt = queuedRun.prompt;
+    queuedRun.waitingFor = "workspace";
+
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
     const statusCard = await this.createStatusCard(chatId, {
@@ -627,7 +1145,7 @@ export class MessageRouter {
       startedAt,
       updatedAt: startedAt,
     });
-    this.rememberStatusCardRun(statusCard, chatId, prompt);
+    this.rememberStatusCardRun(statusCard, chatId, prompt, queuedRun.collaborationMode);
 
     const controller = queuedRun.controller;
     if (controller.signal.aborted) {
@@ -640,6 +1158,18 @@ export class MessageRouter {
         updatedAt: new Date().toISOString(),
       });
       return;
+    }
+    if (queuedRun.messageId) {
+      await this.mutateState((currentState) => {
+        const job = currentState.jobs[queuedRun.messageId!];
+        if (!job || isTerminalJobStatus(job.status)) {
+          return;
+        }
+        job.status = "running";
+        job.prompt = truncateInline(job.prompt, 180);
+        job.startedAt = startedAt;
+        job.updatedAt = startedAt;
+      });
     }
     const runState: ActiveRunState = {
       controller,
@@ -674,21 +1204,81 @@ export class MessageRouter {
     );
     this.activeRuns.set(chatId, runState);
     try {
-      const result = await this.codex.run({
+      const codexRunTask = this.codex.run({
         prompt,
         cwd: session.cwd,
         threadId: session.threadId,
+        collaborationMode: queuedRun.collaborationMode,
+        sessionScope:
+          queuedRun.originSender && hasStableSenderIdentity(queuedRun.originSender)
+            ? {
+                chatId,
+                sessionEpoch: queuedRun.sessionEpoch,
+                principal: { ...queuedRun.originSender },
+              }
+            : undefined,
+        onThreadBound: async (threadId) => {
+          if (this.disposed) {
+            throw new Error("Chat2Codex is shutting down; refusing to bind a Codex thread.");
+          }
+          await this.mutateState((currentState) => {
+            const currentSession = this.ensureSession(chatId, currentState, queuedRun.chatType);
+            if (
+              currentSession.cwd !== queuedRun.cwd ||
+              currentSession.threadId !== queuedRun.threadId ||
+              currentSession.sessionEpoch !== queuedRun.sessionEpoch
+            ) {
+              throw new Error("The chat session changed before the Codex thread could be bound.");
+            }
+            const now = new Date().toISOString();
+            currentSession.threadId = threadId;
+            currentSession.updatedAt = now;
+            if (queuedRun.messageId) {
+              const job = currentState.jobs[queuedRun.messageId];
+              if (!job || isTerminalJobStatus(job.status)) {
+                throw new Error("The durable Codex job ended before its thread could be bound.");
+              }
+              job.threadId = threadId;
+              job.updatedAt = now;
+            }
+          });
+          queuedRun.threadId = threadId;
+          runState.threadId = threadId;
+        },
         signal: controller.signal,
         onProgress: reportProgress,
         onApprovalRequest: (request) =>
           this.requestApproval(
             chatId,
+            queuedRun.originSender,
             request,
             controller.signal,
             statusCard,
             session.cwd,
             prompt,
             startedAt,
+          ),
+        onUserInputRequest: (request, context) =>
+          this.requestUserInput(
+            chatId,
+            queuedRun.chatType ?? "direct",
+            queuedRun.originSender,
+            request,
+            context.signal,
+          ),
+        onMcpElicitationRequest: (request, context) =>
+          this.requestMcpElicitation(
+            chatId,
+            queuedRun.originSender,
+            request,
+            context.signal,
+          ),
+        onPermissionApprovalRequest: (request, context) =>
+          this.requestPermissionApproval(
+            chatId,
+            queuedRun.originSender,
+            request,
+            context.signal,
           ),
         onRunControl: (control) => {
           runState.threadId = control.threadId ?? runState.threadId;
@@ -697,14 +1287,24 @@ export class MessageRouter {
           void this.flushPendingSteers(chatId, runState);
         },
       });
+      this.activeCodexRunTasks.add(codexRunTask);
+      let result: CodexRunResult;
+      try {
+        result = await codexRunTask;
+      } finally {
+        this.activeCodexRunTasks.delete(codexRunTask);
+      }
 
       if (result.cancelled || controller.signal.aborted) {
+        if (this.disposed) {
+          return;
+        }
         if (runState.timedOut) {
-          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt);
+          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt, queuedRun.messageId);
           return;
         }
         const completedAt = new Date().toISOString();
-        session.lastRun = buildLastRunSummary({
+        const lastRun = buildLastRunSummary({
           status: "stopped",
           cwd: session.cwd,
           threadId: result.threadId ?? session.threadId,
@@ -713,8 +1313,14 @@ export class MessageRouter {
           completedAt,
           summary: result.summary,
         });
-        session.updatedAt = completedAt;
-        await this.store.save(state);
+        await this.persistRunTerminal({
+          chatId,
+          messageId: queuedRun.messageId,
+          status: "cancelled",
+          lastRun,
+          threadId: result.threadId ?? session.threadId,
+          deliveries: [],
+        });
         this.logger.info("Codex run stopped", { chatId });
         await this.updateStatusCard(statusCard, {
           status: "stopped",
@@ -723,39 +1329,44 @@ export class MessageRouter {
           prompt,
           startedAt,
           updatedAt: completedAt,
-          result: runResultCardInput(session.lastRun),
+          result: runResultCardInput(lastRun),
         });
         return;
       }
 
-      if (result.threadId) {
-        session.threadId = result.threadId;
-      }
+      const resultThreadId = result.threadId ?? session.threadId;
       const completedAt = new Date().toISOString();
-      session.updatedAt = completedAt;
 
       if (result.exitCode !== 0) {
-        session.lastRun = buildLastRunSummary({
+        const lastRun = buildLastRunSummary({
           status: "failed",
           cwd: session.cwd,
-          threadId: session.threadId,
+          threadId: resultThreadId,
           prompt,
           startedAt,
           completedAt,
           summary: result.summary,
           errorText: [result.finalText, result.stderr].filter(Boolean).join("\n"),
         });
-        await this.store.save(state);
         const failure = formatCodexFailure(result, session.cwd);
         await this.recordRecentFailure(chatId, {
           category: inferCodexResultFailureCategory(result),
           cwd: session.cwd,
           promptPreview: prompt,
-          threadId: session.threadId,
+          threadId: resultThreadId,
           exitCode: result.exitCode,
           signal: result.signal ?? null,
           detail: formatExit(result),
           hint: inferCodexFailureHint(result.finalText, result.stderr) ?? undefined,
+        });
+        const durable = await this.persistRunTerminal({
+          chatId,
+          messageId: queuedRun.messageId,
+          status: "failed",
+          lastRun,
+          threadId: resultThreadId,
+          updateSessionThread: true,
+          deliveries: splitForChat(failure).map((text) => ({ kind: "text" as const, text })),
         });
         await this.updateStatusCard(statusCard, {
           status: "failed",
@@ -764,25 +1375,40 @@ export class MessageRouter {
           prompt,
           startedAt,
           updatedAt: completedAt,
-          result: runResultCardInput(session.lastRun),
+          result: runResultCardInput(lastRun),
         });
-        for (const chunk of splitForChat(failure)) {
-          await this.sender.sendText(chatId, chunk);
+        if (durable) {
+          await this.drainOutboxForJob(queuedRun.messageId!);
+        } else {
+          for (const chunk of splitForChat(failure)) {
+            await this.sender.sendText(chatId, chunk);
+          }
         }
         return;
       }
 
-      session.lastRun = buildLastRunSummary({
+      const lastRun = buildLastRunSummary({
         status: "success",
         cwd: session.cwd,
-        threadId: session.threadId,
+        threadId: resultThreadId,
         prompt,
         startedAt,
         completedAt,
         summary: result.summary,
         finalText: result.finalText,
       });
-      await this.store.save(state);
+      const chatOutput = truncateChatOutput(result.finalText, this.config.chatOutputMaxChars);
+      const durable = await this.persistRunTerminal({
+        chatId,
+        messageId: queuedRun.messageId,
+        status: "completed",
+        lastRun,
+        threadId: resultThreadId,
+        deliveries: splitForChat(chatOutput).map((text) => ({
+          kind: "markdown" as const,
+          text,
+        })),
+      });
       await this.updateStatusCard(statusCard, {
         status: "success",
         detail: "Codex 已完成，正在发送最终回答。",
@@ -790,18 +1416,45 @@ export class MessageRouter {
         prompt,
         startedAt,
         updatedAt: completedAt,
-        result: runResultCardInput(session.lastRun),
+        result: runResultCardInput(lastRun),
       });
-      for (const chunk of splitForChat(result.finalText)) {
-        await this.sendMarkdown(chatId, chunk);
+      if (durable) {
+        await this.drainOutboxForJob(queuedRun.messageId!);
+      } else {
+        for (const chunk of splitForChat(chatOutput)) {
+          await this.sendMarkdown(chatId, chunk);
+        }
       }
     } catch (error) {
       if (controller.signal.aborted) {
+        if (this.disposed) {
+          return;
+        }
         if (runState.timedOut) {
-          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt);
+          await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt, queuedRun.messageId);
           return;
         }
         this.logger.info("Codex run stopped", { chatId });
+        if (queuedRun.messageId) {
+          const completedAt = new Date().toISOString();
+          const lastRun = buildLastRunSummary({
+            status: "stopped",
+            cwd: session.cwd,
+            threadId: session.threadId,
+            prompt,
+            startedAt,
+            completedAt,
+            errorText: "Codex run was stopped.",
+          });
+          await this.persistRunTerminal({
+            chatId,
+            messageId: queuedRun.messageId,
+            status: "cancelled",
+            lastRun,
+            threadId: session.threadId,
+            deliveries: [],
+          });
+        }
         return;
       }
       this.logger.error("Codex run failed", error);
@@ -820,8 +1473,14 @@ export class MessageRouter {
           this.directoryAllowedForChat(candidate, session.chatType)
         ) {
           fallbackCwd = candidate;
-          session.cwd = candidate;
-          delete session.threadId;
+          await this.mutateState((currentState) => {
+            const currentSession = this.ensureSession(chatId, currentState, queuedRun.chatType);
+            currentSession.cwd = candidate;
+            delete currentSession.threadId;
+            currentSession.sessionEpoch = createSessionEpoch();
+            currentSession.updatedAt = new Date().toISOString();
+          });
+          await this.invalidateCodexSession(chatId, "cwd_missing_fallback");
         }
       }
       let failure = formatCodexStartupFailure(
@@ -840,9 +1499,13 @@ export class MessageRouter {
         ].join("\n");
       }
       if (!cwdMissing && failedThreadId && isThreadResumeReadFailure(error)) {
-        delete session.threadId;
-        session.updatedAt = new Date().toISOString();
-        await this.store.save(state);
+        await this.mutateState((currentState) => {
+          const currentSession = this.ensureSession(chatId, currentState, queuedRun.chatType);
+          delete currentSession.threadId;
+          currentSession.sessionEpoch = createSessionEpoch();
+          currentSession.updatedAt = new Date().toISOString();
+        });
+        await this.invalidateCodexSession(chatId, "thread_resume_failed");
         await this.recordRecentFailure(chatId, {
           category: "thread_unavailable",
           cwd: failedCwd,
@@ -879,7 +1542,7 @@ export class MessageRouter {
         });
       }
       const completedAt = new Date().toISOString();
-      session.lastRun = buildLastRunSummary({
+      const lastRun = buildLastRunSummary({
         status: "failed",
         cwd: failedCwd,
         threadId: failedThreadId,
@@ -888,8 +1551,14 @@ export class MessageRouter {
         completedAt,
         errorText: formatError(error),
       });
-      session.updatedAt = completedAt;
-      await this.store.save(state);
+      const durable = await this.persistRunTerminal({
+        chatId,
+        messageId: queuedRun.messageId,
+        status: "failed",
+        lastRun,
+        threadId: failedThreadId,
+        deliveries: splitForChat(failure).map((text) => ({ kind: "text" as const, text })),
+      });
       await this.updateStatusCard(statusCard, {
         status: "failed",
         detail: "Codex 启动失败，错误摘要已发送。",
@@ -897,20 +1566,85 @@ export class MessageRouter {
         prompt,
         startedAt,
         updatedAt: completedAt,
-        result: runResultCardInput(session.lastRun),
+        result: runResultCardInput(lastRun),
       });
-      for (const chunk of splitForChat(failure)) {
-        await this.sender.sendText(chatId, chunk);
+      if (durable) {
+        await this.drainOutboxForJob(queuedRun.messageId!);
+      } else {
+        for (const chunk of splitForChat(failure)) {
+          await this.sender.sendText(chatId, chunk);
+        }
       }
     } finally {
       if (runState.timeoutTimer) {
         clearTimeout(runState.timeoutTimer);
       }
       await this.cancelApprovalsForChat(chatId);
+      await this.cancelUserInputsForChat(chatId);
+      await this.cancelPermissionApprovalsForChat(chatId);
+      await this.cancelMcpElicitationsForChat(chatId);
       if (this.activeRuns.get(chatId) === runState) {
-        await this.reportUnsentPendingSteers(chatId, runState);
+        if (!this.disposed) {
+          await this.reportUnsentPendingSteers(chatId, runState);
+        }
         this.activeRuns.delete(chatId);
       }
+    }
+  }
+
+  private acquireGlobalRunPermit(signal: AbortSignal): Promise<(() => void) | null> {
+    if (signal.aborted || this.disposed) {
+      return Promise.resolve(null);
+    }
+    if (this.activeGlobalRuns < this.config.codexMaxConcurrentRuns) {
+      this.activeGlobalRuns += 1;
+      return Promise.resolve(this.createGlobalRunRelease());
+    }
+
+    return new Promise((resolve) => {
+      const waiter: GlobalRunWaiter = {
+        signal,
+        resolve,
+        abortListener: () => {
+          const index = this.globalRunWaiters.indexOf(waiter);
+          if (index >= 0) {
+            this.globalRunWaiters.splice(index, 1);
+          }
+          signal.removeEventListener("abort", waiter.abortListener);
+          resolve(null);
+        },
+      };
+      signal.addEventListener("abort", waiter.abortListener, { once: true });
+      this.globalRunWaiters.push(waiter);
+    });
+  }
+
+  private createGlobalRunRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.activeGlobalRuns = Math.max(0, this.activeGlobalRuns - 1);
+      this.grantNextGlobalRunPermit();
+    };
+  }
+
+  private grantNextGlobalRunPermit(): void {
+    while (
+      !this.disposed &&
+      this.activeGlobalRuns < this.config.codexMaxConcurrentRuns &&
+      this.globalRunWaiters.length > 0
+    ) {
+      const waiter = this.globalRunWaiters.shift()!;
+      waiter.signal.removeEventListener("abort", waiter.abortListener);
+      if (waiter.signal.aborted) {
+        waiter.resolve(null);
+        continue;
+      }
+      this.activeGlobalRuns += 1;
+      waiter.resolve(this.createGlobalRunRelease());
     }
   }
 
@@ -921,6 +1655,7 @@ export class MessageRouter {
     prompt: string,
     threadId: string | undefined,
     startedAt: string,
+    messageId?: string,
   ): Promise<void> {
     const failure = formatRunTimeoutFailure(this.config.codexRunTimeoutMs, cwd);
     this.logger.warn("Codex run timed out", {
@@ -935,10 +1670,8 @@ export class MessageRouter {
       detail: `Run exceeded CODEX_RUN_TIMEOUT_MS=${this.config.codexRunTimeoutMs}.`,
       hint: runTimeoutHint(this.config.codexRunTimeoutMs),
     });
-    const state = this.requireState();
-    const session = this.ensureSession(chatId, state);
     const completedAt = new Date().toISOString();
-    session.lastRun = buildLastRunSummary({
+    const lastRun = buildLastRunSummary({
       status: "failed",
       cwd,
       threadId,
@@ -947,8 +1680,14 @@ export class MessageRouter {
       completedAt,
       errorText: `Run exceeded CODEX_RUN_TIMEOUT_MS=${this.config.codexRunTimeoutMs}.`,
     });
-    session.updatedAt = completedAt;
-    await this.store.save(state);
+    const durable = await this.persistRunTerminal({
+      chatId,
+      messageId,
+      status: "failed",
+      lastRun,
+      threadId,
+      deliveries: splitForChat(failure).map((text) => ({ kind: "text" as const, text })),
+    });
     await this.updateStatusCard(statusCard, {
       status: "failed",
       detail: "Codex 运行超时，已停止当前任务。",
@@ -956,10 +1695,300 @@ export class MessageRouter {
       prompt,
       startedAt,
       updatedAt: completedAt,
-      result: runResultCardInput(session.lastRun),
+      result: runResultCardInput(lastRun),
     });
-    for (const chunk of splitForChat(failure)) {
-      await this.sender.sendText(chatId, chunk);
+    if (durable) {
+      await this.drainOutboxForJob(messageId!);
+    } else {
+      for (const chunk of splitForChat(failure)) {
+        await this.sender.sendText(chatId, chunk);
+      }
+    }
+  }
+
+  private async recoverDurableState(): Promise<void> {
+    await this.mutateState((state) => {
+      const now = new Date().toISOString();
+      for (const delivery of Object.values(state.outbox)) {
+        if (delivery.status === "sending") {
+          delivery.status = "pending";
+          delivery.updatedAt = now;
+        }
+      }
+
+      for (const pending of Object.values(state.pendingMessages)) {
+        let job = state.jobs[pending.messageId];
+        const route = pending.route ?? inferLegacyPendingRoute(this.config, pending, job);
+        pending.route = route;
+
+        if (route === "control_replay_safe") {
+          continue;
+        }
+        if (route === "message") {
+          // A non-command message can have this route because it was not
+          // authorized when accepted. Never let a later configuration or
+          // command-classification change promote it into a Codex/control
+          // action during restart recovery.
+          if (
+            pendingMessageRoute(this.config, fromPendingMessage(pending)) ===
+            "message"
+          ) {
+            continue;
+          }
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+        if (route === "control_no_replay") {
+          if (!job) {
+            const session = state.chats[pending.chatId];
+            job = {
+              id: pending.messageId,
+              kind: "control_recovery",
+              messageId: pending.messageId,
+              chatId: pending.chatId,
+              chatType: pending.chatType,
+              cwd: session?.cwd ?? this.config.codexWorkdir,
+              prompt: controlCommandName(pending.text),
+              threadId: session?.threadId,
+              status: "interrupted",
+              createdAt: pending.acceptedAt,
+              updatedAt: now,
+              completedAt: now,
+              deliveryIds: [],
+              interruptionReason: "control_command_not_replayed",
+            };
+            state.jobs[job.id] = job;
+            appendOutboxDeliveries(
+              state,
+              job,
+              [{ kind: "text", text: interruptedControlMessage(job.prompt) }],
+              now,
+            );
+          }
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+
+        if (!job) {
+          const session = state.chats[pending.chatId];
+          job = {
+            id: pending.messageId,
+            kind: "codex_run",
+            messageId: pending.messageId,
+            chatId: pending.chatId,
+            chatType: pending.chatType,
+            cwd: session?.cwd ?? this.config.codexWorkdir,
+            prompt: pending.text,
+            threadId: session?.threadId,
+            status: "interrupted",
+            createdAt: pending.acceptedAt,
+            updatedAt: now,
+            completedAt: now,
+            deliveryIds: [],
+            interruptionReason: "legacy_pending_without_job",
+          };
+          state.jobs[job.id] = job;
+          appendOutboxDeliveries(state, job, [
+            {
+              kind: "text",
+              text: interruptedJobMessage(job),
+            },
+          ], now);
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+
+        if (job.status === "running") {
+          interruptDurableJob(state, job, now);
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+        if (isTerminalJobStatus(job.status)) {
+          markMessageProcessed(state, pending.messageId);
+        }
+      }
+
+      for (const job of Object.values(state.jobs)) {
+        if (job.status === "running") {
+          interruptDurableJob(state, job, now);
+          markMessageProcessed(state, job.messageId);
+          continue;
+        }
+        if (job.status === "queued" && !state.pendingMessages[job.messageId]) {
+          interruptDurableJob(state, job, now, "queued_job_missing_inbox");
+          markMessageProcessed(state, job.messageId);
+        }
+      }
+    });
+  }
+
+  private async persistRunTerminal(input: {
+    chatId: string;
+    messageId?: string;
+    status: Extract<DurableCodexJobStatus, "completed" | "failed" | "cancelled">;
+    lastRun: LastRunSummary;
+    threadId?: string;
+    updateSessionThread?: boolean;
+    deliveries: Array<{ kind: DurableOutboxMessage["kind"]; text: string }>;
+  }): Promise<boolean> {
+    return this.mutateState((state) => {
+      const job = input.messageId ? state.jobs[input.messageId] : undefined;
+      const session = this.ensureSession(input.chatId, state, job?.chatType);
+      if ((input.status !== "failed" || input.updateSessionThread) && input.threadId) {
+        session.threadId = input.threadId;
+      }
+      session.lastRun = input.lastRun;
+      session.updatedAt = input.lastRun.completedAt;
+      if (!input.messageId) {
+        return false;
+      }
+
+      const durableJob = job ?? {
+        id: input.messageId,
+        kind: "codex_run" as const,
+        messageId: input.messageId,
+        chatId: input.chatId,
+        chatType: session.chatType ?? "direct",
+        cwd: input.lastRun.cwd,
+        prompt: input.lastRun.promptPreview,
+        status: "running" as const,
+        createdAt: input.lastRun.startedAt,
+        updatedAt: input.lastRun.startedAt,
+        deliveryIds: [],
+      };
+      if (!isTerminalJobStatus(durableJob.status)) {
+        durableJob.status = input.status;
+        durableJob.prompt = input.lastRun.promptPreview;
+        durableJob.threadId = input.threadId ?? durableJob.threadId;
+        durableJob.result = input.lastRun;
+        durableJob.completedAt = input.lastRun.completedAt;
+        durableJob.updatedAt = input.lastRun.completedAt;
+        appendOutboxDeliveries(state, durableJob, input.deliveries, input.lastRun.completedAt);
+        state.jobs[input.messageId] = durableJob;
+      }
+      markMessageProcessed(state, input.messageId);
+      return true;
+    });
+  }
+
+  private scheduleOutboxDrain(jobId: string): void {
+    if (this.disposed) {
+      return;
+    }
+    void this.drainOutboxForJob(jobId).catch((error: unknown) => {
+      this.logger.error("Durable outbox drain failed", error);
+    });
+  }
+
+  private drainOutboxForJob(jobId: string): Promise<void> {
+    const active = this.outboxTasks.get(jobId);
+    if (active) {
+      return active;
+    }
+    const task = this.drainOutboxForJobOnce(jobId).finally(() => {
+      if (this.outboxTasks.get(jobId) === task) {
+        this.outboxTasks.delete(jobId);
+      }
+    });
+    this.outboxTasks.set(jobId, task);
+    return task;
+  }
+
+  private async drainOutboxForJobOnce(jobId: string): Promise<void> {
+    const deliveries = Object.values(this.requireState().outbox)
+      .filter((delivery) => delivery.jobId === jobId)
+      .sort((left, right) => left.sequence - right.sequence);
+    for (const delivery of deliveries) {
+      if (delivery.status === "delivered") {
+        continue;
+      }
+      if (!(await this.deliverOutboxMessage(delivery.id))) {
+        return;
+      }
+    }
+    this.clearOutboxRetry(jobId);
+  }
+
+  private scheduleOutboxRetry(jobId: string, attempts: number): void {
+    if (this.disposed || this.outboxRetryTimers.has(jobId)) {
+      return;
+    }
+    const delayIndex = Math.min(
+      Math.max(0, attempts - 1),
+      outboxRetryDelaysMs.length - 1,
+    );
+    const timer = setTimeout(() => {
+      if (this.outboxRetryTimers.get(jobId) !== timer) {
+        return;
+      }
+      this.outboxRetryTimers.delete(jobId);
+      this.scheduleOutboxDrain(jobId);
+    }, outboxRetryDelaysMs[delayIndex]);
+    timer.unref?.();
+    this.outboxRetryTimers.set(jobId, timer);
+  }
+
+  private clearOutboxRetry(jobId: string): void {
+    const timer = this.outboxRetryTimers.get(jobId);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    this.outboxRetryTimers.delete(jobId);
+  }
+
+  private async deliverOutboxMessage(deliveryId: string): Promise<boolean> {
+    const delivery = await this.mutateState((state) => {
+      const current = state.outbox[deliveryId];
+      if (!current || current.status === "delivered") {
+        return null;
+      }
+      current.status = "sending";
+      current.attempts += 1;
+      current.updatedAt = new Date().toISOString();
+      delete current.lastError;
+      return structuredClone(current);
+    });
+    if (!delivery) {
+      return true;
+    }
+
+    try {
+      const options = { idempotencyKey: delivery.idempotencyKey };
+      if (delivery.kind === "markdown" && this.sender.sendMarkdown) {
+        await this.sender.sendMarkdown(delivery.chatId, delivery.text, options);
+      } else {
+        await this.sender.sendText(delivery.chatId, delivery.text, options);
+      }
+      await this.mutateState((state) => {
+        const current = state.outbox[deliveryId];
+        if (!current) {
+          return;
+        }
+        current.status = "delivered";
+        current.text = "";
+        current.deliveredAt = new Date().toISOString();
+        current.updatedAt = current.deliveredAt;
+        delete current.lastError;
+      });
+      return true;
+    } catch (error) {
+      await this.mutateState((state) => {
+        const current = state.outbox[deliveryId];
+        if (!current) {
+          return;
+        }
+        current.status = "pending";
+        current.updatedAt = new Date().toISOString();
+        current.lastError = truncateInline(formatError(error), 240);
+      });
+      this.logger.warn("Durable outbox delivery failed; leaving it pending", {
+        deliveryId,
+        jobId: delivery.jobId,
+        error: formatError(error),
+      });
+      this.scheduleOutboxRetry(delivery.jobId, delivery.attempts);
+      return false;
     }
   }
 
@@ -998,6 +2027,22 @@ export class MessageRouter {
       return text;
     }
 
+    if (attachments.length > this.config.attachmentMaxCount) {
+      const detail = `Message contains ${attachments.length} attachments; limit is ${this.config.attachmentMaxCount}.`;
+      await this.recordRecentFailure(message.chatId, {
+        category: "attachment_download_failed",
+        cwd: this.requireState().chats[message.chatId]?.cwd ?? this.config.codexWorkdir,
+        promptPreview: text || "attachment-only message",
+        detail,
+        hint: `每条消息最多发送 ${this.config.attachmentMaxCount} 个附件。`,
+      });
+      await this.sender.sendText(
+        message.chatId,
+        `附件数量超过上限：每条消息最多 ${this.config.attachmentMaxCount} 个，本次没有执行 Codex。`,
+      );
+      return null;
+    }
+
     if (!this.sender.downloadAttachment) {
       await this.recordRecentFailure(message.chatId, {
         category: "attachment_download_failed",
@@ -1010,12 +2055,37 @@ export class MessageRouter {
       return null;
     }
 
-    let downloaded: DownloadedAttachment[] = [];
+    return this.enqueueAttachmentTask(() =>
+      this.downloadAttachmentsAndBuildPrompt(message, text, attachments),
+    );
+  }
+
+  private async downloadAttachmentsAndBuildPrompt(
+    message: IncomingTextMessage,
+    text: string,
+    attachments: IncomingAttachment[],
+  ): Promise<string | null> {
+    const downloaded: DownloadedAttachment[] = [];
     try {
       for (const attachment of attachments) {
-        downloaded.push(await this.sender.downloadAttachment(message, attachment));
+        downloaded.push(await this.sender.downloadAttachment!(message, attachment));
       }
+      await enforceAttachmentStoreLimits({
+        rootDir: this.config.attachmentDownloadDir,
+        downloadedPaths: downloaded.map((attachment) => attachment.path),
+        retentionHours: this.config.attachmentRetentionHours,
+        messageMaxBytes: this.config.attachmentMaxTotalBytes,
+        storeMaxBytes: this.config.attachmentStoreMaxBytes,
+      });
     } catch (error) {
+      if (downloaded.length > 0) {
+        await removeAttachmentFiles(
+          this.config.attachmentDownloadDir,
+          downloaded.map((attachment) => attachment.path),
+        ).catch((cleanupError: unknown) => {
+          this.logger.warn("Failed to clean up rejected attachment downloads", cleanupError);
+        });
+      }
       this.logger.error("Attachment download failed", error);
       await this.recordRecentFailure(message.chatId, {
         category: "attachment_download_failed",
@@ -1026,13 +2096,24 @@ export class MessageRouter {
       });
       await this.sender.sendText(
         message.chatId,
-        `附件下载失败：${formatError(error)}\n请确认机器人仍在该会话中，且附件大小不超过飞书/Lark下载限制。`,
+        `附件处理失败：${truncateInline(formatError(error), 240)}\n请检查消息资源权限，以及单文件、单消息和附件存储配额。`,
       );
       return null;
     }
 
     const promptText = text || defaultAttachmentPrompt(downloaded);
     return [promptText, "", "本地附件路径：", ...downloaded.map(formatAttachmentLine)].join("\n");
+  }
+
+  private enqueueAttachmentTask<T>(task: () => Promise<T>): Promise<T> {
+    const operation = this.attachmentTaskTail
+      .catch(() => undefined)
+      .then(task);
+    this.attachmentTaskTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   private async handleImmediateStop(message: IncomingTextMessage): Promise<void> {
@@ -1057,6 +2138,14 @@ export class MessageRouter {
     await this.handleImmediateCommand(message, () =>
       this.steerActiveRun(message.chatId, routedText(message).slice("/steer".length).trim()),
     );
+  }
+
+  private async handleImmediateUserInputAnswer(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.answerUserInputFromText(message));
+  }
+
+  private async handleImmediateMcpAnswer(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.answerMcpElicitationFromText(message));
   }
 
   private async handleImmediateCommand(
@@ -1288,7 +2377,7 @@ export class MessageRouter {
         this.queuedRuns.size > 0
           ? `${this.activeRuns.size} running / ${this.queuedRuns.size} waiting`
           : `${this.activeRuns.size}`,
-      approvalWait: `${this.activeApprovals.size}`,
+      approvalWait: this.formatInteractionWait(),
       codexBin: this.config.codexBin,
       codexVersion: codex.version,
       defaultCwd: this.config.codexWorkdir,
@@ -1317,8 +2406,52 @@ export class MessageRouter {
       `approval_wait: ${formatApprovalWait(
         [...this.activeApprovals.values()].filter((approval) => approval.chatId === chatId),
       )}`,
+      `interaction_wait: ${this.formatInteractionWait(chatId)}`,
       ...formatRecentFailureStatusLines(diagnostics.recentFailures),
     ];
+  }
+
+  private formatInteractionWait(chatId?: string): string {
+    const inChat = <T extends { chatId: string }>(values: Iterable<T>): number =>
+      [...values].filter((value) => chatId === undefined || value.chatId === chatId).length;
+    return [
+      `approval=${inChat(this.activeApprovals.values())}`,
+      `user_input=${inChat(this.activeUserInputs.values())}`,
+      `permission=${inChat(this.activePermissionApprovals.values())}`,
+      `mcp=${inChat(this.activeMcpElicitations.values())}`,
+    ].join(" ");
+  }
+
+  private interactionLimitReached(chatId: string): boolean {
+    const collections: Array<Iterable<{ chatId: string }>> = [
+      this.activeApprovals.values(),
+      this.activeUserInputs.values(),
+      this.activePermissionApprovals.values(),
+      this.activeMcpElicitations.values(),
+    ];
+    let total = 0;
+    let forChat = 0;
+    for (const collection of collections) {
+      for (const pending of collection) {
+        total += 1;
+        if (pending.chatId === chatId) {
+          forChat += 1;
+        }
+      }
+    }
+    return (
+      total >= this.config.bridgeMaxPendingMessages ||
+      forChat >= this.config.bridgeMaxPendingMessagesPerChat
+    );
+  }
+
+  private warnInteractionLimit(chatId: string, kind: string): void {
+    this.logger.warn("Rejected interactive request at the pending interaction limit", {
+      chatId,
+      kind,
+      maxPending: this.config.bridgeMaxPendingMessages,
+      maxPendingPerChat: this.config.bridgeMaxPendingMessagesPerChat,
+    });
   }
 
   private formatDiagnosticStatusLines(chatId: string, state: BridgeState): string[] {
@@ -1356,8 +2489,10 @@ export class MessageRouter {
       this.directoryAllowedForChat(project.cwd, chatType),
     );
     session.lastProjects = projects;
-    session.updatedAt = new Date().toISOString();
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const currentSession = this.ensureSession(chatId, currentState, chatType);
+      currentSession.updatedAt = new Date().toISOString();
+    });
 
     if (!projects.length) {
       await this.sender.sendText(
@@ -1434,7 +2569,7 @@ export class MessageRouter {
       return;
     }
 
-    await this.applyProjectSelection(chatId, state, current, cwd);
+    await this.applyProjectSelection(chatId, cwd);
     await this.sendMarkdown(
       chatId,
       ["**已进入项目**", `\`${cwd}\``, "", "发送 `/sessions` 查看会话，或 `/new` 新建对话。"].join(
@@ -1470,8 +2605,10 @@ export class MessageRouter {
 
     const threads = result.threads.filter((thread) => thread.cwd === session.cwd);
     session.lastThreads = threads.map((thread) => toThreadSelection(thread));
-    session.updatedAt = new Date().toISOString();
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const currentSession = this.ensureSession(chatId, currentState, chatType);
+      currentSession.updatedAt = new Date().toISOString();
+    });
 
     if (!threads.length) {
       await this.sender.sendText(
@@ -1695,7 +2832,7 @@ export class MessageRouter {
       return;
     }
 
-    await this.applyThreadSelection(chatId, state, current, selection);
+    await this.applyThreadSelection(chatId, selection);
     await this.sendMarkdown(
       chatId,
       [
@@ -1733,6 +2870,7 @@ export class MessageRouter {
       return;
     }
 
+    await this.rotateSessionEpoch(chatId, "thread_fork");
     let forked: CodexThread;
     try {
       forked = await this.codex.forkThread({
@@ -1750,7 +2888,7 @@ export class MessageRouter {
     }
 
     const forkSelection = toThreadSelection(forked);
-    await this.applyThreadSelection(chatId, state, current, forkSelection);
+    await this.applyThreadSelection(chatId, forkSelection);
     await this.sendMarkdown(
       chatId,
       [
@@ -1785,6 +2923,7 @@ export class MessageRouter {
       return;
     }
 
+    await this.rotateSessionEpoch(chatId, "thread_compact");
     try {
       await this.codex.compactThread(session.threadId);
     } catch (error) {
@@ -1792,8 +2931,10 @@ export class MessageRouter {
       return;
     }
 
-    session.updatedAt = new Date().toISOString();
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const currentSession = this.ensureSession(chatId, currentState, chatType);
+      currentSession.updatedAt = new Date().toISOString();
+    });
     await this.sendMarkdown(
       chatId,
       [
@@ -1857,36 +2998,905 @@ export class MessageRouter {
 
   private async applyProjectSelection(
     chatId: string,
-    state: BridgeState,
-    current: { chatType?: ChatType; lastProjects?: ProjectSelection[] },
     cwd: string,
   ): Promise<void> {
-    state.chats[chatId] = {
-      cwd,
-      chatType: current.chatType,
-      updatedAt: new Date().toISOString(),
-      lastProjects: current.lastProjects,
-      lastTurns: undefined,
-    };
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const current = this.ensureSession(chatId, state);
+      state.chats[chatId] = {
+        cwd,
+        sessionEpoch: createSessionEpoch(),
+        chatType: current.chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current.lastProjects,
+        lastTurns: undefined,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "project_changed");
   }
 
   private async applyThreadSelection(
     chatId: string,
-    state: BridgeState,
-    current: { chatType?: ChatType; lastProjects?: ProjectSelection[]; lastThreads?: ThreadSelection[] },
     selection: ThreadSelection,
   ): Promise<void> {
-    state.chats[chatId] = {
-      cwd: selection.cwd,
-      threadId: selection.threadId,
-      chatType: current.chatType,
+    await this.mutateState((state) => {
+      const current = this.ensureSession(chatId, state);
+      state.chats[chatId] = {
+        cwd: selection.cwd,
+        threadId: selection.threadId,
+        sessionEpoch: createSessionEpoch(),
+        chatType: current.chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current.lastProjects,
+        lastThreads: current.lastThreads,
+        lastTurns: undefined,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "thread_changed");
+  }
+
+  private async handleUserInputCardAction(
+    action: IncomingCardAction,
+  ): Promise<CardActionResponse> {
+    if (!action.userInputId) {
+      return cardActionToast("warning", "无法处理输入请求：缺少请求上下文。");
+    }
+    const pending = this.activeUserInputs.get(userInputKey(action.chatId, action.userInputId));
+    if (!pending) {
+      return cardActionToast("warning", "无法处理输入请求：请求已结束或已失效。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以回答这条输入请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      action.messageId !== pending.handle.messageId
+    ) {
+      return cardActionToast("warning", "无法处理输入请求：卡片上下文不匹配。");
+    }
+
+    if (action.action === cancelUserInputCardAction) {
+      const input = this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+      await this.updateUserInputCard(pending.handle, input);
+      return cardActionCard(buildUserInputCard(input));
+    }
+
+    const question = nextUserInputQuestion(pending);
+    if (!question || !action.questionId || action.questionId !== question.id) {
+      return cardActionToast("warning", "无法处理输入请求：当前问题已变化，请刷新卡片后重试。");
+    }
+
+    let answers: string[] = [];
+    if (action.optionIndex !== undefined) {
+      const options = question.options ?? [];
+      const option = options[action.optionIndex];
+      if (!option || action.optionIndex < 0) {
+        return cardActionToast("warning", "无法处理输入请求：选项已失效。");
+      }
+      if (option.label.length > maxUserInputAnswerLength) {
+        return cardActionToast("warning", "无法处理输入请求：选项内容超过安全长度上限。");
+      }
+      // Never trust a label supplied by the callback. Resolve the selected value
+      // from the original app-server request using the validated index.
+      answers = [option.label];
+    }
+
+    const input = this.advancePendingUserInput(pending, question.id, answers);
+    await this.updateUserInputCard(pending.handle, input);
+    return cardActionCard(buildUserInputCard(input));
+  }
+
+  private async requestUserInput(
+    chatId: string,
+    chatType: ChatType,
+    originSender: SenderIdentity | undefined,
+    request: CodexUserInputRequest,
+    signal: AbortSignal,
+  ): Promise<CodexUserInputResponse> {
+    if (signal.aborted || request.questions.length === 0) {
+      return { answers: {} };
+    }
+    if (request.questions.some((question) => question.isSecret)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "这次 Codex 请求包含敏感输入；当前聊天通道不提供安全密码输入，已按安全策略跳过。",
+      );
+      return { answers: {} };
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已拒绝这次 Codex 用户输入请求。",
+      );
+      return { answers: {} };
+    }
+
+    const key = userInputKey(chatId, request.id);
+    if (this.activeUserInputs.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的 Codex 用户输入请求；为避免回答错配，已拒绝后到请求。",
+      );
+      return { answers: {} };
+    }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "request_user_input");
+      return { answers: {} };
+    }
+
+    return new Promise<CodexUserInputResponse>((resolve) => {
+      let pending!: PendingUserInput;
+      const abortListener = () => {
+        if (this.activeUserInputs.get(key) !== pending) {
+          return;
+        }
+        const input = this.finishPendingUserInput(pending, "expired", { answers: {} });
+        void this.updateUserInputCard(pending.handle, input);
+      };
+      pending = {
+        key,
+        chatId,
+        chatType,
+        originSender: { ...originSender },
+        request,
+        replyCode: this.createUserInputReplyCode(),
+        answers: new Map(),
+        resolve,
+        signal,
+        abortListener,
+        handle: null,
+      };
+      this.activeUserInputs.set(key, pending);
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) {
+        abortListener();
+        return;
+      }
+      void this.presentUserInputRequest(pending);
+    });
+  }
+
+  private async answerUserInputFromText(message: IncomingTextMessage): Promise<void> {
+    const command = parseUserInputAnswerCommand(routedText(message));
+    if (!command) {
+      await this.sender.sendText(message.chatId, "用法：/answer <replyCode> <内容>");
+      return;
+    }
+    const pending = [...this.activeUserInputs.values()].find(
+      (candidate) =>
+        candidate.chatId === message.chatId &&
+        candidate.replyCode.toLowerCase() === command.replyCode.toLowerCase(),
+    );
+    if (!pending) {
+      await this.sender.sendText(message.chatId, "回复码无效，或这条 Codex 输入请求已经结束。");
+      return;
+    }
+    if (!sameStableSenderIdentity(pending.originSender, message.sender)) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起当前 Codex 任务的用户可以回答这条输入请求。",
+      );
+      return;
+    }
+
+    const question = nextUserInputQuestion(pending);
+    if (!question) {
+      await this.sender.sendText(message.chatId, "这条 Codex 输入请求已经结束。");
+      return;
+    }
+    if (command.answer.length > maxUserInputAnswerLength) {
+      await this.sender.sendText(
+        message.chatId,
+        `回答超过 ${maxUserInputAnswerLength} 个字符，未提交；请缩短后重试。`,
+      );
+      return;
+    }
+    let answer = command.answer;
+    if ((question.options?.length ?? 0) > 0 && !question.isOther) {
+      const option = question.options?.find((candidate) => candidate.label === answer);
+      if (!option) {
+        await this.sender.sendText(
+          message.chatId,
+          "当前问题只接受卡片中的可选项；请发送完全一致的选项名称。",
+        );
+        return;
+      }
+      answer = option.label;
+    }
+
+    const input = this.advancePendingUserInput(pending, question.id, [answer]);
+    await this.updateUserInputCard(pending.handle, input);
+    if (input.status === "pending" && !pending.handle) {
+      const delivered = await this.sendUserInputTextSafely(
+        message.chatId,
+        formatUserInputTextPrompt(pending),
+      );
+      if (!delivered && this.activeUserInputs.get(pending.key) === pending) {
+        this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+      }
+      return;
+    }
+    await this.sendUserInputTextSafely(
+      message.chatId,
+      input.status === "resolved"
+        ? "已把回答提交给 Codex（回答内容不会在聊天中回显）。"
+        : "已记录当前问题的回答（回答内容不会在聊天中回显）。",
+    );
+  }
+
+  private advancePendingUserInput(
+    pending: PendingUserInput,
+    questionId: string,
+    answers: string[],
+  ): UserInputCardInput {
+    pending.answers.set(questionId, { answers: [...answers] });
+    if (nextUserInputQuestion(pending)) {
+      return this.userInputCardInput(pending, "pending");
+    }
+    return this.finishPendingUserInput(
+      pending,
+      "resolved",
+      pendingUserInputResponse(pending),
+    );
+  }
+
+  private finishPendingUserInput(
+    pending: PendingUserInput,
+    status: "resolved" | "cancelled" | "expired",
+    response: CodexUserInputResponse,
+  ): UserInputCardInput {
+    if (this.activeUserInputs.get(pending.key) === pending) {
+      this.activeUserInputs.delete(pending.key);
+    }
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    const input = this.userInputCardInput(pending, status);
+    pending.terminalCard = input;
+    pending.resolve(response);
+    return input;
+  }
+
+  private userInputCardInput(
+    pending: PendingUserInput,
+    status: UserInputCardInput["status"],
+  ): UserInputCardInput {
+    return {
+      status,
+      request: pending.request,
+      replyCode: pending.replyCode,
+      ...(status === "pending" || status === "resolved"
+        ? { answers: redactedUserInputAnswers(pending) }
+        : {}),
       updatedAt: new Date().toISOString(),
-      lastProjects: current.lastProjects,
-      lastThreads: current.lastThreads,
-      lastTurns: undefined,
     };
-    await this.store.save(state);
+  }
+
+  private async presentUserInputRequest(pending: PendingUserInput): Promise<void> {
+    if (!this.sender.createUserInputCard || !this.sender.updateUserInputCard) {
+      const delivered = await this.sendUserInputTextSafely(
+        pending.chatId,
+        formatUserInputTextPrompt(pending),
+      );
+      if (!delivered && this.activeUserInputs.get(pending.key) === pending) {
+        this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+      }
+      return;
+    }
+    try {
+      const handle = await this.sender.createUserInputCard(
+        pending.chatId,
+        this.userInputCardInput(pending, "pending"),
+      );
+      if (this.activeUserInputs.get(pending.key) === pending) {
+        pending.handle = handle;
+        const answerCount = pending.answers.size;
+        if (answerCount > 0) {
+          await this.updateUserInputCard(handle, this.userInputCardInput(pending, "pending"));
+        }
+        if (this.activeUserInputs.get(pending.key) !== pending) {
+          if (pending.terminalCard) {
+            await this.updateUserInputCard(handle, pending.terminalCard);
+          }
+        } else if (pending.answers.size !== answerCount) {
+          await this.updateUserInputCard(handle, this.userInputCardInput(pending, "pending"));
+        }
+        return;
+      }
+      if (pending.terminalCard) {
+        await this.updateUserInputCard(handle, pending.terminalCard);
+      }
+    } catch (error) {
+      this.logger.warn("User-input card creation failed; falling back to text", error);
+      if (this.activeUserInputs.get(pending.key) === pending) {
+        const delivered = await this.sendUserInputTextSafely(
+          pending.chatId,
+          formatUserInputTextPrompt(pending),
+        );
+        if (!delivered && this.activeUserInputs.get(pending.key) === pending) {
+          this.finishPendingUserInput(pending, "cancelled", { answers: {} });
+        }
+      }
+    }
+  }
+
+  private async updateUserInputCard(
+    handle: StatusCardHandle | null,
+    input: UserInputCardInput,
+  ): Promise<boolean> {
+    if (!handle || !this.sender.updateUserInputCard) {
+      return false;
+    }
+    try {
+      await this.sender.updateUserInputCard(handle, input);
+      return true;
+    } catch (error) {
+      this.logger.warn("User-input card update failed", error);
+      return false;
+    }
+  }
+
+  private async sendUserInputTextSafely(chatId: string, text: string): Promise<boolean> {
+    try {
+      await this.sender.sendText(chatId, text);
+      return true;
+    } catch (error) {
+      this.logger.warn("User-input text delivery failed", error);
+      return false;
+    }
+  }
+
+  private async cancelUserInputsForChat(chatId: string): Promise<void> {
+    const pending = [...this.activeUserInputs.values()].filter(
+      (request) => request.chatId === chatId,
+    );
+    for (const request of pending) {
+      if (this.activeUserInputs.get(request.key) !== request) {
+        continue;
+      }
+      const input = this.finishPendingUserInput(request, "cancelled", { answers: {} });
+      await this.updateUserInputCard(request.handle, input);
+    }
+  }
+
+  private createUserInputReplyCode(): string {
+    let code = "";
+    do {
+      code = randomUUID().replaceAll("-", "").slice(0, 8).toLowerCase();
+    } while (
+      [...this.activeUserInputs.values()].some(
+        (pending) => pending.replyCode.toLowerCase() === code,
+      )
+    );
+    return code;
+  }
+
+  private async handlePermissionApprovalCardAction(
+    action: IncomingCardAction,
+  ): Promise<CardActionResponse> {
+    if (!action.requestId || !isPermissionApprovalDecision(action.decision)) {
+      return cardActionToast("warning", "无法处理权限请求：缺少请求上下文。");
+    }
+    const pending = this.activePermissionApprovals.get(
+      interactiveRequestKey(action.chatId, action.requestId),
+    );
+    if (!pending) {
+      return cardActionToast("warning", "无法处理权限请求：请求已结束或已失效。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以处理这条权限请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      pending.handle.messageId !== action.messageId
+    ) {
+      return cardActionToast("warning", "无法处理权限请求：卡片上下文不匹配。");
+    }
+    if (!isPermissionApprovalCardDecisionAllowed(pending.request, action.decision)) {
+      return cardActionToast("warning", "权限详情未能完整验证，不能执行这项授权。");
+    }
+
+    const status = action.decision === "deny" ? "declined" : "resolved";
+    const input = this.finishPendingPermissionApproval(pending, status, action.decision);
+    await this.updatePermissionApprovalCard(pending.handle, input);
+    return cardActionCard(buildPermissionApprovalCard(input));
+  }
+
+  private async requestPermissionApproval(
+    chatId: string,
+    originSender: SenderIdentity | undefined,
+    request: CodexPermissionApprovalRequest,
+    signal: AbortSignal,
+  ): Promise<CodexPermissionApprovalDecision> {
+    if (signal.aborted) {
+      return "deny";
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已拒绝这次额外权限请求。",
+      );
+      return "deny";
+    }
+    const key = interactiveRequestKey(chatId, request.id);
+    if (this.activePermissionApprovals.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的额外权限请求；为避免授权错配，已拒绝后到请求。",
+      );
+      return "deny";
+    }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "permission_approval");
+      return "deny";
+    }
+
+    return new Promise<CodexPermissionApprovalDecision>((resolve) => {
+      let pending!: PendingPermissionApproval;
+      const abortListener = () => {
+        if (this.activePermissionApprovals.get(key) !== pending) {
+          return;
+        }
+        const input = this.finishPendingPermissionApproval(pending, "expired", "deny");
+        void this.updatePermissionApprovalCard(pending.handle, input);
+      };
+      pending = {
+        key,
+        chatId,
+        originSender: { ...originSender },
+        request,
+        resolve,
+        signal,
+        abortListener,
+        handle: null,
+      };
+      if (this.config.codexApprovalTimeoutMs > 0) {
+        pending.timeoutTimer = setTimeout(() => {
+          if (this.activePermissionApprovals.get(key) !== pending) {
+            return;
+          }
+          const input = this.finishPendingPermissionApproval(pending, "expired", "deny");
+          void this.updatePermissionApprovalCard(pending.handle, input);
+        }, this.config.codexApprovalTimeoutMs);
+        pending.timeoutTimer.unref?.();
+      }
+      this.activePermissionApprovals.set(key, pending);
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) {
+        abortListener();
+        return;
+      }
+      void this.presentPermissionApproval(pending);
+    });
+  }
+
+  private finishPendingPermissionApproval(
+    pending: PendingPermissionApproval,
+    status: PermissionApprovalCardInput["status"],
+    decision: CodexPermissionApprovalDecision,
+  ): PermissionApprovalCardInput {
+    if (this.activePermissionApprovals.get(pending.key) === pending) {
+      this.activePermissionApprovals.delete(pending.key);
+    }
+    if (pending.timeoutTimer) {
+      clearTimeout(pending.timeoutTimer);
+    }
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    const input: PermissionApprovalCardInput = {
+      status,
+      request: pending.request,
+      ...(status === "resolved" || status === "declined" ? { decision } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    pending.terminalCard = input;
+    pending.resolve(decision);
+    return input;
+  }
+
+  private async presentPermissionApproval(pending: PendingPermissionApproval): Promise<void> {
+    if (!this.sender.createPermissionApprovalCard || !this.sender.updatePermissionApprovalCard) {
+      await this.sendUserInputTextSafely(
+        pending.chatId,
+        "当前聊天适配器不能安全展示额外权限详情，已拒绝这次请求。",
+      );
+      if (this.activePermissionApprovals.get(pending.key) === pending) {
+        this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+      }
+      return;
+    }
+    try {
+      const handle = await this.sender.createPermissionApprovalCard(pending.chatId, {
+        status: "pending",
+        request: pending.request,
+        updatedAt: new Date().toISOString(),
+      });
+      if (this.activePermissionApprovals.get(pending.key) === pending) {
+        pending.handle = handle;
+        return;
+      }
+      if (pending.terminalCard) {
+        await this.updatePermissionApprovalCard(handle, pending.terminalCard);
+      }
+    } catch (error) {
+      this.logger.warn("Permission approval card creation failed; denying", error);
+      if (this.activePermissionApprovals.get(pending.key) === pending) {
+        await this.sendUserInputTextSafely(
+          pending.chatId,
+          "额外权限审批卡发送失败，已按安全策略拒绝这次请求。",
+        );
+        this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+      }
+    }
+  }
+
+  private async updatePermissionApprovalCard(
+    handle: StatusCardHandle | null,
+    input: PermissionApprovalCardInput,
+  ): Promise<boolean> {
+    if (!handle || !this.sender.updatePermissionApprovalCard) {
+      return false;
+    }
+    try {
+      await this.sender.updatePermissionApprovalCard(handle, input);
+      return true;
+    } catch (error) {
+      this.logger.warn("Permission approval card update failed", error);
+      return false;
+    }
+  }
+
+  private async cancelPermissionApprovalsForChat(chatId: string): Promise<void> {
+    for (const pending of [...this.activePermissionApprovals.values()]) {
+      if (pending.chatId !== chatId || this.activePermissionApprovals.get(pending.key) !== pending) {
+        continue;
+      }
+      const input = this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+      await this.updatePermissionApprovalCard(pending.handle, input);
+    }
+  }
+
+  private async handleMcpElicitationCardAction(
+    action: IncomingCardAction,
+  ): Promise<CardActionResponse> {
+    if (!action.requestId) {
+      return cardActionToast("warning", "无法处理 MCP 请求：缺少请求上下文。");
+    }
+    const pending = this.activeMcpElicitations.get(
+      interactiveRequestKey(action.chatId, action.requestId),
+    );
+    if (!pending) {
+      return cardActionToast("warning", "无法处理 MCP 请求：请求已结束或已失效。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以回答这条 MCP 请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      pending.handle.messageId !== action.messageId
+    ) {
+      return cardActionToast("warning", "无法处理 MCP 请求：卡片上下文不匹配。");
+    }
+
+    if (action.action === answerMcpElicitationCardAction) {
+      if (pending.request.mode !== "form" || !action.fieldId) {
+        return cardActionToast("warning", "无法处理 MCP 回答：字段上下文无效。");
+      }
+      const cardInput = this.mcpElicitationCardInput(pending, "pending");
+      if (action.decision === "skip") {
+        if (!isMcpElicitationCardSkipAllowed(cardInput, action.fieldId)) {
+          return cardActionToast("warning", "这个 MCP 字段不能跳过，或当前字段已经变化。");
+        }
+        pending.completedFieldIds.add(action.fieldId);
+      } else {
+        if (action.optionIndex === undefined) {
+          return cardActionToast("warning", "无法处理 MCP 回答：选项上下文无效。");
+        }
+        const value = getMcpElicitationCardOptionValue(
+          cardInput,
+          action.fieldId,
+          action.optionIndex,
+        );
+        if (value === undefined) {
+          return cardActionToast("warning", "MCP 选项已失效，或当前字段已经变化。");
+        }
+        pending.answers.set(action.fieldId, value);
+        pending.completedFieldIds.add(action.fieldId);
+      }
+      const updated = this.mcpElicitationCardInput(pending, "pending");
+      await this.updateMcpElicitationCard(pending.handle, updated);
+      return cardActionCard(buildMcpElicitationCard(updated));
+    }
+
+    if (!isMcpResolutionDecision(action.decision)) {
+      return cardActionToast("warning", "无法处理 MCP 请求：缺少处理决定。");
+    }
+    const cardInput = this.mcpElicitationCardInput(pending, "pending");
+    if (!isMcpElicitationCardDecisionAllowed(cardInput, action.decision)) {
+      return cardActionToast("warning", "MCP 请求未完整验证，不能执行这项操作。");
+    }
+    const response: CodexMcpElicitationResponse =
+      action.decision === "accept"
+        ? pending.request.mode === "form"
+          ? { action: "accept", content: mcpElicitationContent(pending) }
+          : { action: "accept", content: null }
+        : { action: action.decision };
+    const status =
+      action.decision === "accept"
+        ? "resolved"
+        : action.decision === "decline"
+          ? "declined"
+          : "cancelled";
+    const terminal = this.finishPendingMcpElicitation(pending, status, response);
+    await this.updateMcpElicitationCard(pending.handle, terminal);
+    return cardActionCard(buildMcpElicitationCard(terminal));
+  }
+
+  private async requestMcpElicitation(
+    chatId: string,
+    originSender: SenderIdentity | undefined,
+    request: CodexMcpElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<CodexMcpElicitationResponse> {
+    if (signal.aborted) {
+      return { action: "cancel" };
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已取消这次 MCP elicitation。",
+      );
+      return { action: "cancel" };
+    }
+    if (
+      request.mode === "form" &&
+      request.fields.some((field) => isSensitiveMcpInputField(field))
+    ) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "这次 MCP 表单包含 secret/password-like 字段；聊天通道不能安全采集或展示，已取消请求。",
+      );
+      return { action: "cancel" };
+    }
+    const key = interactiveRequestKey(chatId, request.id);
+    if (this.activeMcpElicitations.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的 MCP elicitation；为避免回答错配，已取消后到请求。",
+      );
+      return { action: "cancel" };
+    }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "mcp_elicitation");
+      return { action: "cancel" };
+    }
+
+    return new Promise<CodexMcpElicitationResponse>((resolve) => {
+      let pending!: PendingMcpElicitation;
+      const abortListener = () => {
+        if (this.activeMcpElicitations.get(key) !== pending) {
+          return;
+        }
+        const input = this.finishPendingMcpElicitation(
+          pending,
+          "expired",
+          { action: "cancel" },
+        );
+        void this.updateMcpElicitationCard(pending.handle, input);
+      };
+      pending = {
+        key,
+        chatId,
+        originSender: { ...originSender },
+        request,
+        replyCode: this.createMcpReplyCode(),
+        answers: new Map(),
+        completedFieldIds: new Set(),
+        resolve,
+        signal,
+        abortListener,
+        handle: null,
+      };
+      this.activeMcpElicitations.set(key, pending);
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) {
+        abortListener();
+        return;
+      }
+      void this.presentMcpElicitation(pending);
+    });
+  }
+
+  private async answerMcpElicitationFromText(message: IncomingTextMessage): Promise<void> {
+    const command = parseMcpAnswerCommand(routedText(message));
+    if (!command) {
+      await this.sender.sendText(
+        message.chatId,
+        "用法：/mcp-answer <replyCode> <fieldId> <内容>",
+      );
+      return;
+    }
+    const pending = [...this.activeMcpElicitations.values()].find(
+      (candidate) =>
+        candidate.chatId === message.chatId &&
+        candidate.replyCode.toLowerCase() === command.replyCode.toLowerCase(),
+    );
+    if (!pending) {
+      await this.sender.sendText(message.chatId, "回复码无效，或这条 MCP 请求已经结束。");
+      return;
+    }
+    if (!sameStableSenderIdentity(pending.originSender, message.sender)) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起当前 Codex 任务的用户可以回答这条 MCP 请求。",
+      );
+      return;
+    }
+    if (pending.request.mode !== "form") {
+      await this.sender.sendText(message.chatId, "URL 型 MCP 请求只能通过原始卡片处理。");
+      return;
+    }
+    const field = nextMcpElicitationField(pending);
+    if (!field || field.name !== command.fieldId) {
+      await this.sender.sendText(
+        message.chatId,
+        "MCP 当前字段已经变化；请按最新卡片或提示中的 fieldId 重试。",
+      );
+      return;
+    }
+    if (isSensitiveMcpInputField(field)) {
+      await this.sender.sendText(
+        message.chatId,
+        "这个字段看起来包含 secret/password；聊天中不会接收该值。",
+      );
+      return;
+    }
+    if (command.answer === "/skip" && !field.required) {
+      pending.completedFieldIds.add(field.name);
+    } else {
+      const parsed = parseMcpTextAnswer(field, command.answer);
+      if (!parsed.ok) {
+        await this.sender.sendText(message.chatId, parsed.message);
+        return;
+      }
+      pending.answers.set(field.name, parsed.value);
+      pending.completedFieldIds.add(field.name);
+    }
+
+    const nextField = nextMcpElicitationField(pending);
+    if (!nextField) {
+      const terminal = this.finishPendingMcpElicitation(
+        pending,
+        "resolved",
+        { action: "accept", content: mcpElicitationContent(pending) },
+      );
+      await this.updateMcpElicitationCard(pending.handle, terminal);
+      await this.sendUserInputTextSafely(
+        message.chatId,
+        "已把 MCP 表单提交给 Codex（回答内容不会在聊天中回显）。",
+      );
+      return;
+    }
+
+    const input = this.mcpElicitationCardInput(pending, "pending");
+    await this.updateMcpElicitationCard(pending.handle, input);
+    await this.sendUserInputTextSafely(message.chatId, formatMcpTextPrompt(pending));
+  }
+
+  private mcpElicitationCardInput(
+    pending: PendingMcpElicitation,
+    status: McpElicitationCardInput["status"],
+  ): McpElicitationCardInput {
+    return {
+      status,
+      request: pending.request,
+      updatedAt: new Date().toISOString(),
+      ...(pending.request.mode === "form" ? { replyCode: pending.replyCode } : {}),
+      ...(status === "pending" || status === "resolved"
+        ? { answeredFieldIds: [...pending.completedFieldIds] }
+        : {}),
+    };
+  }
+
+  private finishPendingMcpElicitation(
+    pending: PendingMcpElicitation,
+    status: McpElicitationCardInput["status"],
+    response: CodexMcpElicitationResponse,
+  ): McpElicitationCardInput {
+    if (this.activeMcpElicitations.get(pending.key) === pending) {
+      this.activeMcpElicitations.delete(pending.key);
+    }
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    const input = this.mcpElicitationCardInput(pending, status);
+    pending.terminalCard = input;
+    pending.resolve(response);
+    return input;
+  }
+
+  private async presentMcpElicitation(pending: PendingMcpElicitation): Promise<void> {
+    if (!this.sender.createMcpElicitationCard || !this.sender.updateMcpElicitationCard) {
+      await this.presentMcpTextFallback(pending);
+      return;
+    }
+    try {
+      const handle = await this.sender.createMcpElicitationCard(
+        pending.chatId,
+        this.mcpElicitationCardInput(pending, "pending"),
+      );
+      if (this.activeMcpElicitations.get(pending.key) === pending) {
+        pending.handle = handle;
+        return;
+      }
+      if (pending.terminalCard) {
+        await this.updateMcpElicitationCard(handle, pending.terminalCard);
+      }
+    } catch (error) {
+      this.logger.warn("MCP elicitation card creation failed", error);
+      if (this.activeMcpElicitations.get(pending.key) === pending) {
+        await this.presentMcpTextFallback(pending);
+      }
+    }
+  }
+
+  private async presentMcpTextFallback(pending: PendingMcpElicitation): Promise<void> {
+    if (pending.request.mode !== "form" || !nextMcpElicitationField(pending)) {
+      await this.sendUserInputTextSafely(
+        pending.chatId,
+        "当前聊天适配器不能安全展示这次 MCP 请求，已取消。",
+      );
+      if (this.activeMcpElicitations.get(pending.key) === pending) {
+        this.finishPendingMcpElicitation(pending, "cancelled", { action: "cancel" });
+      }
+      return;
+    }
+    const delivered = await this.sendUserInputTextSafely(
+      pending.chatId,
+      formatMcpTextPrompt(pending),
+    );
+    if (!delivered && this.activeMcpElicitations.get(pending.key) === pending) {
+      this.finishPendingMcpElicitation(pending, "cancelled", { action: "cancel" });
+    }
+  }
+
+  private async updateMcpElicitationCard(
+    handle: StatusCardHandle | null,
+    input: McpElicitationCardInput,
+  ): Promise<boolean> {
+    if (!handle || !this.sender.updateMcpElicitationCard) {
+      return false;
+    }
+    try {
+      await this.sender.updateMcpElicitationCard(handle, input);
+      return true;
+    } catch (error) {
+      this.logger.warn("MCP elicitation card update failed", error);
+      return false;
+    }
+  }
+
+  private async cancelMcpElicitationsForChat(chatId: string): Promise<void> {
+    for (const pending of [...this.activeMcpElicitations.values()]) {
+      if (pending.chatId !== chatId || this.activeMcpElicitations.get(pending.key) !== pending) {
+        continue;
+      }
+      const input = this.finishPendingMcpElicitation(
+        pending,
+        "cancelled",
+        { action: "cancel" },
+      );
+      await this.updateMcpElicitationCard(pending.handle, input);
+    }
+  }
+
+  private createMcpReplyCode(): string {
+    let code = "";
+    do {
+      code = randomUUID().replaceAll("-", "").slice(0, 8).toLowerCase();
+    } while (
+      [...this.activeMcpElicitations.values()].some(
+        (pending) => pending.replyCode.toLowerCase() === code,
+      )
+    );
+    return code;
   }
 
   private async stopCodex(
@@ -1926,12 +3936,16 @@ export class MessageRouter {
     if (!run.messageId) {
       return;
     }
-    const state = this.requireState();
-    if (!state.processedMessageIds.includes(run.messageId)) {
-      state.processedMessageIds.push(run.messageId);
-    }
-    delete state.pendingMessages[run.messageId];
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const job = state.jobs[run.messageId!];
+      if (job?.status === "queued") {
+        job.status = "cancelled";
+        job.prompt = truncateInline(job.prompt, 180);
+        job.updatedAt = new Date().toISOString();
+        job.completedAt = job.updatedAt;
+      }
+      markMessageProcessed(state, run.messageId!);
+    });
   }
 
   private handleRetryCardAction(action: IncomingCardAction): CardActionResponse {
@@ -1949,7 +3963,14 @@ export class MessageRouter {
     }
 
     this.enqueueTask(action.chatId, () =>
-      this.runCodex(action.chatId, run.prompt, this.chatTypeForAction(action.chatId)),
+      this.runCodex(
+        action.chatId,
+        run.prompt,
+        this.chatTypeForAction(action.chatId),
+        undefined,
+        action.sender,
+        run.collaborationMode,
+      ),
     ).catch(
       (error) => {
         this.logger.error("Retry task failed", error);
@@ -2012,13 +4033,6 @@ export class MessageRouter {
   private async handleSelectProjectCardAction(
     action: IncomingCardAction,
   ): Promise<CardActionResponse | undefined> {
-    if (
-      this.queues.has(action.chatId) ||
-      this.queuedRuns.has(action.chatId) ||
-      this.activeRuns.has(action.chatId)
-    ) {
-      return cardActionToast("warning", "当前 chat 有任务排队或运行中，完成或停止后再切换项目。");
-    }
     const index = action.projectIndex;
     if (!index || index < 1) {
       return cardActionToast("warning", "无法进入项目：缺少项目编号。");
@@ -2033,7 +4047,7 @@ export class MessageRouter {
       return cardActionToast("error", this.formatDirectoryDenied(selected.cwd));
     }
 
-    await this.applyProjectSelection(action.chatId, state, session, selected.cwd);
+    await this.applyProjectSelection(action.chatId, selected.cwd);
     const card = buildProjectListCard({
       currentCwd: selected.cwd,
       projects: session.lastProjects ?? [],
@@ -2051,13 +4065,6 @@ export class MessageRouter {
   private async handleResumeThreadCardAction(
     action: IncomingCardAction,
   ): Promise<CardActionResponse | undefined> {
-    if (
-      this.queues.has(action.chatId) ||
-      this.queuedRuns.has(action.chatId) ||
-      this.activeRuns.has(action.chatId)
-    ) {
-      return cardActionToast("warning", "当前 chat 有任务排队或运行中，完成或停止后再切换会话。");
-    }
     const index = action.threadIndex;
     if (!index || index < 1) {
       return cardActionToast("warning", "无法继续会话：缺少会话编号。");
@@ -2075,7 +4082,7 @@ export class MessageRouter {
       return cardActionToast("error", this.formatDirectoryDenied(selected.cwd));
     }
 
-    await this.applyThreadSelection(action.chatId, state, session, selected);
+    await this.applyThreadSelection(action.chatId, selected);
     const card = buildSessionListCard({
       cwd: selected.cwd,
       currentThreadId: selected.threadId,
@@ -2104,19 +4111,34 @@ export class MessageRouter {
     if (!action.approvalId) {
       return cardActionToast("warning", "无法处理审批：缺少审批上下文。");
     }
-    const pending = this.activeApprovals.get(action.approvalId);
-    if (!pending || pending.chatId !== action.chatId) {
+    const pending = this.activeApprovals.get(
+      interactiveRequestKey(action.chatId, action.approvalId),
+    );
+    if (!pending) {
       return cardActionToast("warning", "无法处理审批：当前服务没有这条待审批请求。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以处理这条审批请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      pending.handle.messageId !== action.messageId
+    ) {
+      return cardActionToast("warning", "无法处理审批：卡片上下文不匹配。");
     }
     if (action.decisionIndex === undefined) {
       return cardActionToast("warning", "无法处理审批：缺少审批选项。");
+    }
+    if (!isApprovalDecisionIndexAllowed(pending.request, action.decisionIndex)) {
+      return cardActionToast("warning", "无法处理审批：该选项未通过安全披露校验。");
     }
     const decision = pending.request.decisions[action.decisionIndex];
     if (!decision) {
       return cardActionToast("warning", "无法处理审批：审批选项已失效。");
     }
 
-    this.activeApprovals.delete(action.approvalId);
+    this.activeApprovals.delete(pending.key);
     if (pending.timeoutTimer) {
       clearTimeout(pending.timeoutTimer);
     }
@@ -2135,6 +4157,7 @@ export class MessageRouter {
 
   private async requestApproval(
     chatId: string,
+    originSender: SenderIdentity | undefined,
     request: CodexApprovalRequest,
     signal: AbortSignal,
     statusCard: StatusCardHandle | null,
@@ -2143,6 +4166,25 @@ export class MessageRouter {
     startedAt: string,
   ): Promise<CodexApprovalDecision> {
     if (signal.aborted) {
+      return "cancel";
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已取消这次 Codex 审批请求。",
+      );
+      return "cancel";
+    }
+    const key = interactiveRequestKey(chatId, request.id);
+    if (this.activeApprovals.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的 Codex 审批请求；为避免审批错配，已取消后到请求。",
+      );
+      return "cancel";
+    }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "approval");
       return "cancel";
     }
 
@@ -2158,19 +4200,21 @@ export class MessageRouter {
     return new Promise<CodexApprovalDecision>((resolve) => {
       const createdAtMs = Date.now();
       const pending: PendingApproval = {
+        key,
         chatId,
+        originSender: { ...originSender },
         request,
         resolve,
         handle: null,
         createdAt: new Date(createdAtMs).toISOString(),
         createdAtMs,
       };
-      this.activeApprovals.set(request.id, pending);
+      this.activeApprovals.set(key, pending);
       const cancel = () => {
-        if (this.activeApprovals.get(request.id) !== pending) {
+        if (this.activeApprovals.get(key) !== pending) {
           return;
         }
-        this.activeApprovals.delete(request.id);
+        this.activeApprovals.delete(key);
         if (pending.timeoutTimer) {
           clearTimeout(pending.timeoutTimer);
         }
@@ -2189,10 +4233,10 @@ export class MessageRouter {
 
       if (this.config.codexApprovalTimeoutMs > 0) {
         pending.timeoutTimer = setTimeout(() => {
-          if (this.activeApprovals.get(request.id) !== pending) {
+          if (this.activeApprovals.get(key) !== pending) {
             return;
           }
-          this.activeApprovals.delete(request.id);
+          this.activeApprovals.delete(key);
           pending.cancelledAt = new Date().toISOString();
           pending.cancelReason = "timeout";
           resolve("cancel");
@@ -2232,7 +4276,7 @@ export class MessageRouter {
         updatedAt: new Date().toISOString(),
       })
         .then((handle) => {
-          if (this.activeApprovals.get(request.id) === pending) {
+          if (this.activeApprovals.get(key) === pending) {
             pending.handle = handle;
             return;
           }
@@ -2259,8 +4303,8 @@ export class MessageRouter {
         })
         .catch((error: unknown) => {
           this.logger.warn("Approval card creation failed; cancelling approval request", error);
-          if (this.activeApprovals.get(request.id) === pending) {
-            this.activeApprovals.delete(request.id);
+          if (this.activeApprovals.get(key) === pending) {
+            this.activeApprovals.delete(key);
             resolve("cancel");
           }
         });
@@ -2270,10 +4314,10 @@ export class MessageRouter {
   private async cancelApprovalsForChat(chatId: string): Promise<void> {
     const pending = [...this.activeApprovals.values()].filter((approval) => approval.chatId === chatId);
     for (const approval of pending) {
-      if (this.activeApprovals.get(approval.request.id) !== approval) {
+      if (this.activeApprovals.get(approval.key) !== approval) {
         continue;
       }
-      this.activeApprovals.delete(approval.request.id);
+      this.activeApprovals.delete(approval.key);
       if (approval.timeoutTimer) {
         clearTimeout(approval.timeoutTimer);
       }
@@ -2292,12 +4336,13 @@ export class MessageRouter {
     handle: StatusCardHandle | null,
     chatId: string,
     prompt: string,
+    collaborationMode: CodexCollaborationMode,
   ): void {
     if (!handle) {
       return;
     }
 
-    this.statusCardRuns.set(handle.messageId, { chatId, prompt });
+    this.statusCardRuns.set(handle.messageId, { chatId, prompt, collaborationMode });
     while (this.statusCardRuns.size > maxRememberedStatusCards) {
       const oldestKey = this.statusCardRuns.keys().next().value;
       if (!oldestKey) {
@@ -2453,17 +4498,20 @@ export class MessageRouter {
   }
 
   private async resetSession(chatId: string): Promise<void> {
-    const state = this.requireState();
-    const current = this.ensureSession(chatId, state);
-    const cwd = current.cwd;
-    state.chats[chatId] = {
-      cwd,
-      chatType: current.chatType,
-      updatedAt: new Date().toISOString(),
-      lastProjects: current.lastProjects,
-      lastThreads: current.lastThreads,
-    };
-    await this.store.save(state);
+    let cwd = this.config.codexWorkdir;
+    await this.mutateState((state) => {
+      const current = this.ensureSession(chatId, state);
+      cwd = current.cwd;
+      state.chats[chatId] = {
+        cwd,
+        sessionEpoch: createSessionEpoch(),
+        chatType: current.chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current.lastProjects,
+        lastThreads: current.lastThreads,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "session_reset");
     await this.sendMarkdown(chatId, ["**已新建当前项目的 Codex 会话**", `\`${cwd}\``].join("\n"));
   }
 
@@ -2489,16 +4537,31 @@ export class MessageRouter {
       return;
     }
 
-    const state = this.requireState();
-    const current = state.chats[chatId];
-    state.chats[chatId] = {
-      cwd: nextCwd,
-      chatType,
-      updatedAt: new Date().toISOString(),
-      lastProjects: current?.lastProjects,
-    };
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const current = state.chats[chatId];
+      state.chats[chatId] = {
+        cwd: nextCwd,
+        sessionEpoch: createSessionEpoch(),
+        chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current?.lastProjects,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "cwd_changed");
     await this.sender.sendText(chatId, `已切换 cwd，并重置 session：\n${nextCwd}`);
+  }
+
+  private async rotateSessionEpoch(chatId: string, reason: string): Promise<void> {
+    await this.mutateState((state) => {
+      const session = this.ensureSession(chatId, state);
+      session.sessionEpoch = createSessionEpoch();
+      session.updatedAt = new Date().toISOString();
+    });
+    await this.invalidateCodexSession(chatId, reason);
+  }
+
+  private async invalidateCodexSession(chatId: string, reason: string): Promise<void> {
+    await this.codex.invalidateChatSession?.(chatId, reason);
   }
 
   private ensureSession(
@@ -2508,6 +4571,7 @@ export class MessageRouter {
   ) {
     const session = state.chats[chatId] ?? {
       cwd: this.config.codexWorkdir,
+      sessionEpoch: createSessionEpoch(),
       updatedAt: new Date().toISOString(),
     };
     if (chatType) {
@@ -2542,30 +4606,52 @@ export class MessageRouter {
     chatId: string,
     failure: Omit<RecentFailureDiagnostic, "at"> & { at?: string },
   ): Promise<void> {
-    const state = this.requireState();
-    const diagnostics = ensureChatDiagnostics(state, chatId);
-    const recentFailures = diagnostics.recentFailures ?? [];
-    diagnostics.recentFailures = [
-      ...recentFailures,
-      {
-        at: failure.at ?? new Date().toISOString(),
-        category: failure.category,
-        cwd: failure.cwd,
-        promptPreview: failure.promptPreview
-          ? truncateInline(failure.promptPreview, 120)
-          : undefined,
-        threadId: failure.threadId,
-        exitCode: failure.exitCode,
-        signal: failure.signal,
-        detail: truncateInline(failure.detail, 240),
-        hint: failure.hint ? truncateInline(failure.hint, 240) : undefined,
-      },
-    ].slice(-5);
+    await this.mutateState((state) => {
+      const diagnostics = ensureChatDiagnostics(state, chatId);
+      const recentFailures = diagnostics.recentFailures ?? [];
+      diagnostics.recentFailures = [
+        ...recentFailures,
+        {
+          at: failure.at ?? new Date().toISOString(),
+          category: failure.category,
+          cwd: failure.cwd,
+          promptPreview: failure.promptPreview
+            ? truncateInline(failure.promptPreview, 120)
+            : undefined,
+          threadId: failure.threadId,
+          exitCode: failure.exitCode,
+          signal: failure.signal,
+          detail: truncateInline(failure.detail, 240),
+          hint: failure.hint ? truncateInline(failure.hint, 240) : undefined,
+        },
+      ].slice(-5);
+    });
     this.logger.warn("Recorded recent Chat2Codex failure", {
       chatId,
       category: failure.category,
     });
-    await this.store.save(state);
+  }
+
+  private mutateState<T>(mutation: (state: BridgeState) => T): Promise<T> {
+    const operation = this.stateMutationTail
+      .catch(() => undefined)
+      .then(async () => {
+        const state = this.requireState();
+        const previous = structuredClone(state);
+        try {
+          const result = mutation(state);
+          await this.store.save(state);
+          return result;
+        } catch (error) {
+          restoreBridgeState(state, previous);
+          throw error;
+        }
+      });
+    this.stateMutationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   private requireState(): BridgeState {
@@ -2574,6 +4660,15 @@ export class MessageRouter {
     }
     return this.state;
   }
+}
+
+function restoreBridgeState(target: BridgeState, source: BridgeState): void {
+  target.chats = source.chats;
+  target.jobs = source.jobs;
+  target.outbox = source.outbox;
+  target.pendingMessages = source.pendingMessages;
+  target.processedMessageIds = source.processedMessageIds;
+  target.diagnostics = source.diagnostics;
 }
 
 interface ProjectAggregate extends ProjectSelection {
@@ -3234,6 +5329,31 @@ function summarizeFailureOutput(output: string): string {
   return `${normalized.slice(0, maxLength).trimEnd()}\n...（已截断，完整输出请查看服务日志）`;
 }
 
+function truncateChatOutput(value: string, maxChars: number): string {
+  let prefix = "";
+  let count = 0;
+  let truncated = false;
+  for (const character of value) {
+    if (count >= maxChars) {
+      truncated = true;
+      break;
+    }
+    prefix += character;
+    count += 1;
+  }
+  if (!truncated) {
+    return value;
+  }
+
+  const marker = "\n\n…（输出已截断）";
+  const markerChars = [...marker];
+  if (maxChars <= markerChars.length) {
+    return markerChars.slice(0, maxChars).join("");
+  }
+  const contentChars = [...prefix];
+  return `${contentChars.slice(0, maxChars - markerChars.length).join("").trimEnd()}${marker}`;
+}
+
 function inferCodexFailureHint(finalText: string, stderr: string): string | null {
   const combined = `${finalText}\n${stderr}`.toLowerCase();
   if (combined.includes("not a git repository")) {
@@ -3312,7 +5432,344 @@ function getErrorCode(error: unknown): string | null {
   return typeof code === "string" ? code : null;
 }
 
-function toPendingMessage(message: IncomingTextMessage): PendingMessageDelivery {
+function isDurableCodexCandidate(config: BridgeConfig, message: IncomingTextMessage): boolean {
+  if (!decideAccess(config.access, toAccessContext(message)).allowed) {
+    return false;
+  }
+  if (message.attachments?.length) {
+    return true;
+  }
+  const text = routedText(message);
+  return Boolean(text) && !isBuiltInRouterCommand(text);
+}
+
+function pendingMessageRoute(
+  config: BridgeConfig,
+  message: IncomingTextMessage,
+): PendingMessageRoute {
+  if (isDurableCodexCandidate(config, message)) {
+    return "codex";
+  }
+  if (!message.attachments?.length) {
+    const text = routedText(message);
+    if (isBuiltInRouterCommand(text)) {
+      return isReplaySafeRouterCommand(text)
+        ? "control_replay_safe"
+        : "control_no_replay";
+    }
+  }
+  return "message";
+}
+
+function inferLegacyPendingRoute(
+  config: BridgeConfig,
+  pending: PendingMessageDelivery,
+  job: DurableCodexJob | undefined,
+): PendingMessageRoute {
+  if (job) {
+    return "codex";
+  }
+  return pendingMessageRoute(config, fromPendingMessage(pending));
+}
+
+function isReplaySafeRouterCommand(text: string): boolean {
+  return (
+    text === "/whoami" ||
+    text === "/status" ||
+    text === "/host" ||
+    text === "/health" ||
+    text === "/diff" ||
+    text === "/logs" ||
+    text === "/files" ||
+    text === "/summary" ||
+    text === "/plan" ||
+    text === "/projects" ||
+    text === "/threads" ||
+    text === "/sessions" ||
+    text === "/history" ||
+    text.startsWith("/history ") ||
+    text === "/search" ||
+    text.startsWith("/search ")
+  );
+}
+
+function controlCommandName(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) {
+    return "(control command)";
+  }
+  return trimmed.split(/\s+/u, 1)[0] ?? "(control command)";
+}
+
+function isBuiltInRouterCommand(text: string): boolean {
+  return (
+    text === "/whoami" ||
+    text === "/status" ||
+    text === "/host" ||
+    text === "/health" ||
+    text === "/diff" ||
+    text === "/logs" ||
+    text === "/files" ||
+    text === "/summary" ||
+    text === "/stop" ||
+    text === "/projects" ||
+    text === "/threads" ||
+    text === "/sessions" ||
+    text === "/compact" ||
+    text === "/plan" ||
+    text === "/new" ||
+    text === "/reset" ||
+    text === "/steer" ||
+    text.startsWith("/steer ") ||
+    text === "/answer" ||
+    text.startsWith("/answer ") ||
+    text === "/mcp-answer" ||
+    text.startsWith("/mcp-answer ") ||
+    text === "/project" ||
+    text.startsWith("/project ") ||
+    text === "/history" ||
+    text.startsWith("/history ") ||
+    text === "/search" ||
+    text.startsWith("/search ") ||
+    text === "/resume" ||
+    text.startsWith("/resume ") ||
+    text === "/fork" ||
+    text.startsWith("/fork ") ||
+    text.startsWith("/cd ")
+  );
+}
+
+function isTerminalJobStatus(status: DurableCodexJobStatus): boolean {
+  return status !== "queued" && status !== "running";
+}
+
+function queueLimitScope(
+  state: BridgeState,
+  chatId: string,
+  config: BridgeConfig,
+): "global" | "chat" | null {
+  const counts = durableObligationCounts(state);
+  if (counts.total >= config.bridgeMaxPendingMessages) {
+    return "global";
+  }
+  if ((counts.byChat.get(chatId) ?? 0) >= config.bridgeMaxPendingMessagesPerChat) {
+    return "chat";
+  }
+  return null;
+}
+
+function pendingInboxLimitScope(
+  state: BridgeState,
+  chatId: string,
+  config: BridgeConfig,
+): "global" | "chat" | null {
+  const counts = inboxObligationCounts(state);
+  if (counts.total >= config.bridgeMaxPendingMessages) {
+    return "global";
+  }
+  if ((counts.byChat.get(chatId) ?? 0) >= config.bridgeMaxPendingMessagesPerChat) {
+    return "chat";
+  }
+  return null;
+}
+
+function hasActiveCapacityNotice(
+  state: BridgeState,
+  kind: "durable" | "inbox",
+  scope: "global" | "chat",
+  chatId: string,
+): boolean {
+  return Object.values(state.jobs).some(
+    (job) =>
+      job.capacityNoticeActive === true &&
+      (job.capacityNoticeKind ?? "durable") === kind &&
+      job.capacityNoticeScope === scope &&
+      (scope === "global" || job.chatId === chatId),
+  );
+}
+
+function clearResolvedCapacityNotices(
+  state: BridgeState,
+  config: BridgeConfig,
+): void {
+  const durableCounts = durableObligationCounts(state);
+  const inboxCounts = inboxObligationCounts(state);
+  const jobsWithUndeliveredOutbox = new Set(
+    Object.values(state.outbox)
+      .filter((delivery) => delivery.status !== "delivered")
+      .map((delivery) => delivery.jobId),
+  );
+  for (const job of Object.values(state.jobs)) {
+    if (!job.capacityNoticeActive || !job.capacityNoticeScope) {
+      continue;
+    }
+    const noticeKind = job.capacityNoticeKind ?? "durable";
+    const counts = noticeKind === "durable" ? durableCounts : inboxCounts;
+    const stillFull =
+      jobsWithUndeliveredOutbox.has(job.id) ||
+      (job.capacityNoticeScope === "global"
+        ? counts.total >= config.bridgeMaxPendingMessages
+        : (counts.byChat.get(job.chatId) ?? 0) >= config.bridgeMaxPendingMessagesPerChat);
+    if (!stillFull) {
+      job.capacityNoticeActive = false;
+    }
+  }
+}
+
+function inboxObligationCounts(state: BridgeState): {
+  total: number;
+  byChat: Map<string, number>;
+} {
+  const obligations = new Map<string, string>();
+  for (const pending of Object.values(state.pendingMessages)) {
+    if (pending.route === "codex") {
+      continue;
+    }
+    obligations.set(pending.messageId, pending.chatId);
+  }
+  for (const delivery of Object.values(state.outbox)) {
+    if (
+      delivery.status !== "delivered" &&
+      state.jobs[delivery.jobId]?.kind === "control_recovery"
+    ) {
+      obligations.set(delivery.jobId, delivery.chatId);
+    }
+  }
+
+  const byChat = new Map<string, number>();
+  for (const chatId of obligations.values()) {
+    byChat.set(chatId, (byChat.get(chatId) ?? 0) + 1);
+  }
+  return { total: obligations.size, byChat };
+}
+
+function durableObligationCounts(state: BridgeState): {
+  total: number;
+  byChat: Map<string, number>;
+} {
+  const obligations = new Map<string, string>();
+  for (const job of Object.values(state.jobs)) {
+    if (!isTerminalJobStatus(job.status)) {
+      obligations.set(job.id, job.chatId);
+    }
+  }
+  for (const delivery of Object.values(state.outbox)) {
+    if (delivery.status !== "delivered") {
+      obligations.set(delivery.jobId, delivery.chatId);
+    }
+  }
+  for (const pending of Object.values(state.pendingMessages)) {
+    if (
+      pending.route === "codex" &&
+      !state.jobs[pending.messageId]
+    ) {
+      obligations.set(pending.messageId, pending.chatId);
+    }
+  }
+
+  const byChat = new Map<string, number>();
+  for (const chatId of obligations.values()) {
+    byChat.set(chatId, (byChat.get(chatId) ?? 0) + 1);
+  }
+  return { total: obligations.size, byChat };
+}
+
+function queueCapacityMessage(config: BridgeConfig): string {
+  return [
+    "Chat2Codex 当前任务队列已满，这条任务没有执行。",
+    `全局最多保留 ${config.bridgeMaxPendingMessages} 条排队、运行或待投递任务；每个 chat 最多 ${config.bridgeMaxPendingMessagesPerChat} 条。`,
+    "请等待已有任务结束或回复投递成功后重新发送。控制命令使用独立的待处理消息上限；交互回复不受该上限影响。",
+  ].join("\n");
+}
+
+function inboxCapacityMessage(config: BridgeConfig): string {
+  return [
+    "Chat2Codex 当前待处理消息已满，这条控制消息没有执行。",
+    `全局最多保留 ${config.bridgeMaxPendingMessages} 条待处理消息；每个 chat 最多 ${config.bridgeMaxPendingMessagesPerChat} 条。`,
+    "请等待已有消息处理完成后重试。过载期间只会保留这一条通知。",
+  ].join("\n");
+}
+
+function appendOutboxDeliveries(
+  state: BridgeState,
+  job: DurableCodexJob,
+  deliveries: Array<{ kind: DurableOutboxMessage["kind"]; text: string }>,
+  createdAt: string,
+): void {
+  for (const delivery of deliveries) {
+    const id = randomUUID();
+    const outbox: DurableOutboxMessage = {
+      id,
+      jobId: job.id,
+      chatId: job.chatId,
+      kind: delivery.kind,
+      text: delivery.text,
+      sequence: job.deliveryIds.length,
+      status: "pending",
+      idempotencyKey: id,
+      attempts: 0,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    state.outbox[id] = outbox;
+    job.deliveryIds.push(id);
+  }
+}
+
+function interruptDurableJob(
+  state: BridgeState,
+  job: DurableCodexJob,
+  at: string,
+  reason = "bridge_restarted_during_run",
+): void {
+  if (isTerminalJobStatus(job.status)) {
+    return;
+  }
+  job.status = "interrupted";
+  job.prompt = truncateInline(job.prompt, 180);
+  job.updatedAt = at;
+  job.completedAt = at;
+  job.interruptionReason = reason;
+  appendOutboxDeliveries(
+    state,
+    job,
+    [{ kind: "text", text: interruptedJobMessage(job) }],
+    at,
+  );
+}
+
+function interruptedJobMessage(job: DurableCodexJob): string {
+  return [
+    "Chat2Codex 在任务执行期间重启，无法确认此前的 Codex 进程是否已经产生副作用。",
+    "为避免重复修改，系统不会自动重新执行这条任务。",
+    `cwd: ${job.cwd}`,
+    job.threadId ? `thread: ${job.threadId}` : null,
+    "请先检查当前 thread、Git 工作区和相关外部状态，再决定是否重新发送任务。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function interruptedControlMessage(command: string): string {
+  return [
+    "桥接服务在处理控制命令期间重启，无法确认该命令是否已经完成。",
+    "为避免重复变更，系统不会自动重放这条控制命令。",
+    `command: ${command}`,
+    "请先检查当前会话和工作区状态，再决定是否重新发送。",
+  ].join("\n");
+}
+
+function markMessageProcessed(state: BridgeState, messageId: string): void {
+  if (!state.processedMessageIds.includes(messageId)) {
+    state.processedMessageIds.push(messageId);
+  }
+  delete state.pendingMessages[messageId];
+}
+
+function toPendingMessage(
+  message: IncomingTextMessage,
+  route: PendingMessageRoute,
+): PendingMessageDelivery {
   return {
     messageId: message.messageId,
     chatId: message.chatId,
@@ -3322,6 +5779,7 @@ function toPendingMessage(message: IncomingTextMessage): PendingMessageDelivery 
     attachments: message.attachments?.map((attachment) => ({ ...attachment })),
     acceptedAt: new Date().toISOString(),
     attempts: 0,
+    route,
   };
 }
 
@@ -3351,6 +5809,22 @@ function routedText(message: IncomingTextMessage): string {
   return message.text.trim();
 }
 
+function parseCodexTurnRequest(text: string): {
+  prompt: string;
+  collaborationMode: CodexCollaborationMode;
+} {
+  if (text === "/plan") {
+    return { prompt: "", collaborationMode: "plan" };
+  }
+  if (text.startsWith("/plan ")) {
+    return {
+      prompt: text.slice("/plan".length).trim(),
+      collaborationMode: "plan",
+    };
+  }
+  return { prompt: text, collaborationMode: "default" };
+}
+
 function isStopCommand(message: IncomingTextMessage): boolean {
   return routedText(message) === "/stop";
 }
@@ -3366,6 +5840,377 @@ function isHostCommand(message: IncomingTextMessage): boolean {
 function isSteerCommand(message: IncomingTextMessage): boolean {
   const text = routedText(message);
   return text === "/steer" || text.startsWith("/steer ");
+}
+
+function isUserInputAnswerCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/answer" || text.startsWith("/answer ");
+}
+
+function isMcpAnswerCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/mcp-answer" || text.startsWith("/mcp-answer ");
+}
+
+function parseUserInputAnswerCommand(
+  text: string,
+): { replyCode: string; answer: string } | null {
+  if (!text.startsWith("/answer ")) {
+    return null;
+  }
+  const rest = text.slice("/answer".length).trim();
+  const separator = rest.search(/\s/);
+  if (separator <= 0) {
+    return null;
+  }
+  const replyCode = rest.slice(0, separator).trim();
+  const answer = rest.slice(separator).trim();
+  return replyCode && answer ? { replyCode, answer } : null;
+}
+
+function userInputKey(chatId: string, requestId: string): string {
+  return `${chatId}\u0000${requestId}`;
+}
+
+interface ParsedMcpAnswerCommand {
+  replyCode: string;
+  fieldId: string;
+  answer: string;
+}
+
+function parseMcpAnswerCommand(text: string): ParsedMcpAnswerCommand | null {
+  if (!text.startsWith("/mcp-answer ")) {
+    return null;
+  }
+  const rest = text.slice("/mcp-answer".length).trim();
+  const separator = rest.search(/\s/u);
+  if (separator <= 0) {
+    return null;
+  }
+  const replyCode = rest.slice(0, separator);
+  const fieldAndAnswer = rest.slice(separator).trimStart();
+  if (!/^[a-f0-9]{8}$/u.test(replyCode) || !fieldAndAnswer) {
+    return null;
+  }
+  let fieldId = "";
+  let answerText = "";
+  if (fieldAndAnswer.startsWith('"')) {
+    const token = parseJsonStringToken(fieldAndAnswer);
+    if (!token) {
+      return null;
+    }
+    fieldId = token.value;
+    answerText = token.rest;
+  } else {
+    const fieldSeparator = fieldAndAnswer.search(/\s/u);
+    if (fieldSeparator <= 0) {
+      return null;
+    }
+    fieldId = fieldAndAnswer.slice(0, fieldSeparator);
+    answerText = fieldAndAnswer.slice(fieldSeparator);
+  }
+  const answer = answerText.trim();
+  if (!fieldId || fieldId.length > 128 || !answer || answer.length > maxMcpTextAnswerLength) {
+    return null;
+  }
+  return { replyCode, fieldId, answer };
+}
+
+function parseJsonStringToken(text: string): { value: string; rest: string } | null {
+  let escaped = false;
+  for (let index = 1; index < text.length; index += 1) {
+    const character = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character !== '"') {
+      continue;
+    }
+    const token = text.slice(0, index + 1);
+    const rest = text.slice(index + 1);
+    if (!/^\s/u.test(rest)) {
+      return null;
+    }
+    try {
+      const value: unknown = JSON.parse(token);
+      return typeof value === "string" ? { value, rest } : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function interactiveRequestKey(chatId: string, requestId: string): string {
+  return `${chatId}\u0000${requestId}`;
+}
+
+function isPermissionApprovalDecision(
+  value: unknown,
+): value is CodexPermissionApprovalDecision {
+  return value === "deny" || value === "grantTurn" || value === "grantSession";
+}
+
+function isMcpResolutionDecision(
+  value: unknown,
+): value is "accept" | "decline" | "cancel" {
+  return value === "accept" || value === "decline" || value === "cancel";
+}
+
+function nextMcpElicitationField(
+  pending: PendingMcpElicitation,
+): CodexMcpElicitationField | undefined {
+  return pending.request.mode === "form"
+    ? pending.request.fields.find((field) => !pending.completedFieldIds.has(field.name))
+    : undefined;
+}
+
+function mcpElicitationContent(
+  pending: PendingMcpElicitation,
+): Record<string, CodexMcpElicitationValue> {
+  if (pending.request.mode !== "form") {
+    return {};
+  }
+  return Object.fromEntries(
+    pending.request.fields.flatMap((field) => {
+      const value = pending.answers.get(field.name);
+      return value === undefined
+        ? []
+        : [[field.name, Array.isArray(value) ? [...value] : value] as const];
+    }),
+  );
+}
+
+function isSensitiveMcpInputField(field: CodexMcpElicitationField): boolean {
+  const sensitive = (value: string): boolean =>
+    /(?:password|passwd|secret|token|api[\s_-]*key|credential|private[\s_-]*key)/iu.test(value);
+  if (sensitive(`${field.name} ${field.title ?? ""}`)) {
+    return true;
+  }
+  return (
+    (field.type === "enum" || field.type === "multi_select") &&
+    field.options.some((option) => sensitive(`${option.title} ${option.value}`))
+  );
+}
+
+type ParsedMcpTextAnswer =
+  | { ok: true; value: CodexMcpElicitationValue }
+  | { ok: false; message: string };
+
+function parseMcpTextAnswer(
+  field: CodexMcpElicitationField,
+  raw: string,
+): ParsedMcpTextAnswer {
+  if (!raw || raw.length > maxMcpTextAnswerLength) {
+    return { ok: false, message: "MCP 回答为空或超过聊天输入上限。" };
+  }
+  if (field.type === "string") {
+    const decoded = decodeMcpStringAnswer(raw);
+    if (!decoded.ok) {
+      return decoded;
+    }
+    const value = decoded.value;
+    if (
+      value.length > 4_096 ||
+      (field.minLength !== null && value.length < field.minLength) ||
+      (field.maxLength !== null && value.length > field.maxLength)
+    ) {
+      return { ok: false, message: "MCP 文本回答不符合字段长度约束。" };
+    }
+    if (field.format === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)) {
+      return { ok: false, message: "MCP 回答必须是有效的邮箱地址。" };
+    }
+    if (field.format === "uri") {
+      try {
+        if (new URL(value).protocol.length <= 1) {
+          return { ok: false, message: "MCP 回答必须是有效的 URI。" };
+        }
+      } catch {
+        return { ok: false, message: "MCP 回答必须是有效的 URI。" };
+      }
+    }
+    if (
+      field.format === "date" &&
+      (!/^\d{4}-\d{2}-\d{2}$/u.test(value) || Number.isNaN(Date.parse(`${value}T00:00:00Z`)))
+    ) {
+      return { ok: false, message: "MCP 回答必须是 YYYY-MM-DD 日期。" };
+    }
+    if (
+      field.format === "date-time" &&
+      (!/^\d{4}-\d{2}-\d{2}T/u.test(value) || Number.isNaN(Date.parse(value)))
+    ) {
+      return { ok: false, message: "MCP 回答必须是有效的 ISO 日期时间。" };
+    }
+    return { ok: true, value };
+  }
+  if (field.type === "number" || field.type === "integer") {
+    const value = Number(raw);
+    if (
+      !Number.isFinite(value) ||
+      (field.type === "integer" && !Number.isSafeInteger(value)) ||
+      (field.minimum !== null && value < field.minimum) ||
+      (field.maximum !== null && value > field.maximum)
+    ) {
+      return { ok: false, message: "MCP 数值回答不符合字段类型或范围约束。" };
+    }
+    return { ok: true, value };
+  }
+  if (field.type === "boolean") {
+    const value = raw.toLowerCase();
+    if (value !== "true" && value !== "false") {
+      return { ok: false, message: "MCP 布尔回答只能是 true 或 false。" };
+    }
+    return { ok: true, value: value === "true" };
+  }
+  if (field.type === "enum") {
+    const decoded = decodeMcpStringAnswer(raw);
+    if (!decoded.ok) {
+      return decoded;
+    }
+    const direct = field.options.find((option) => option.value === decoded.value);
+    if (direct) {
+      return { ok: true, value: direct.value };
+    }
+    const byTitle = field.options.filter((option) => option.title === decoded.value);
+    return byTitle.length === 1
+      ? { ok: true, value: byTitle[0]!.value }
+      : { ok: false, message: "MCP 回答必须与一个枚举值或唯一标题完全一致。" };
+  }
+
+  let values: unknown;
+  try {
+    values = JSON.parse(raw);
+  } catch {
+    return { ok: false, message: "MCP 多选回答必须是 JSON 字符串数组。" };
+  }
+  const allowed = new Set(field.options.map((option) => option.value));
+  if (
+    !Array.isArray(values) ||
+    !values.every((value) => typeof value === "string") ||
+    new Set(values).size !== values.length ||
+    (field.minItems !== null && values.length < field.minItems) ||
+    (field.maxItems !== null && values.length > field.maxItems) ||
+    !values.every((value) => allowed.has(value))
+  ) {
+    return { ok: false, message: "MCP 多选回答包含无效、重复或超出数量约束的选项。" };
+  }
+  return { ok: true, value: [...values] };
+}
+
+function decodeMcpStringAnswer(
+  raw: string,
+): { ok: true; value: string } | { ok: false; message: string } {
+  if (!raw.startsWith('"')) {
+    return { ok: true, value: raw };
+  }
+  try {
+    const value: unknown = JSON.parse(raw);
+    return typeof value === "string"
+      ? { ok: true, value }
+      : { ok: false, message: "MCP 字符串回答的 JSON 引号格式无效。" };
+  } catch {
+    return { ok: false, message: "MCP 字符串回答的 JSON 引号格式无效。" };
+  }
+}
+
+function formatMcpTextPrompt(pending: PendingMcpElicitation): string {
+  const field = nextMcpElicitationField(pending);
+  if (!field) {
+    return "这条 MCP elicitation 已经结束。";
+  }
+  const sensitive = isSensitiveMcpInputField(field);
+  const options =
+    !sensitive && (field.type === "enum" || field.type === "multi_select")
+      ? field.options.map((option) =>
+          option.title === option.value
+            ? `- ${truncateInline(option.value, 256)}`
+            : `- ${truncateInline(option.title, 160)} (${truncateInline(option.value, 256)})`,
+        )
+      : !sensitive && field.type === "boolean"
+        ? ["- true", "- false"]
+        : [];
+  return [
+    "Codex 正在等待 MCP 结构化输入。",
+    `${truncateInline(field.title ?? field.name, 160)}（fieldId: ${truncateInline(field.name, 128)}，type: ${field.type}，${field.required ? "必填" : "可选"}）`,
+    field.description ? truncateDetail(field.description, 500) : null,
+    ...options,
+    sensitive ? "这个字段看起来包含 secret/password；聊天中不会提供输入入口。" : null,
+    !sensitive && field.type === "multi_select" ? "多选值请使用 JSON 字符串数组。" : null,
+    !field.required
+      ? `发送 /mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} /skip 跳过这个字段。`
+      : null,
+    !sensitive
+      ? `发送 /mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} <内容> 回答当前字段。`
+      : null,
+    !field.required && (field.type === "string" || field.type === "enum")
+      ? '若实际值就是 /skip，请把值写成 JSON 字符串 "/skip"。'
+      : null,
+    "回答内容不会在聊天中回显，也不会写入 Chat2Codex 持久化状态。",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
+function hasStableSenderIdentity(sender: SenderIdentity): boolean {
+  return Boolean(sender.openId || sender.userId || sender.unionId);
+}
+
+function sameStableSenderIdentity(left: SenderIdentity, right: SenderIdentity): boolean {
+  return Boolean(
+    (left.openId && right.openId && left.openId === right.openId) ||
+    (left.userId && right.userId && left.userId === right.userId) ||
+    (left.unionId && right.unionId && left.unionId === right.unionId),
+  );
+}
+
+function nextUserInputQuestion(
+  pending: PendingUserInput,
+): CodexUserInputRequest["questions"][number] | undefined {
+  return pending.request.questions.find((question) => !pending.answers.has(question.id));
+}
+
+function pendingUserInputResponse(pending: PendingUserInput): CodexUserInputResponse {
+  return {
+    answers: Object.fromEntries(
+      [...pending.answers].map(([questionId, answer]) => [
+        questionId,
+        { answers: [...answer.answers] },
+      ]),
+    ),
+  };
+}
+
+function redactedUserInputAnswers(
+  pending: PendingUserInput,
+): CodexUserInputResponse["answers"] {
+  return Object.fromEntries(
+    [...pending.answers.keys()].map((questionId) => [questionId, { answers: [] }]),
+  );
+}
+
+function formatUserInputTextPrompt(pending: PendingUserInput): string {
+  const question = nextUserInputQuestion(pending);
+  if (!question) {
+    return "这条 Codex 用户输入请求已经结束。";
+  }
+  const options = (question.options ?? []).slice(0, 10);
+  return [
+    "Codex 正在等待你的补充输入。",
+    `${truncateInline(question.header, 80)}：${truncateInline(question.question, 500)}`,
+    ...options.map((option) => `- ${truncateInline(option.label, 80)}`),
+    `发送 /answer ${pending.replyCode} <内容> 回答当前问题。`,
+    options.length > 0 && !question.isOther
+      ? "当前问题只接受上面的可选项名称（需完全一致）。"
+      : null,
+    "回答内容不会在聊天中回显，也不会写入 Chat2Codex 持久化状态。",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 function detailCommandKind(message: IncomingTextMessage): RunDetailKind | null {
@@ -3480,7 +6325,7 @@ function formatQueuedRun(run: QueuedRunState | undefined): string {
     return "(none)";
   }
   return [
-    "state=waiting_for_workspace",
+    `state=${run.waitingFor === "global_capacity" ? "waiting_for_global_capacity" : "waiting_for_workspace"}`,
     `age=${formatDuration(Date.now() - run.queuedAtMs)}`,
     `cwd=${run.cwd}`,
     `thread=${run.threadId ?? "(new)"}`,
