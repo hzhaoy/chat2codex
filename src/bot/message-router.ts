@@ -53,6 +53,7 @@ import {
   type LastRunStatus,
   type LastRunSummary,
   type PendingMessageDelivery,
+  type PendingMessageRoute,
   type ProjectSelection,
   type RecentFailureDiagnostic,
   type ThreadSelection,
@@ -368,10 +369,13 @@ export class MessageRouter {
       this.scheduleOutboxDrain(jobId);
     }
     for (const pending of Object.values(this.state.pendingMessages)) {
-      if (this.state.jobs[pending.messageId]?.status !== "queued") {
-        continue;
+      const job = this.state.jobs[pending.messageId];
+      const route = pending.route ?? inferLegacyPendingRoute(this.config, pending, job);
+      if (route === "control_replay_safe" || route === "message") {
+        this.scheduleAcceptedMessage(fromPendingMessage(pending));
+      } else if (route === "codex" && job?.status === "queued") {
+        this.scheduleAcceptedMessage(fromPendingMessage(pending));
       }
-      this.scheduleAcceptedMessage(fromPendingMessage(pending));
     }
   }
 
@@ -389,15 +393,34 @@ export class MessageRouter {
       this.scheduleAcceptedMessage(message);
       return;
     }
+    let retryPending: IncomingTextMessage | undefined;
     const outcome = await this.mutateState((state) => {
       if (state.processedMessageIds.includes(message.messageId)) {
         return "duplicate" as const;
       }
-      const durableCandidate = isDurableCodexCandidate(this.config, message);
+      const existingPending = state.pendingMessages[message.messageId];
+      if (existingPending) {
+        retryPending = fromPendingMessage(existingPending);
+        return "retry_pending" as const;
+      }
+      const route = pendingMessageRoute(this.config, message);
+      const durableCandidate = route === "codex";
+      clearResolvedCapacityNotices(state, this.config);
       if (durableCandidate && !state.jobs[message.messageId]) {
         const session = this.ensureSession(message.chatId, state, message.chatType);
         const now = new Date().toISOString();
-        if (queueLimitReached(state, message.chatId, this.config)) {
+        const capacityScope = queueLimitScope(state, message.chatId, this.config);
+        if (capacityScope) {
+          const activeNotice = hasActiveCapacityNotice(
+            state,
+            "durable",
+            capacityScope,
+            message.chatId,
+          );
+          if (activeNotice) {
+            markMessageProcessed(state, message.messageId);
+            return "rejected_silently" as const;
+          }
           const job: DurableCodexJob = {
             id: message.messageId,
             kind: "codex_run",
@@ -413,6 +436,9 @@ export class MessageRouter {
             completedAt: now,
             deliveryIds: [],
             interruptionReason: "queue_capacity_reached",
+            capacityNoticeScope: capacityScope,
+            capacityNoticeKind: "durable",
+            capacityNoticeActive: true,
           };
           state.jobs[message.messageId] = job;
           appendOutboxDeliveries(
@@ -438,15 +464,72 @@ export class MessageRouter {
           updatedAt: now,
           deliveryIds: [],
         };
+      } else if (!durableCandidate) {
+        const capacityScope = pendingInboxLimitScope(
+          state,
+          message.chatId,
+          this.config,
+        );
+        if (capacityScope) {
+          const activeNotice = hasActiveCapacityNotice(
+            state,
+            "inbox",
+            capacityScope,
+            message.chatId,
+          );
+          if (activeNotice) {
+            markMessageProcessed(state, message.messageId);
+            return "rejected_silently" as const;
+          }
+          const now = new Date().toISOString();
+          const session = state.chats[message.chatId];
+          const job: DurableCodexJob = {
+            id: message.messageId,
+            kind: "control_recovery",
+            messageId: message.messageId,
+            chatId: message.chatId,
+            chatType: message.chatType,
+            cwd: session?.cwd ?? this.config.codexWorkdir,
+            prompt: "[rejected: inbox capacity reached]",
+            threadId: session?.threadId,
+            status: "cancelled",
+            createdAt: now,
+            updatedAt: now,
+            completedAt: now,
+            deliveryIds: [],
+            interruptionReason: "inbox_capacity_reached",
+            capacityNoticeScope: capacityScope,
+            capacityNoticeKind: "inbox",
+            capacityNoticeActive: true,
+          };
+          state.jobs[job.id] = job;
+          appendOutboxDeliveries(
+            state,
+            job,
+            [{ kind: "text", text: inboxCapacityMessage(this.config) }],
+            now,
+          );
+          markMessageProcessed(state, message.messageId);
+          return "rejected" as const;
+        }
       }
-      state.pendingMessages[message.messageId] ??= toPendingMessage(message);
+      state.pendingMessages[message.messageId] ??= toPendingMessage(message, route);
       return "accepted" as const;
     });
     if (outcome === "duplicate") {
       return;
     }
+    if (outcome === "retry_pending") {
+      if (retryPending) {
+        this.scheduleAcceptedMessage(retryPending);
+      }
+      return;
+    }
     if (outcome === "rejected") {
       this.scheduleOutboxDrain(message.messageId);
+      return;
+    }
+    if (outcome === "rejected_silently") {
       return;
     }
     this.scheduleAcceptedMessage(message);
@@ -1434,6 +1517,57 @@ export class MessageRouter {
 
       for (const pending of Object.values(state.pendingMessages)) {
         let job = state.jobs[pending.messageId];
+        const route = pending.route ?? inferLegacyPendingRoute(this.config, pending, job);
+        pending.route = route;
+
+        if (route === "control_replay_safe") {
+          continue;
+        }
+        if (route === "message") {
+          // A non-command message can have this route because it was not
+          // authorized when accepted. Never let a later configuration or
+          // command-classification change promote it into a Codex/control
+          // action during restart recovery.
+          if (
+            pendingMessageRoute(this.config, fromPendingMessage(pending)) ===
+            "message"
+          ) {
+            continue;
+          }
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+        if (route === "control_no_replay") {
+          if (!job) {
+            const session = state.chats[pending.chatId];
+            job = {
+              id: pending.messageId,
+              kind: "control_recovery",
+              messageId: pending.messageId,
+              chatId: pending.chatId,
+              chatType: pending.chatType,
+              cwd: session?.cwd ?? this.config.codexWorkdir,
+              prompt: controlCommandName(pending.text),
+              threadId: session?.threadId,
+              status: "interrupted",
+              createdAt: pending.acceptedAt,
+              updatedAt: now,
+              completedAt: now,
+              deliveryIds: [],
+              interruptionReason: "control_command_not_replayed",
+            };
+            state.jobs[job.id] = job;
+            appendOutboxDeliveries(
+              state,
+              job,
+              [{ kind: "text", text: interruptedControlMessage(job.prompt) }],
+              now,
+            );
+          }
+          markMessageProcessed(state, pending.messageId);
+          continue;
+        }
+
         if (!job) {
           const session = state.chats[pending.chatId];
           job = {
@@ -5059,6 +5193,63 @@ function isDurableCodexCandidate(config: BridgeConfig, message: IncomingTextMess
   return Boolean(text) && !isBuiltInRouterCommand(text);
 }
 
+function pendingMessageRoute(
+  config: BridgeConfig,
+  message: IncomingTextMessage,
+): PendingMessageRoute {
+  if (isDurableCodexCandidate(config, message)) {
+    return "codex";
+  }
+  if (!message.attachments?.length) {
+    const text = routedText(message);
+    if (isBuiltInRouterCommand(text)) {
+      return isReplaySafeRouterCommand(text)
+        ? "control_replay_safe"
+        : "control_no_replay";
+    }
+  }
+  return "message";
+}
+
+function inferLegacyPendingRoute(
+  config: BridgeConfig,
+  pending: PendingMessageDelivery,
+  job: DurableCodexJob | undefined,
+): PendingMessageRoute {
+  if (job) {
+    return "codex";
+  }
+  return pendingMessageRoute(config, fromPendingMessage(pending));
+}
+
+function isReplaySafeRouterCommand(text: string): boolean {
+  return (
+    text === "/whoami" ||
+    text === "/status" ||
+    text === "/host" ||
+    text === "/health" ||
+    text === "/diff" ||
+    text === "/logs" ||
+    text === "/files" ||
+    text === "/summary" ||
+    text === "/projects" ||
+    text === "/threads" ||
+    text === "/sessions" ||
+    text === "/history" ||
+    text.startsWith("/history ") ||
+    text === "/search" ||
+    text.startsWith("/search ")
+  );
+}
+
+function controlCommandName(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) {
+    return "(control command)";
+  }
+  return trimmed.split(/\s+/u, 1)[0] ?? "(control command)";
+}
+
 function isBuiltInRouterCommand(text: string): boolean {
   return (
     text === "/whoami" ||
@@ -5100,33 +5291,150 @@ function isTerminalJobStatus(status: DurableCodexJobStatus): boolean {
   return status !== "queued" && status !== "running";
 }
 
-function queueLimitReached(
+function queueLimitScope(
   state: BridgeState,
   chatId: string,
   config: BridgeConfig,
+): "global" | "chat" | null {
+  const counts = durableObligationCounts(state);
+  if (counts.total >= config.bridgeMaxPendingMessages) {
+    return "global";
+  }
+  if ((counts.byChat.get(chatId) ?? 0) >= config.bridgeMaxPendingMessagesPerChat) {
+    return "chat";
+  }
+  return null;
+}
+
+function pendingInboxLimitScope(
+  state: BridgeState,
+  chatId: string,
+  config: BridgeConfig,
+): "global" | "chat" | null {
+  const counts = inboxObligationCounts(state);
+  if (counts.total >= config.bridgeMaxPendingMessages) {
+    return "global";
+  }
+  if ((counts.byChat.get(chatId) ?? 0) >= config.bridgeMaxPendingMessagesPerChat) {
+    return "chat";
+  }
+  return null;
+}
+
+function hasActiveCapacityNotice(
+  state: BridgeState,
+  kind: "durable" | "inbox",
+  scope: "global" | "chat",
+  chatId: string,
 ): boolean {
-  let total = 0;
-  let forChat = 0;
+  return Object.values(state.jobs).some(
+    (job) =>
+      job.capacityNoticeActive === true &&
+      (job.capacityNoticeKind ?? "durable") === kind &&
+      job.capacityNoticeScope === scope &&
+      (scope === "global" || job.chatId === chatId),
+  );
+}
+
+function clearResolvedCapacityNotices(
+  state: BridgeState,
+  config: BridgeConfig,
+): void {
+  const durableCounts = durableObligationCounts(state);
+  const inboxCounts = inboxObligationCounts(state);
+  const jobsWithUndeliveredOutbox = new Set(
+    Object.values(state.outbox)
+      .filter((delivery) => delivery.status !== "delivered")
+      .map((delivery) => delivery.jobId),
+  );
   for (const job of Object.values(state.jobs)) {
-    if (isTerminalJobStatus(job.status)) {
+    if (!job.capacityNoticeActive || !job.capacityNoticeScope) {
       continue;
     }
-    total += 1;
-    if (job.chatId === chatId) {
-      forChat += 1;
+    const noticeKind = job.capacityNoticeKind ?? "durable";
+    const counts = noticeKind === "durable" ? durableCounts : inboxCounts;
+    const stillFull =
+      jobsWithUndeliveredOutbox.has(job.id) ||
+      (job.capacityNoticeScope === "global"
+        ? counts.total >= config.bridgeMaxPendingMessages
+        : (counts.byChat.get(job.chatId) ?? 0) >= config.bridgeMaxPendingMessagesPerChat);
+    if (!stillFull) {
+      job.capacityNoticeActive = false;
     }
   }
-  return (
-    total >= config.bridgeMaxPendingMessages ||
-    forChat >= config.bridgeMaxPendingMessagesPerChat
-  );
+}
+
+function inboxObligationCounts(state: BridgeState): {
+  total: number;
+  byChat: Map<string, number>;
+} {
+  const obligations = new Map<string, string>();
+  for (const pending of Object.values(state.pendingMessages)) {
+    if (pending.route === "codex") {
+      continue;
+    }
+    obligations.set(pending.messageId, pending.chatId);
+  }
+  for (const delivery of Object.values(state.outbox)) {
+    if (
+      delivery.status !== "delivered" &&
+      state.jobs[delivery.jobId]?.kind === "control_recovery"
+    ) {
+      obligations.set(delivery.jobId, delivery.chatId);
+    }
+  }
+
+  const byChat = new Map<string, number>();
+  for (const chatId of obligations.values()) {
+    byChat.set(chatId, (byChat.get(chatId) ?? 0) + 1);
+  }
+  return { total: obligations.size, byChat };
+}
+
+function durableObligationCounts(state: BridgeState): {
+  total: number;
+  byChat: Map<string, number>;
+} {
+  const obligations = new Map<string, string>();
+  for (const job of Object.values(state.jobs)) {
+    if (!isTerminalJobStatus(job.status)) {
+      obligations.set(job.id, job.chatId);
+    }
+  }
+  for (const delivery of Object.values(state.outbox)) {
+    if (delivery.status !== "delivered") {
+      obligations.set(delivery.jobId, delivery.chatId);
+    }
+  }
+  for (const pending of Object.values(state.pendingMessages)) {
+    if (
+      pending.route === "codex" &&
+      !state.jobs[pending.messageId]
+    ) {
+      obligations.set(pending.messageId, pending.chatId);
+    }
+  }
+
+  const byChat = new Map<string, number>();
+  for (const chatId of obligations.values()) {
+    byChat.set(chatId, (byChat.get(chatId) ?? 0) + 1);
+  }
+  return { total: obligations.size, byChat };
 }
 
 function queueCapacityMessage(config: BridgeConfig): string {
   return [
     "Chat2Codex 当前任务队列已满，这条任务没有执行。",
-    `全局最多保留 ${config.bridgeMaxPendingMessages} 条排队或运行任务；每个 chat 最多 ${config.bridgeMaxPendingMessagesPerChat} 条。`,
-    "请等待已有任务结束后重新发送。控制命令和交互回复不受该上限影响。",
+    `全局最多保留 ${config.bridgeMaxPendingMessages} 条排队、运行或待投递任务；每个 chat 最多 ${config.bridgeMaxPendingMessagesPerChat} 条。`,
+    "请等待已有任务结束或回复投递成功后重新发送。控制命令使用独立的待处理消息上限；交互回复不受该上限影响。",
+  ].join("\n");
+}
+
+function inboxCapacityMessage(config: BridgeConfig): string {
+  return [
+    "Chat2Codex 当前待处理消息已满，这条控制消息没有执行。",
+    `全局最多保留 ${config.bridgeMaxPendingMessages} 条待处理消息；每个 chat 最多 ${config.bridgeMaxPendingMessagesPerChat} 条。`,
+    "请等待已有消息处理完成后重试。过载期间只会保留这一条通知。",
   ].join("\n");
 }
 
@@ -5190,6 +5498,15 @@ function interruptedJobMessage(job: DurableCodexJob): string {
     .join("\n");
 }
 
+function interruptedControlMessage(command: string): string {
+  return [
+    "桥接服务在处理控制命令期间重启，无法确认该命令是否已经完成。",
+    "为避免重复变更，系统不会自动重放这条控制命令。",
+    `command: ${command}`,
+    "请先检查当前会话和工作区状态，再决定是否重新发送。",
+  ].join("\n");
+}
+
 function markMessageProcessed(state: BridgeState, messageId: string): void {
   if (!state.processedMessageIds.includes(messageId)) {
     state.processedMessageIds.push(messageId);
@@ -5197,7 +5514,10 @@ function markMessageProcessed(state: BridgeState, messageId: string): void {
   delete state.pendingMessages[messageId];
 }
 
-function toPendingMessage(message: IncomingTextMessage): PendingMessageDelivery {
+function toPendingMessage(
+  message: IncomingTextMessage,
+  route: PendingMessageRoute,
+): PendingMessageDelivery {
   return {
     messageId: message.messageId,
     chatId: message.chatId,
@@ -5207,6 +5527,7 @@ function toPendingMessage(message: IncomingTextMessage): PendingMessageDelivery 
     attachments: message.attachments?.map((attachment) => ({ ...attachment })),
     acceptedAt: new Date().toISOString(),
     attempts: 0,
+    route,
   };
 }
 

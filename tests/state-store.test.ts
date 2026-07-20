@@ -238,6 +238,51 @@ describe("JsonStateStore", () => {
     }
   });
 
+  test("keeps an active capacity notice until its queue has recovered", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const statePath = path.join(tempDir, "state.json");
+    try {
+      const store = new JsonStateStore(statePath, {
+        jobRetentionCount: 1,
+        outboxRetentionCount: 0,
+      });
+      const activeJob = durableJob("job_active", "queued", timestamp(1), []);
+      const capacityNotice = durableJob(
+        "job_capacity_notice",
+        "cancelled",
+        timestamp(2),
+        ["outbox_capacity_notice"],
+      );
+      capacityNotice.capacityNoticeActive = true;
+      capacityNotice.capacityNoticeKind = "durable";
+      capacityNotice.capacityNoticeScope = "global";
+      const state = durableState(
+        [activeJob, capacityNotice],
+        [
+          durableOutbox(
+            "outbox_capacity_notice",
+            capacityNotice.id,
+            "delivered",
+            timestamp(2),
+          ),
+        ],
+      );
+
+      await store.save(state);
+
+      expect(Object.keys(state.jobs).sort()).toEqual(
+        [activeJob.id, capacityNotice.id].sort(),
+      );
+      expect(state.outbox).toEqual({});
+
+      capacityNotice.capacityNoticeActive = false;
+      await store.save(state);
+      expect(Object.keys(state.jobs)).toEqual([activeJob.id]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("normalizes durable references and applies retention again when loading after restart", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
     const statePath = path.join(tempDir, "state.json");

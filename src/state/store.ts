@@ -165,7 +165,10 @@ function pruneTerminalJobs(state: BridgeState, retentionCount: number): void {
   );
   const candidates = Object.values(state.jobs)
     .filter(
-      (job) => isTerminalJob(job) && !jobsWithActiveOutbox.has(job.id),
+      (job) =>
+        isTerminalJob(job) &&
+        job.capacityNoticeActive !== true &&
+        !jobsWithActiveOutbox.has(job.id),
     )
     .sort(compareJobAge);
 

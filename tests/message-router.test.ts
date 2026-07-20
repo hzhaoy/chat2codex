@@ -117,6 +117,54 @@ class TransientFinalDeliverySender extends CollectingSender {
   }
 }
 
+class PersistentDurableDeliveryFailingSender extends CollectingSender {
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendText(
+    chatId: string,
+    text: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+      throw new Error("simulated persistent durable delivery failure");
+    }
+    await super.sendText(chatId, text);
+  }
+
+  override async sendMarkdown(
+    chatId: string,
+    markdown: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+      throw new Error("simulated persistent durable delivery failure");
+    }
+    await super.sendMarkdown(chatId, markdown);
+  }
+}
+
+class ToggleControlDeliverySender extends CollectingSender {
+  failControl = false;
+  readonly idempotencyKeys: string[] = [];
+
+  override async sendText(
+    chatId: string,
+    text: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    if (options?.idempotencyKey) {
+      this.idempotencyKeys.push(options.idempotencyKey);
+      throw new Error("simulated persistent durable delivery failure");
+    }
+    if (this.failControl) {
+      throw new Error("simulated transient control delivery failure");
+    }
+    await super.sendText(chatId, text);
+  }
+}
+
 class IdempotencyCollectingSender extends CollectingSender {
   readonly idempotencyKeys: string[] = [];
 
@@ -319,6 +367,17 @@ class DelayedStatusCardSender extends CardCollectingSender {
     this.createStarted.resolve();
     await this.releaseCreate.promise;
     return super.createStatusCard(chatId, input);
+  }
+}
+
+class DelayedTextSender extends CollectingSender {
+  readonly sendStarted = deferred<void>();
+  readonly releaseSend = deferred<void>();
+
+  override async sendText(chatId: string, text: string): Promise<void> {
+    this.sendStarted.resolve();
+    await this.releaseSend.promise;
+    await super.sendText(chatId, text);
   }
 }
 
@@ -1225,7 +1284,7 @@ describe("MessageRouter access control", () => {
           }),
         ]);
         await waitFor(
-          () => sender.messages.filter((message) => message.text.includes("队列已满")).length === 2,
+          () => sender.messages.filter((message) => message.text.includes("队列已满")).length === 1,
         );
 
         await router.accept({
@@ -1239,17 +1298,27 @@ describe("MessageRouter access control", () => {
 
         const store = new JsonStateStore(config.bridgeStatePath);
         const state = await store.load();
+        expect(state.jobs.m_capacity_rejected_1).toMatchObject({
+          status: "cancelled",
+          interruptionReason: "queue_capacity_reached",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        expect(state.jobs.m_capacity_rejected_2).toBeUndefined();
         for (const messageId of ["m_capacity_rejected_1", "m_capacity_rejected_2"]) {
-          expect(state.jobs[messageId]).toMatchObject({
-            status: "cancelled",
-            interruptionReason: "queue_capacity_reached",
-          });
           expect(state.pendingMessages[messageId]).toBeUndefined();
           expect(state.processedMessageIds).toContain(messageId);
-          expect(
-            Object.values(state.outbox).find((delivery) => delivery.jobId === messageId)?.status,
-          ).toBe("delivered");
         }
+        expect(
+          Object.values(state.outbox).find(
+            (delivery) => delivery.jobId === "m_capacity_rejected_1",
+          )?.status,
+        ).toBe("delivered");
+        expect(
+          Object.values(state.outbox).some(
+            (delivery) => delivery.jobId === "m_capacity_rejected_2",
+          ),
+        ).toBe(false);
         expect(codex.runs).toHaveLength(1);
 
         codex.complete(0, "thread_capacity_running");
@@ -1302,6 +1371,285 @@ describe("MessageRouter access control", () => {
         await waitFor(() => codex.runs.length === 2);
         codex.complete(1, "thread_other_chat");
         await waitForState(store, (state) => state.jobs.m_other_chat_accepted?.status === "completed");
+      },
+    );
+  });
+
+  test("bounds durable jobs and outbox retries while delivery keeps failing", async () => {
+    const sender = new PersistentDurableDeliveryFailingSender();
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "1",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await router.accept({
+          messageId: "m_delivery_blocked",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "finish but keep the reply undelivered",
+        });
+        await waitForState(store, (state) =>
+          Object.values(state.outbox).some(
+            (delivery) =>
+              delivery.jobId === "m_delivery_blocked" &&
+              delivery.status === "pending" &&
+              delivery.attempts >= 1,
+          ),
+        );
+
+        const overflowIds = Array.from({ length: 12 }, (_, index) => `m_overflow_${index}`);
+        await Promise.all(
+          overflowIds.map((messageId) =>
+            router.accept({
+              messageId,
+              chatId: "oc_chat",
+              chatType: "direct",
+              sender: { openId: "ou_user" },
+              text: `overflow ${messageId}`,
+            }),
+          ),
+        );
+        await waitForState(store, (state) =>
+          Object.values(state.outbox).some(
+            (delivery) =>
+              delivery.jobId === overflowIds[0] &&
+              delivery.status === "pending" &&
+              delivery.attempts >= 1,
+          ),
+        );
+
+        const blocked = await store.load();
+        expect(codex.runs).toHaveLength(1);
+        expect(Object.keys(blocked.jobs).sort()).toEqual(
+          ["m_delivery_blocked", overflowIds[0]!].sort(),
+        );
+        expect(Object.values(blocked.outbox)).toHaveLength(2);
+        expect(blocked.jobs[overflowIds[0]!]).toMatchObject({
+          status: "cancelled",
+          interruptionReason: "queue_capacity_reached",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        for (const messageId of overflowIds) {
+          expect(blocked.pendingMessages[messageId]).toBeUndefined();
+          expect(blocked.processedMessageIds).toContain(messageId);
+        }
+        expect(sender.idempotencyKeys.length).toBeGreaterThanOrEqual(2);
+      },
+    );
+  });
+
+  test("bounds pending control inbox records while the sender keeps failing", async () => {
+    const sender = new PersistentDurableDeliveryFailingSender();
+    sender.sendText = async (_chatId, _text, options) => {
+      if (options?.idempotencyKey) {
+        sender.idempotencyKeys.push(options.idempotencyKey);
+      }
+      throw new Error("simulated persistent control delivery failure");
+    };
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "1",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await router.accept({
+          messageId: "m_status_blocked",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitForState(
+          store,
+          (state) => state.pendingMessages.m_status_blocked?.attempts === 1,
+        );
+
+        const overflowIds = Array.from(
+          { length: 12 },
+          (_, index) => `m_status_overflow_${index}`,
+        );
+        await Promise.all(
+          overflowIds.map((messageId) =>
+            router.accept({
+              messageId,
+              chatId: "oc_chat",
+              chatType: "direct",
+              sender: { openId: "ou_user" },
+              text: "/status",
+            }),
+          ),
+        );
+        await waitForState(
+          store,
+          (state) =>
+            Object.values(state.outbox).some(
+              (delivery) =>
+                delivery.jobId === overflowIds[0] &&
+                delivery.status === "pending" &&
+                delivery.attempts >= 1,
+            ),
+        );
+
+        const blocked = await store.load();
+        expect(codex.runs).toHaveLength(0);
+        expect(Object.keys(blocked.pendingMessages)).toEqual(["m_status_blocked"]);
+        expect(Object.keys(blocked.jobs)).toEqual([overflowIds[0]]);
+        expect(Object.values(blocked.outbox)).toHaveLength(1);
+        expect(blocked.jobs[overflowIds[0]!]).toMatchObject({
+          kind: "control_recovery",
+          status: "cancelled",
+          interruptionReason: "inbox_capacity_reached",
+          capacityNoticeKind: "inbox",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        for (const messageId of overflowIds) {
+          expect(blocked.processedMessageIds).toContain(messageId);
+        }
+      },
+    );
+  });
+
+  test("applies the pending control inbox cap per chat", async () => {
+    const sender = new FailingDeliverySender();
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "3",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await router.accept({
+          messageId: "m_chat_status_blocked",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitForState(
+          store,
+          (state) => state.pendingMessages.m_chat_status_blocked?.attempts === 1,
+        );
+
+        await router.accept({
+          messageId: "m_chat_status_overflow",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await router.accept({
+          messageId: "m_other_chat_status",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitForState(
+          store,
+          (state) => state.pendingMessages.m_other_chat_status?.attempts === 1,
+        );
+
+        const blocked = await store.load();
+        expect(Object.keys(blocked.pendingMessages).sort()).toEqual(
+          ["m_chat_status_blocked", "m_other_chat_status"].sort(),
+        );
+        expect(blocked.jobs.m_chat_status_overflow).toMatchObject({
+          kind: "control_recovery",
+          interruptionReason: "inbox_capacity_reached",
+          capacityNoticeKind: "inbox",
+          capacityNoticeScope: "chat",
+          capacityNoticeActive: true,
+        });
+        expect(codex.runs).toHaveLength(0);
+      },
+    );
+  });
+
+  test("retries the same control delivery without letting failed notices grow across chats", async () => {
+    const sender = new ToggleControlDeliverySender();
+    const codex = new FakeCodex();
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "3",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const store = new JsonStateStore(config.bridgeStatePath);
+        for (const suffix of ["a", "b", "c"]) {
+          const chatId = `oc_chat_${suffix}`;
+          const pendingId = `m_status_${suffix}`;
+          const overflowId = `m_status_overflow_${suffix}`;
+          const pendingMessage = {
+            messageId: pendingId,
+            chatId,
+            chatType: "direct" as const,
+            sender: { openId: "ou_user" },
+            text: "/status",
+          };
+
+          sender.failControl = true;
+          await router.accept(pendingMessage);
+          await waitForState(
+            store,
+            (state) => state.pendingMessages[pendingId]?.attempts === 1,
+          );
+          await router.accept({ ...pendingMessage, messageId: overflowId });
+          await waitForState(
+            store,
+            (state) =>
+              Object.values(state.outbox).some(
+                (delivery) =>
+                  delivery.jobId === overflowId &&
+                  delivery.status === "pending" &&
+                  delivery.attempts >= 1,
+              ),
+          );
+
+          sender.failControl = false;
+          await router.accept(pendingMessage);
+          await waitForState(
+            store,
+            (state) => state.pendingMessages[pendingId] === undefined,
+          );
+        }
+
+        sender.failControl = true;
+        await router.accept({
+          messageId: "m_status_after_global_cap",
+          chatId: "oc_chat_d",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+
+        const bounded = await store.load();
+        expect(Object.keys(bounded.pendingMessages)).toHaveLength(0);
+        expect(Object.keys(bounded.jobs)).toHaveLength(3);
+        expect(Object.keys(bounded.outbox)).toHaveLength(3);
+        expect(bounded.jobs.m_status_overflow_c).toMatchObject({
+          capacityNoticeKind: "inbox",
+          capacityNoticeScope: "global",
+          capacityNoticeActive: true,
+        });
+        expect(bounded.processedMessageIds).toContain("m_status_after_global_cap");
+        expect(codex.runs).toHaveLength(0);
       },
     );
   });
@@ -1458,6 +1806,280 @@ describe("MessageRouter access control", () => {
         expect(delivered).not.toContain("结尾不应出现");
       },
     );
+  });
+
+  test("replays a pending status command after restart instead of inventing a Codex job", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-status-recovery-"));
+    const sender = new DelayedTextSender();
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {},
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_status_restart: {
+            messageId: "m_status_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/status",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await sender.sendStarted.promise;
+
+      const replaying = await store.load();
+      expect(replaying.pendingMessages.m_status_restart?.route).toBe("control_replay_safe");
+      expect(replaying.jobs.m_status_restart).toBeUndefined();
+
+      sender.releaseSend.resolve();
+      await waitForState(
+        store,
+        (state) => state.pendingMessages.m_status_restart === undefined,
+      );
+      const recovered = await store.load();
+      expect(codex.runs).toHaveLength(0);
+      expect(recovered.jobs.m_status_restart).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_status_restart");
+      expect(sender.messages[0]?.text).toContain("当前 chat");
+    } finally {
+      sender.releaseSend.resolve();
+      router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not promote a persisted non-Codex message after access changes", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-route-recovery-"));
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_newly_allowed",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {},
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_previously_denied: {
+            messageId: "m_previously_denied",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_newly_allowed" },
+            text: "must not become a Codex run after restart",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 1,
+            route: "message",
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      const sender = new CollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+
+      const recovered = await store.load();
+      expect(recovered.pendingMessages.m_previously_denied).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_previously_denied");
+      expect(recovered.jobs.m_previously_denied).toBeUndefined();
+      expect(codex.runs).toHaveLength(0);
+      expect(sender.messages).toHaveLength(0);
+    } finally {
+      router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers a pending side-effect control without replaying or blaming Codex", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-control-recovery-"));
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: tempDir,
+            chatType: "direct",
+            threadId: "thread_before_restart",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+          },
+        },
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_new_restart: {
+            messageId: "m_new_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/new",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new FakeCodex();
+      const sender = new IdempotencyCollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitFor(() => sender.messages.length === 1);
+
+      const recovered = await store.load();
+      expect(codex.runs).toHaveLength(0);
+      expect(recovered.chats.oc_chat?.threadId).toBe("thread_before_restart");
+      expect(recovered.pendingMessages.m_new_restart).toBeUndefined();
+      expect(recovered.processedMessageIds).toContain("m_new_restart");
+      expect(recovered.jobs.m_new_restart).toMatchObject({
+        kind: "control_recovery",
+        status: "interrupted",
+        interruptionReason: "control_command_not_replayed",
+        prompt: "/new",
+      });
+      expect(sender.messages[0]?.text).toContain("不会自动重放");
+      expect(sender.messages[0]?.text).not.toContain("Codex");
+    } finally {
+      router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not replay stale stop or steer commands onto a recovered queued run", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-control-race-"));
+    const codex = new ControlledCodex();
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: tempDir,
+            chatType: "direct",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+          },
+        },
+        jobs: {
+          m_queued_restart: {
+            id: "m_queued_restart",
+            kind: "codex_run",
+            messageId: "m_queued_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            cwd: tempDir,
+            prompt: "continue the queued task",
+            status: "queued",
+            createdAt: "2026-07-20T00:00:00.000Z",
+            updatedAt: "2026-07-20T00:00:00.000Z",
+            deliveryIds: [],
+          },
+        },
+        outbox: {},
+        pendingMessages: {
+          m_queued_restart: {
+            messageId: "m_queued_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "continue the queued task",
+            acceptedAt: "2026-07-20T00:00:00.000Z",
+            attempts: 0,
+          },
+          m_stop_restart: {
+            messageId: "m_stop_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/stop",
+            acceptedAt: "2026-07-20T00:00:01.000Z",
+            attempts: 0,
+          },
+          m_steer_restart: {
+            messageId: "m_steer_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/steer private recovery instruction",
+            acceptedAt: "2026-07-20T00:00:02.000Z",
+            attempts: 0,
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const sender = new IdempotencyCollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitFor(() => codex.runs.length === 1);
+      await waitFor(
+        () => sender.messages.filter((message) => message.text.includes("不会自动重放")).length === 2,
+      );
+
+      const recovered = await store.load();
+      expect(codex.runs[0]?.signal?.aborted).toBe(false);
+      expect(recovered.jobs.m_stop_restart).toMatchObject({
+        kind: "control_recovery",
+        prompt: "/stop",
+      });
+      expect(recovered.jobs.m_steer_restart).toMatchObject({
+        kind: "control_recovery",
+        prompt: "/steer",
+      });
+      expect(sender.messages.map((message) => message.text).join("\n")).not.toContain(
+        "private recovery instruction",
+      );
+
+      codex.complete(0, "thread_recovered_queue");
+      await waitForState(
+        store,
+        (state) => state.jobs.m_queued_restart?.status === "completed",
+      );
+    } finally {
+      codex.complete(0, "thread_recovered_queue");
+      router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   test("marks a running durable job interrupted on restart without rerunning Codex", async () => {

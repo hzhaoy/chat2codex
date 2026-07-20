@@ -120,6 +120,12 @@ export interface RecentFailureDiagnostic {
   hint?: string;
 }
 
+export type PendingMessageRoute =
+  | "codex"
+  | "control_replay_safe"
+  | "control_no_replay"
+  | "message";
+
 export interface PendingMessageDelivery {
   messageId: string;
   chatId: string;
@@ -138,6 +144,11 @@ export interface PendingMessageDelivery {
   acceptedAt: string;
   attempts: number;
   lastError?: string;
+  /**
+   * Added after the initial durable-inbox rollout. Missing values are
+   * classified conservatively during recovery for state-file compatibility.
+   */
+  route?: PendingMessageRoute;
 }
 
 export type DurableCodexJobStatus =
@@ -150,7 +161,7 @@ export type DurableCodexJobStatus =
 
 export interface DurableCodexJob {
   id: string;
-  kind: "codex_run";
+  kind: "codex_run" | "control_recovery";
   messageId: string;
   chatId: string;
   chatType: "direct" | "group";
@@ -165,6 +176,10 @@ export interface DurableCodexJob {
   result?: LastRunSummary;
   deliveryIds: string[];
   interruptionReason?: string;
+  /** A durable singleton used to suppress repeated queue-full replies. */
+  capacityNoticeScope?: "global" | "chat";
+  capacityNoticeKind?: "durable" | "inbox";
+  capacityNoticeActive?: boolean;
 }
 
 export type DurableOutboxStatus = "pending" | "sending" | "delivered";
