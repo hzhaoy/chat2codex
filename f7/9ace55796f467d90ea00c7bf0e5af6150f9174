@@ -1,0 +1,31 @@
+src/state/store.ts
+  s_48fcd23938c128::t_78e28da160a328 5-10,16-20,22-37,43,51-56,66-70,119-258
+tests/state-store.test.ts
+  s_5deca673f869a1::t_99478919bfdc9b 8-14,164-277,279-340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f79ace55796f467d90ea00c7bf0e5af6150f9174",
+  "prompts": {},
+  "sessions": {
+    "s_48fcd23938c128": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d86-f2da-7092-a0e2-259386ddbabc",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_5deca673f869a1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d86-b4e6-7e02-bf63-0f858dca49d5",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
