@@ -1,0 +1,21 @@
+src/state/types.ts
+  s_6565217ad544a3::t_06aa68da8c75c0 123-128,147-151,164,179-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "45c5c12a23f4f31af4a74402cb234e5f5ba617c2",
+  "prompts": {},
+  "sessions": {
+    "s_6565217ad544a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7db4-5e3f-7703-bfe9-212101623ed0",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

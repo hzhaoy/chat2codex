@@ -1,0 +1,23 @@
+src/bot/message-router.ts
+  s_bc0331dd4e9203::t_0f37346ca39a22 215-221,264-265,285-288,320,322,324-325,328-354,370-371,373-377,754,812-832,1210-1265,4333-4362,4680
+tests/message-router.test.ts
+  s_bc0331dd4e9203::t_79a322eb97a61b 987-1154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f4671a268ee3d7b36ca8e76996398d130c1b9408",
+  "prompts": {},
+  "sessions": {
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

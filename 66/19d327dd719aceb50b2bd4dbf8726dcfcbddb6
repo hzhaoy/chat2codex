@@ -1,0 +1,29 @@
+.env.example
+  s_29e14976450b4e::t_955ef4fc3b7867 23,38-41,43-57
+src/agent/codex-environment.ts
+  s_29e14976450b4e::t_578be472638347 24,31-47
+src/config/env.ts
+  s_29e14976450b4e::t_43b37b8b1644e8 16-36,83,91-92,94-108,111-139,162,172-173,177-191
+tests/codex-environment.test.ts
+  s_29e14976450b4e::t_c24671ca8dab23 23-40,60-81
+tests/config.test.ts
+  s_29e14976450b4e::t_adaa07769ca96e 33-96,153-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6619d327dd719aceb50b2bd4dbf8726dcfcbddb6",
+  "prompts": {},
+  "sessions": {
+    "s_29e14976450b4e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d83-7ac0-7740-8786-b8a676b82769",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

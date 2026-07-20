@@ -1,0 +1,79 @@
+.env.example
+  s_4efc68b404d41d::t_869fb79be6a4be 24-27
+README.zh-CN.md
+  s_bc0331dd4e9203::t_c3fe8a340f2b6d 74-75,80,137,231,252-254,295
+SECURITY.md
+  s_bc0331dd4e9203::t_d4a9263bd2d7c4 14,53-64
+src/agent/codex-environment.ts
+  s_bc0331dd4e9203::t_739f09ff87289b 25-26
+src/agent/codex-runner.ts
+  s_bc0331dd4e9203::t_da0f122076b5e2 1,3,34-35,46-48,67-80,499-504,636-724,750-753,1022-1024,1026-1032,1046,1110-1261,1416-1433,1435-1442,1455-1461,1591-1593,1599-1602,1779-2642,3148-3165,4933-4958
+src/bot/lark-bot.ts
+  s_a6e0a94167b956::t_7ba09ed0746461 50-62,339-341,343,345-352,354-366,368-396,398-406,408,411-441
+src/bot/message-router.ts
+  s_bc0331dd4e9203::t_f113ddff23768b 12,45,207-208,219,221,255-256,341-344,346,350,362-365,371-384,389-432,436-438,460-462,533,541-542,624-626,641-649,653-655,698-700,752-756,759-763,778-780,793-811,846-848,948-951,961-962,973,1006,1032,1048-1049,1099-1103,1148,1207,1211-1247,1253,1290-1296,1299-1301,1430-1432,1476-1483,1502-1508,1587-1589,2492-2495,2572,2608-2611,2835,2873,2891,2926,2934-2937,3003-3014,3021-3034,3972,4050,4085,4114-4117,4120-4129,4141,4160,4171-4185,4203,4205,4212,4214,4217,4236,4239,4279,4306-4307,4317,4320,4339,4345,4501-4514,4540-4550,4554-4566,4574,5485,5519,5812-5827
+src/cli.ts
+  s_a50315598e3ccc::t_5b22a0f6ca7bf0 19,55-73,170-174,176-179,181-182,184-221,225-325
+src/config/env.ts
+  s_4efc68b404d41d::t_c7a86f05d38500 37,40,45,84-85,121-127,172-173
+src/state/store.ts
+  s_4efc68b404d41d::t_6a6d3f54804f98 9,52,68,119-129
+src/state/types.ts
+  s_bc0331dd4e9203::t_70eae225ef40ba 1-2,4-5,16-21,180-181
+tests/cli.test.ts
+  s_a6e0a94167b956::t_562b6d49408f95 6-12,45-155,333-353
+tests/codex-environment.test.ts
+  s_bc0331dd4e9203::t_ea728d5bac608b 24-25,65-66
+tests/codex-session-manager.test.ts
+  s_bc0331dd4e9203::t_f02b4ecd2fdef4 1-957
+tests/config.test.ts
+  s_4efc68b404d41d::t_eb977e1e6e02b8 34-35,60-61,83-84,140-149,167-180,186,221-228
+tests/lark-bot.test.ts
+  s_a6e0a94167b956::t_ce746761a64fe2 7-10,20-69,253-263
+tests/message-router.test.ts
+  s_bc0331dd4e9203::t_e8308300a02132 63-73,445-499,595-602,665-672,744,751-753,756,1061-1092,1127-1200,1898,1927-1928,2055,2104,2167,2271,3394-3518,4447-4572,4735-4788,4832,4861-4863,4865,4869-4877,6184
+tests/state-store.test.ts
+  s_4efc68b404d41d::t_0b1b3aabc39e6e 34,70,121,139,169-205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6db36de19cc1ccfadc0b29432f7ae8f8c8bd1eea",
+  "prompts": {},
+  "sessions": {
+    "s_4efc68b404d41d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7eb7-90ea-7cb0-aa72-8b5b8a227013",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_a50315598e3ccc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7eb7-17a4-76e2-a644-7688a6d79dfe",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_a6e0a94167b956": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7ec0-7ed3-7bc3-83e7-3a4fcf1cbb4b",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
