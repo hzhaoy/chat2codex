@@ -1,0 +1,29 @@
+CHANGELOG.md
+  s_bc0331dd4e9203::t_9a30beaae378d0 10-11
+README.md
+  s_bc0331dd4e9203::t_20c8398f7aa1dc 473-475,478
+README.zh-CN.md
+  s_bc0331dd4e9203::t_9b90ddc2fc7f64 293,295-296
+SECURITY.md
+  s_bc0331dd4e9203::t_e3601c4c804f60 14-15
+package.json
+  s_bc0331dd4e9203::t_99086798f43a2e 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fc7e70f0adab1da62da667f81236ed921f10339c",
+  "prompts": {},
+  "sessions": {
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
