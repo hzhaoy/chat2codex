@@ -687,6 +687,11 @@ describe("Codex app-server session manager", () => {
         sessionScope: scope(),
       });
       await waitForMessage(fixture.receivedPath, "fixture/exit");
+      // The child writes fixture/exit from its own exit hook, which can become
+      // visible just before the parent receives the close event. Let the
+      // manager observe that event so this test exercises idle-session
+      // eviction rather than the separate pre-submission retry boundary.
+      await delay(25);
       const second = await runner.run({
         prompt: "after-crash",
         cwd: fixture.tempDir,
