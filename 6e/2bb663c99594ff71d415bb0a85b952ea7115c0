@@ -1,0 +1,23 @@
+src/bot/attachment-store.ts
+  s_bc0331dd4e9203::t_9839f3e831ee6d 104-105,114,131,145,201-205,241-291,404-421
+tests/attachment-store.test.ts
+  s_bc0331dd4e9203::t_6720face8fdcb8 47-48,77-79,161-200,211-212,215-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6e2bb663c99594ff71d415bb0a85b952ea7115c0",
+  "prompts": {},
+  "sessions": {
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
