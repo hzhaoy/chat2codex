@@ -1,0 +1,37 @@
+src/agent/codex-runner.ts
+  s_bc75faee1cb9b9::t_428b8506d13fb7 19-31,44-51,171-291,431-435,437-438,442-446,619-621,624,628,715-717,741,823,828,928-930,940-942,958,962-966,970,981,985,997,1001,1008-1031,1034-1042,1099-1220,1234,1296-1298,1320,1831,1833,1841,1845,1849-1894,1897-1898,1901-1924,1926,1929-1955,1958-1959,1961-1964,1966,1968-1970,1972-2222,2224-2267,2270-2362,2364-2369,2373-2833,3452-3455,3457-3460
+src/bot/lark-bot.ts
+  s_91a5e06e810951::t_1894caf5f93819 19-20,22,24-26,248-315
+src/bot/lark-card-action.ts
+  s_91a5e06e810951::t_9682fe81d21fec 9-11,32-34,42-46,58-60,134-137,166-168,180-202,220-228,233-241
+tests/codex-runner.test.ts
+  s_bc75faee1cb9b9::t_841e4bf449f976 822,979,1121-1122,1130-1633,1635-1637,1639-1640,1643,1727-2134
+tests/lark-card-action.test.ts
+  s_91a5e06e810951::t_bb1b28129dacea 3-8,237-332
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3d4cf81395df4aa83c25286a231e644ec194184",
+  "prompts": {},
+  "sessions": {
+    "s_91a5e06e810951": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d83-494d-7c82-805c-d7b8230aa03b",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_bc75faee1cb9b9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d83-1c93-7583-b9fe-a2e06e4005e1",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
