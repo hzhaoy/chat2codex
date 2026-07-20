@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { Readable } from "node:stream";
 
 import * as lark from "@larksuiteoapi/node-sdk";
 
@@ -34,6 +36,11 @@ import {
 interface BotProbeResult {
   botName?: string;
   botOpenId?: string;
+}
+
+interface AttachmentDownloadResponse {
+  headers: unknown;
+  getReadableStream(): Readable;
 }
 
 export async function runBridge(config: BridgeConfig, logger: Logger): Promise<void> {
@@ -115,15 +122,20 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
       });
       const directory = path.join(
         config.attachmentDownloadDir,
-        sanitizePathSegment(message.messageId),
+        sanitizeMessageDirectoryName(message.messageId),
       );
-      await ensurePrivateDirectory(config.attachmentDownloadDir);
-      await ensurePrivateDirectory(directory);
+      const downloadRoot = await ensurePrivateDirectory(config.attachmentDownloadDir);
+      const resolvedDirectory = await ensurePrivateDirectory(directory);
+      assertPathInside(downloadRoot, resolvedDirectory);
 
       const fileName = buildAttachmentFileName(attachment, response.headers);
-      const filePath = path.join(directory, fileName);
-      await response.writeFile(filePath);
-      await fs.chmod(filePath, 0o600);
+      const filePath = path.join(resolvedDirectory, fileName);
+      await writeAttachmentResponseAtomically(
+        response,
+        downloadRoot,
+        filePath,
+        config.attachmentMaxFileBytes,
+      );
       return {
         kind: attachment.kind,
         name: attachment.name ?? fileName,
@@ -233,7 +245,10 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
 
   const router = new MessageRouter(
     config,
-    new JsonStateStore(config.bridgeStatePath),
+    new JsonStateStore(config.bridgeStatePath, {
+      jobRetentionCount: config.jobRetentionCount,
+      outboxRetentionCount: config.outboxRetentionCount,
+    }),
     sender,
     logger,
   );
@@ -285,10 +300,138 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
   wsClient.start({ eventDispatcher });
 }
 
-async function ensurePrivateDirectory(directory: string): Promise<void> {
-  const createdDirectory = await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  if (createdDirectory) {
-    await fs.chmod(directory, 0o700);
+async function ensurePrivateDirectory(directory: string): Promise<string> {
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const stats = await fs.lstat(directory);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error(`Attachment directory is not a private directory: ${directory}`);
+  }
+  await fs.chmod(directory, 0o700);
+  return fs.realpath(directory);
+}
+
+async function writeAttachmentResponseAtomically(
+  response: AttachmentDownloadResponse,
+  downloadRoot: string,
+  filePath: string,
+  maxBytes: number,
+): Promise<number> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error("Attachment byte limit must be a positive safe integer.");
+  }
+
+  const resolvedRoot = path.resolve(downloadRoot);
+  const resolvedFilePath = path.resolve(filePath);
+  assertPathInside(resolvedRoot, resolvedFilePath);
+
+  const temporaryPath = path.join(
+    path.dirname(resolvedFilePath),
+    `.${path.basename(resolvedFilePath)}.${randomUUID()}.part`,
+  );
+  assertPathInside(resolvedRoot, temporaryPath);
+
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let readable: Readable | undefined;
+  let bytesWritten = 0;
+
+  try {
+    const contentLength = attachmentContentLength(response.headers);
+    if (contentLength !== undefined && contentLength > maxBytes) {
+      throw attachmentTooLargeError(maxBytes);
+    }
+
+    handle = await fs.open(temporaryPath, "wx", 0o600);
+    readable = response.getReadableStream();
+    for await (const chunk of readable) {
+      const buffer = attachmentChunkBuffer(chunk);
+      if (bytesWritten + buffer.byteLength > maxBytes) {
+        readable.destroy();
+        throw attachmentTooLargeError(maxBytes);
+      }
+      await writeAll(handle, buffer);
+      bytesWritten += buffer.byteLength;
+    }
+
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await fs.chmod(temporaryPath, 0o600);
+    await fs.rename(temporaryPath, resolvedFilePath);
+    await fs.chmod(resolvedFilePath, 0o600);
+    return bytesWritten;
+  } catch (error) {
+    readable?.destroy();
+    if (handle) {
+      await handle.close().catch(() => undefined);
+    }
+    await Promise.allSettled([
+      fs.rm(temporaryPath, { force: true }),
+      fs.rm(resolvedFilePath, { force: true }),
+    ]);
+    throw error;
+  }
+}
+
+// Exported solely so the byte-limit and atomic-file guarantees can be tested without mocking the SDK.
+export const writeAttachmentResponseAtomicallyForTest = writeAttachmentResponseAtomically;
+
+async function writeAll(
+  handle: Awaited<ReturnType<typeof fs.open>>,
+  buffer: Buffer,
+): Promise<void> {
+  let offset = 0;
+  while (offset < buffer.byteLength) {
+    const { bytesWritten } = await handle.write(
+      buffer,
+      offset,
+      buffer.byteLength - offset,
+      null,
+    );
+    if (bytesWritten === 0) {
+      throw new Error("Attachment download stopped before the current chunk was written.");
+    }
+    offset += bytesWritten;
+  }
+}
+
+function attachmentChunkBuffer(chunk: unknown): Buffer {
+  if (typeof chunk === "string") {
+    return Buffer.from(chunk);
+  }
+  if (Buffer.isBuffer(chunk)) {
+    return chunk;
+  }
+  if (ArrayBuffer.isView(chunk)) {
+    return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
+  if (chunk instanceof ArrayBuffer) {
+    return Buffer.from(chunk);
+  }
+  throw new Error("Attachment stream returned an unsupported chunk type.");
+}
+
+function attachmentContentLength(headers: unknown): number | undefined {
+  const value = headerValue(headers, "content-length")?.trim();
+  if (!value || !/^\d+$/u.test(value)) {
+    return undefined;
+  }
+  const length = Number(value);
+  return Number.isSafeInteger(length) ? length : undefined;
+}
+
+function attachmentTooLargeError(maxBytes: number): Error {
+  return new Error(`Attachment exceeds the configured ${maxBytes}-byte per-file limit.`);
+}
+
+function assertPathInside(root: string, candidate: string): void {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  if (
+    !relative ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error("Attachment path escapes the configured download directory.");
   }
 }
 
@@ -326,11 +469,18 @@ function imageExtension(headers: unknown): string {
 function headerValue(headers: unknown, name: string): string | undefined {
   const record =
     typeof headers === "object" && headers !== null ? (headers as Record<string, unknown>) : null;
-  const value = record?.[name] ?? record?.[name.toLowerCase()] ?? record?.[name.toUpperCase()];
+  const getter = record?.get;
+  const getterValue =
+    typeof getter === "function" ? (getter.call(headers, name) as unknown) : undefined;
+  const matchingEntry = record
+    ? Object.entries(record).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1]
+    : undefined;
+  const value = getterValue ?? matchingEntry;
   if (Array.isArray(value)) {
-    return value.find((item): item is string => typeof item === "string");
+    const item = value.find((entry) => typeof entry === "string" || typeof entry === "number");
+    return typeof item === "number" ? String(item) : item;
   }
-  return typeof value === "string" ? value : undefined;
+  return typeof value === "string" ? value : typeof value === "number" ? String(value) : undefined;
 }
 
 function shortKey(key: string): string {
@@ -339,6 +489,11 @@ function shortKey(key: string): string {
 
 function sanitizePathSegment(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]+/gu, "_").replace(/^_+|_+$/gu, "");
+}
+
+function sanitizeMessageDirectoryName(value: string): string {
+  const sanitized = sanitizePathSegment(value);
+  return sanitized && sanitized !== "." && sanitized !== ".." ? sanitized : "message";
 }
 
 function sanitizeFileName(value: string): string {

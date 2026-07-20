@@ -63,6 +63,10 @@ import {
   type SenderIdentity,
 } from "./access-control.js";
 import {
+  enforceAttachmentStoreLimits,
+  removeAttachmentFiles,
+} from "./attachment-store.js";
+import {
   answerUserInputCardAction,
   cancelUserInputCardAction,
   cardActionCard,
@@ -248,6 +252,7 @@ interface PendingRunSteers {
 export class MessageRouter {
   private state: BridgeState | null = null;
   private stateMutationTail: Promise<void> = Promise.resolve();
+  private attachmentTaskTail: Promise<void> = Promise.resolve();
   private readonly bridgeStartedAtMs = Date.now();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly workspaceQueues = new Map<string, Promise<void>>();
@@ -1592,6 +1597,22 @@ export class MessageRouter {
       return text;
     }
 
+    if (attachments.length > this.config.attachmentMaxCount) {
+      const detail = `Message contains ${attachments.length} attachments; limit is ${this.config.attachmentMaxCount}.`;
+      await this.recordRecentFailure(message.chatId, {
+        category: "attachment_download_failed",
+        cwd: this.requireState().chats[message.chatId]?.cwd ?? this.config.codexWorkdir,
+        promptPreview: text || "attachment-only message",
+        detail,
+        hint: `每条消息最多发送 ${this.config.attachmentMaxCount} 个附件。`,
+      });
+      await this.sender.sendText(
+        message.chatId,
+        `附件数量超过上限：每条消息最多 ${this.config.attachmentMaxCount} 个，本次没有执行 Codex。`,
+      );
+      return null;
+    }
+
     if (!this.sender.downloadAttachment) {
       await this.recordRecentFailure(message.chatId, {
         category: "attachment_download_failed",
@@ -1604,12 +1625,37 @@ export class MessageRouter {
       return null;
     }
 
-    let downloaded: DownloadedAttachment[] = [];
+    return this.enqueueAttachmentTask(() =>
+      this.downloadAttachmentsAndBuildPrompt(message, text, attachments),
+    );
+  }
+
+  private async downloadAttachmentsAndBuildPrompt(
+    message: IncomingTextMessage,
+    text: string,
+    attachments: IncomingAttachment[],
+  ): Promise<string | null> {
+    const downloaded: DownloadedAttachment[] = [];
     try {
       for (const attachment of attachments) {
-        downloaded.push(await this.sender.downloadAttachment(message, attachment));
+        downloaded.push(await this.sender.downloadAttachment!(message, attachment));
       }
+      await enforceAttachmentStoreLimits({
+        rootDir: this.config.attachmentDownloadDir,
+        downloadedPaths: downloaded.map((attachment) => attachment.path),
+        retentionHours: this.config.attachmentRetentionHours,
+        messageMaxBytes: this.config.attachmentMaxTotalBytes,
+        storeMaxBytes: this.config.attachmentStoreMaxBytes,
+      });
     } catch (error) {
+      if (downloaded.length > 0) {
+        await removeAttachmentFiles(
+          this.config.attachmentDownloadDir,
+          downloaded.map((attachment) => attachment.path),
+        ).catch((cleanupError: unknown) => {
+          this.logger.warn("Failed to clean up rejected attachment downloads", cleanupError);
+        });
+      }
       this.logger.error("Attachment download failed", error);
       await this.recordRecentFailure(message.chatId, {
         category: "attachment_download_failed",
@@ -1620,13 +1666,24 @@ export class MessageRouter {
       });
       await this.sender.sendText(
         message.chatId,
-        `附件下载失败：${formatError(error)}\n请确认机器人仍在该会话中，且附件大小不超过飞书/Lark下载限制。`,
+        `附件处理失败：${truncateInline(formatError(error), 240)}\n请检查消息资源权限，以及单文件、单消息和附件存储配额。`,
       );
       return null;
     }
 
     const promptText = text || defaultAttachmentPrompt(downloaded);
     return [promptText, "", "本地附件路径：", ...downloaded.map(formatAttachmentLine)].join("\n");
+  }
+
+  private enqueueAttachmentTask<T>(task: () => Promise<T>): Promise<T> {
+    const operation = this.attachmentTaskTail
+      .catch(() => undefined)
+      .then(task);
+    this.attachmentTaskTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   private async handleImmediateStop(message: IncomingTextMessage): Promise<void> {

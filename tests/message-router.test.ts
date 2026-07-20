@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -253,16 +253,31 @@ class DelayedStatusCardSender extends CardCollectingSender {
 
 class AttachmentCollectingSender extends CollectingSender {
   readonly downloads: Array<{ messageId: string; attachment: IncomingAttachment }> = [];
+  readonly downloadedPaths: string[] = [];
+  readonly contentsByKey = new Map<string, string>();
+  private attachmentRoot = "/tmp/chat2codex-downloads";
+
+  setAttachmentRoot(attachmentRoot: string): void {
+    this.attachmentRoot = attachmentRoot;
+  }
 
   async downloadAttachment(
     message: IncomingTextMessage,
     attachment: IncomingAttachment,
   ): Promise<DownloadedAttachment> {
     this.downloads.push({ messageId: message.messageId, attachment });
+    const filePath = path.join(
+      this.attachmentRoot,
+      message.messageId,
+      attachment.name ?? attachment.key,
+    );
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, this.contentsByKey.get(attachment.key) ?? "attachment");
+    this.downloadedPaths.push(filePath);
     return {
       kind: attachment.kind,
       name: attachment.name,
-      path: `/tmp/chat2codex-downloads/${attachment.name ?? attachment.key}`,
+      path: filePath,
     };
   }
 }
@@ -2822,7 +2837,7 @@ describe("MessageRouter access control", () => {
 
   test("downloads attachments and appends local paths to the Codex prompt", async () => {
     const sender = new AttachmentCollectingSender();
-    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex }) => {
+    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex, config }) => {
       await router.enqueue({
         messageId: "m1",
         chatId: "oc_chat",
@@ -2853,7 +2868,7 @@ describe("MessageRouter access control", () => {
           "summarize this",
           "",
           "本地附件路径：",
-          "- 文件 report.pdf: /tmp/chat2codex-downloads/report.pdf",
+          `- 文件 report.pdf: ${path.join(config.attachmentDownloadDir, "m1", "report.pdf")}`,
         ].join("\n"),
       );
     });
@@ -2861,7 +2876,7 @@ describe("MessageRouter access control", () => {
 
   test("uses a default prompt for attachment-only messages", async () => {
     const sender = new AttachmentCollectingSender();
-    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex }) => {
+    await withRouterAndSender({}, new FakeCodex(), sender, async ({ router, codex, config }) => {
       await router.enqueue({
         messageId: "m1",
         chatId: "oc_chat",
@@ -2881,10 +2896,71 @@ describe("MessageRouter access control", () => {
           "请查看并处理下面的图片。",
           "",
           "本地附件路径：",
-          "- 图片: /tmp/chat2codex-downloads/img_v3_test",
+          `- 图片: ${path.join(config.attachmentDownloadDir, "m1", "img_v3_test")}`,
         ].join("\n"),
       );
     });
+  });
+
+  test("rejects attachment counts before starting any download", async () => {
+    const sender = new AttachmentCollectingSender();
+    await withRouterAndSender(
+      { ATTACHMENT_MAX_COUNT: "1" },
+      new FakeCodex(),
+      sender,
+      async ({ router, codex }) => {
+        await router.enqueue({
+          messageId: "m_too_many_attachments",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "process both",
+          attachments: [
+            { kind: "file", key: "first", name: "first.txt" },
+            { kind: "file", key: "second", name: "second.txt" },
+          ],
+        });
+
+        expect(sender.downloads).toHaveLength(0);
+        expect(codex.runs).toHaveLength(0);
+        expect(sender.messages.at(-1)?.text).toContain("附件数量超过上限");
+      },
+    );
+  });
+
+  test("removes the current batch when attachment message bytes exceed the quota", async () => {
+    const sender = new AttachmentCollectingSender();
+    sender.contentsByKey.set("first", "1234");
+    sender.contentsByKey.set("second", "5678");
+    await withRouterAndSender(
+      {
+        ATTACHMENT_MAX_FILE_BYTES: "5",
+        ATTACHMENT_MAX_TOTAL_BYTES: "6",
+        ATTACHMENT_STORE_MAX_BYTES: "100",
+      },
+      new FakeCodex(),
+      sender,
+      async ({ router, codex }) => {
+        await router.enqueue({
+          messageId: "m_attachment_total",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "process both",
+          attachments: [
+            { kind: "file", key: "first", name: "first.txt" },
+            { kind: "file", key: "second", name: "second.txt" },
+          ],
+        });
+
+        expect(sender.downloads).toHaveLength(2);
+        expect(codex.runs).toHaveLength(0);
+        expect(sender.messages.at(-1)?.text).toContain("per-message limit");
+        for (const filePath of sender.downloadedPaths) {
+          await expect(Bun.file(filePath).exists()).resolves.toBe(false);
+        }
+      },
+    );
   });
 
   test("does not run Codex when the sender cannot download attachments", async () => {
@@ -4251,9 +4327,13 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
       FEISHU_APP_SECRET: "secret",
       CODEX_WORKDIR: tempDir,
       BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+      ATTACHMENT_DOWNLOAD_DIR: path.join(tempDir, "attachments"),
       ALLOWED_USER_IDS: "ou_user",
       ...env,
     });
+    if (sender instanceof AttachmentCollectingSender) {
+      sender.setAttachmentRoot(config.attachmentDownloadDir);
+    }
     router = new MessageRouter(
       config,
       new JsonStateStore(config.bridgeStatePath),
