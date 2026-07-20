@@ -1,0 +1,21 @@
+tests/codex-session-manager.test.ts
+  s_bc0331dd4e9203::t_6ff5175cf9b5e1 690-694
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2f9c16acce370962963cd95d20cec97091e2c068",
+  "prompts": {},
+  "sessions": {
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
