@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import readline from "node:readline";
+import type { Readable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import { isDeepStrictEqual } from "node:util";
 
 import type { BridgeConfig } from "../config/env.js";
@@ -29,6 +30,11 @@ const maxPermissionEntries = 64;
 const maxPermissionPathLength = 4_096;
 const maxPermissionGlobDepth = 128;
 const serverRequestCallbackGraceMs = 25;
+const maxChangedFiles = 200;
+const maxChangedFilePathChars = 4_096;
+const minAppServerJsonLineBytes = 256 * 1_024;
+const maxAppServerJsonLineBytes = 8 * 1_024 * 1_024;
+const truncationMarker = "\n... [truncated]";
 
 export interface CodexRunInput {
   prompt: string;
@@ -444,6 +450,17 @@ interface PendingInteractiveRequest {
   threadId: string;
 }
 
+interface BoundedCommandOutput {
+  text: string;
+  bytes: number;
+  truncated: boolean;
+}
+
+interface CommandOutputBufferState {
+  buffers: Map<string, BoundedCommandOutput>;
+  totalBytes: number;
+}
+
 type JsonRpcServerResponse =
   | { id: string | number | null; result: unknown }
   | { id: string | number | null; error: { code: number; message: string } };
@@ -645,14 +662,16 @@ export class CodexRunner {
 
     let threadId = input.threadId;
     let finalText = "";
-    let stderr = "";
     let requestSeq = 0;
     let activeTurnId: string | undefined;
     let turnCompleted = false;
     let turnError: string | null = null;
     let approvalCancelled = false;
     const summary = createEmptyRunSummary();
-    const commandOutputBuffers = new Map<string, string>();
+    const commandOutputBuffers: CommandOutputBufferState = {
+      buffers: new Map(),
+      totalBytes: 0,
+    };
     let resolveTurn: (() => void) | null = null;
     const pendingRequests = new Map<
       string,
@@ -686,8 +705,14 @@ export class CodexRunner {
       }
     };
 
-    const stdoutReader = readline.createInterface({ input: child.stdout });
-    stdoutReader.on("line", (line) => {
+    const stderrCollector = createBoundedUtf8Collector(
+      child.stderr,
+      this.config.codexStderrMaxBytes,
+    );
+    const stdoutReader = createBoundedLineReader(
+      child.stdout,
+      appServerJsonLineLimit(this.config),
+      (line) => {
       const message = parseJsonLine(line);
       if (!message) {
         return;
@@ -755,13 +780,19 @@ export class CodexRunner {
           resolveTurn?.();
         }
         if (getString(turn, "status") === "failed") {
-          turnError = formatTurnError(turn?.error);
+          turnError = truncateTextChars(
+            formatTurnError(turn?.error),
+            this.config.chatOutputMaxChars,
+          );
         }
       }
       if (message.method === "error") {
         if (message.params?.willRetry !== true) {
-          turnError =
-            getString(asRecord(message.params?.error), "message") ?? "Codex reported an error.";
+          turnError = truncateTextChars(
+            getString(asRecord(message.params?.error), "message") ??
+              "Codex reported an error.",
+            this.config.chatOutputMaxChars,
+          );
         }
         this.logger.warn("Codex emitted an error notification", message);
       }
@@ -769,28 +800,42 @@ export class CodexRunner {
         const item = asRecord(message.params?.item);
         if (getString(item, "type") === "agentMessage") {
           const text = getString(item, "text");
-          if (text?.trim() && getString(item, "phase") !== "commentary") {
-            finalText = text;
+          if (text && /\S/u.test(text) && getString(item, "phase") !== "commentary") {
+            finalText = truncateTextChars(text, this.config.chatOutputMaxChars);
           }
         }
-        recordCompletedItem(summary, item, commandOutputBuffers);
+        recordCompletedItem(
+          summary,
+          item,
+          commandOutputBuffers,
+          this.config.runLogMaxCommands,
+          this.config.runLogMaxBytes,
+        );
       }
       if (message.method === "turn/diff/updated") {
         const diff = getString(message.params, "diff");
         if (diff !== undefined) {
-          summary.diff = diff;
-          summary.diffStat = summarizeUnifiedDiff(diff);
-          addChangedFiles(summary, filesFromUnifiedDiff(diff));
+          const boundedDiff = truncateTextChars(diff, this.config.runDiffMaxChars);
+          summary.diff = boundedDiff;
+          summary.diffStat = summarizeUnifiedDiff(boundedDiff);
+          addChangedFiles(summary, filesFromUnifiedDiff(boundedDiff));
         }
       }
       if (message.method === "item/commandExecution/outputDelta") {
         const itemId = getString(message.params, "itemId");
         const delta = getString(message.params, "delta");
-        if (itemId !== undefined && delta !== undefined) {
-          const outputPreview = truncateOutputPreview(`${commandOutputBuffers.get(itemId) ?? ""}${delta}`);
-          if (outputPreview !== undefined) {
-            commandOutputBuffers.set(itemId, outputPreview);
-          }
+        if (
+          itemId !== undefined &&
+          itemId.length <= maxInteractiveIdentityLength &&
+          delta !== undefined
+        ) {
+          appendCommandOutput(
+            commandOutputBuffers,
+            itemId,
+            delta,
+            this.config.runLogMaxCommands,
+            this.config.runLogMaxBytes,
+          );
         }
       }
       if (message.method === "item/fileChange/patchUpdated") {
@@ -804,18 +849,22 @@ export class CodexRunner {
           this.logger.warn("Codex progress callback failed", error);
         });
       }
-    });
+      },
+      () => {
+        const error = new Error("Codex app-server emitted an oversized JSON line.");
+        turnError = error.message;
+        this.logger.warn("Discarded an oversized Codex app-server JSON line");
+        rejectPendingRequests(error);
+        abortChild();
+      },
+    );
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-
-    const rejectPendingRequests = (error: Error) => {
+    function rejectPendingRequests(error: Error) {
       for (const pending of pendingRequests.values()) {
         pending.reject(error);
       }
       pendingRequests.clear();
-    };
+    }
 
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolve, reject) => {
@@ -900,6 +949,7 @@ export class CodexRunner {
       clearTimeout(forceKillTimer);
     }
     stdoutReader.close();
+    const stderr = stderrCollector.finish().trim();
 
     const cancelled = Boolean(input.signal?.aborted || (approvalCancelled && !finalText.trim()));
     if (!finalText.trim()) {
@@ -907,17 +957,23 @@ export class CodexRunner {
         ? ""
         : exit.code === 0 && turnCompleted && !turnError
           ? "(Codex finished without a final text response.)"
-          : [turnError, stderr.trim()].filter(Boolean).join("\n");
+          : [turnError, stderr].filter(Boolean).join("\n");
     }
+    finalText = truncateTextChars(finalText.trim(), this.config.chatOutputMaxChars);
 
     return {
       threadId,
-      finalText: finalText.trim(),
-      stderr: stderr.trim(),
+      finalText,
+      stderr,
       exitCode: cancelled || (turnCompleted && !turnError) ? 0 : exit.code,
       signal: exit.signal,
       cancelled,
-      summary: finalizeRunSummary(summary),
+      summary: finalizeRunSummary(
+        summary,
+        this.config.runLogMaxCommands,
+        this.config.runLogMaxBytes,
+        this.config.runDiffMaxChars,
+      ),
     };
   }
 
@@ -1224,8 +1280,10 @@ export class CodexRunner {
       stdio: ["pipe", "pipe", "pipe"],
       env: buildCodexChildEnv(),
     });
-    const stdoutReader = readline.createInterface({ input: child.stdout });
-    let stderr = "";
+    const stderrCollector = createBoundedUtf8Collector(
+      child.stderr,
+      this.config.codexStderrMaxBytes,
+    );
     let requestSeq = 0;
     const pendingRequests = new Map<
       string,
@@ -1263,73 +1321,82 @@ export class CodexRunner {
       return promise;
     };
 
-    const rejectPendingRequests = (error: Error) => {
+    function rejectPendingRequests(error: Error) {
       for (const pending of pendingRequests.values()) {
         pending.reject(error);
       }
       pendingRequests.clear();
-    };
+    }
 
-    stdoutReader.on("line", (line) => {
-      const message = parseJsonLine(line);
-      if (!message) {
-        return;
-      }
-      if (isJsonRpcResponse(message)) {
-        const pending = pendingRequests.get(String(message.id));
-        if (!pending) {
+    const stdoutReader = createBoundedLineReader(
+      child.stdout,
+      appServerJsonLineLimit(this.config),
+      (line) => {
+        const message = parseJsonLine(line);
+        if (!message) {
           return;
         }
-        pendingRequests.delete(String(message.id));
-        if (message.error) {
-          pending.reject(new Error(message.error.message ?? "Codex app-server request failed."));
+        if (isJsonRpcResponse(message)) {
+          const pending = pendingRequests.get(String(message.id));
+          if (!pending) {
+            return;
+          }
+          pendingRequests.delete(String(message.id));
+          if (message.error) {
+            pending.reject(
+              new Error(message.error.message ?? "Codex app-server request failed."),
+            );
+            return;
+          }
+          pending.resolve(message.result);
           return;
         }
-        pending.resolve(message.result);
-        return;
-      }
-      if (isJsonRpcRequest(message)) {
-        this.handleAppServerRequest(
-          message,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          pendingInteractiveRequests,
-          undefined,
-          (response) => {
-            try {
-              sendJson(response);
-            } catch (error) {
-              this.logger.warn("Failed to respond to Codex app-server request", error);
-            }
-          },
-          () => undefined,
-        );
-        return;
-      }
-      if (isInvalidJsonRpcRequestEnvelope(message)) {
-        try {
-          sendJson({ id: null, error: { code: -32600, message: "Invalid Request" } });
-        } catch (error) {
-          this.logger.warn("Failed to respond to invalid Codex app-server request", error);
+        if (isJsonRpcRequest(message)) {
+          this.handleAppServerRequest(
+            message,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            pendingInteractiveRequests,
+            undefined,
+            (response) => {
+              try {
+                sendJson(response);
+              } catch (error) {
+                this.logger.warn("Failed to respond to Codex app-server request", error);
+              }
+            },
+            () => undefined,
+          );
+          return;
         }
-        return;
-      }
-      if (isJsonRpcNotification(message) && message.method === "serverRequest/resolved") {
-        abortResolvedInteractiveRequest(message, pendingInteractiveRequests);
-      }
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
+        if (isInvalidJsonRpcRequestEnvelope(message)) {
+          try {
+            sendJson({ id: null, error: { code: -32600, message: "Invalid Request" } });
+          } catch (error) {
+            this.logger.warn("Failed to respond to invalid Codex app-server request", error);
+          }
+          return;
+        }
+        if (isJsonRpcNotification(message) && message.method === "serverRequest/resolved") {
+          abortResolvedInteractiveRequest(message, pendingInteractiveRequests);
+        }
+      },
+      () => {
+        const error = new Error("Codex app-server emitted an oversized JSON line.");
+        this.logger.warn("Discarded an oversized Codex app-server JSON line");
+        rejectPendingRequests(error);
+        abortChild();
+      },
+    );
 
     child.once("error", (error) => {
       rejectPendingRequests(error);
     });
     child.once("close", () => {
-      const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+      const stderr = stderrCollector.finish().trim();
+      const suffix = stderr ? `\n${stderr}` : "";
       rejectPendingRequests(new Error(`Codex app-server exited before responding.${suffix}`));
     });
 
@@ -1376,6 +1443,7 @@ export class CodexRunner {
         clearTimeout(forceKillTimer);
       }
       stdoutReader.close();
+      stderrCollector.finish();
     }
   }
 
@@ -1572,43 +1640,55 @@ function createEmptyRunSummary(): CodexRunSummary {
   };
 }
 
-function finalizeRunSummary(summary: CodexRunSummary): CodexRunSummary {
+function finalizeRunSummary(
+  summary: CodexRunSummary,
+  maxCommands: number,
+  maxLogBytes: number,
+  maxDiffChars: number,
+): CodexRunSummary {
+  const commands: CodexCommandSummary[] = [];
+  for (const command of summary.commands) {
+    appendBoundedCommandSummary(commands, command, maxCommands, maxLogBytes);
+  }
   return {
     ...summary,
-    diff: summary.diff ? truncateLargeText(summary.diff, 60_000) : undefined,
-    changedFiles: [...new Set(summary.changedFiles)].slice(0, 200),
-    commands: summary.commands.slice(-20).map((command) => ({
-      ...command,
-      outputPreview: command.outputPreview
-        ? truncateOutputPreview(command.outputPreview)
-        : undefined,
-    })),
+    diff: summary.diff ? truncateTextChars(summary.diff, maxDiffChars) : undefined,
+    changedFiles: [...new Set(summary.changedFiles)].slice(0, maxChangedFiles),
+    commands,
   };
 }
 
 function recordCompletedItem(
   summary: CodexRunSummary,
   item: Record<string, unknown> | null,
-  commandOutputBuffers: Map<string, string>,
+  commandOutputBuffers: CommandOutputBufferState,
+  maxCommands: number,
+  maxLogBytes: number,
 ): void {
   const itemType = getString(item, "type");
   if (itemType === "commandExecution") {
+    const itemId = getString(item, "id");
+    const bufferedOutput = itemId ? takeCommandOutput(commandOutputBuffers, itemId) : undefined;
     const command = getString(item, "command");
     if (!command) {
       return;
     }
-    const itemId = getString(item, "id");
-    const bufferedOutput = itemId ? commandOutputBuffers.get(itemId) : undefined;
-    summary.commands.push({
-      command,
-      cwd: getString(item, "cwd"),
-      status: getString(item, "status"),
-      exitCode: getNullableNumber(item, "exitCode"),
-      durationMs: getNumber(item, "durationMs"),
-      outputPreview: truncateOutputPreview(
-        getString(item, "aggregatedOutput") ?? bufferedOutput ?? "",
-      ),
-    });
+    appendBoundedCommandSummary(
+      summary.commands,
+      {
+        command,
+        cwd: getString(item, "cwd"),
+        status: getString(item, "status"),
+        exitCode: getNullableNumber(item, "exitCode"),
+        durationMs: getNumber(item, "durationMs"),
+        outputPreview: truncateOutputPreview(
+          getString(item, "aggregatedOutput") ?? bufferedOutput ?? "",
+          maxLogBytes,
+        ),
+      },
+      maxCommands,
+      maxLogBytes,
+    );
     return;
   }
 
@@ -1632,11 +1712,15 @@ function recordFileChanges(summary: CodexRunSummary, changes: unknown[]): void {
 function addChangedFiles(summary: CodexRunSummary, files: string[]): void {
   const seen = new Set(summary.changedFiles);
   for (const file of files) {
-    if (!file || seen.has(file)) {
+    if (summary.changedFiles.length >= maxChangedFiles) {
+      break;
+    }
+    const boundedFile = truncateTextChars(file, maxChangedFilePathChars);
+    if (!boundedFile || seen.has(boundedFile)) {
       continue;
     }
-    seen.add(file);
-    summary.changedFiles.push(file);
+    seen.add(boundedFile);
+    summary.changedFiles.push(boundedFile);
   }
 }
 
@@ -1676,16 +1760,277 @@ function summarizeUnifiedDiff(diff: string): string | undefined {
   return `${fileCount} file(s), +${additions} -${deletions}`;
 }
 
-function truncateOutputPreview(value: string): string | undefined {
+function truncateOutputPreview(value: string, maxBytes: number): string | undefined {
   const normalized = value.trim();
   if (!normalized) {
     return undefined;
   }
-  return truncateLargeText(normalized, 4_000);
+  return truncateUtf8Text(normalized, maxBytes).text;
 }
 
-function truncateLargeText(value: string, maxLength: number): string {
-  return value.length > maxLength ? `${value.slice(0, maxLength - 32)}\n... [truncated]` : value;
+function appendCommandOutput(
+  state: CommandOutputBufferState,
+  itemId: string,
+  delta: string,
+  maxCommands: number,
+  maxBytes: number,
+): void {
+  const existing = state.buffers.get(itemId);
+  if (existing) {
+    state.totalBytes -= existing.bytes;
+    state.buffers.delete(itemId);
+  }
+  const bounded = existing?.truncated
+    ? existing
+    : truncateUtf8Text(`${existing?.text ?? ""}${delta}`, maxBytes);
+  state.buffers.set(itemId, bounded);
+  state.totalBytes += bounded.bytes;
+
+  while (state.buffers.size > maxCommands || state.totalBytes > maxBytes) {
+    const oldestId = state.buffers.keys().next().value as string | undefined;
+    if (oldestId === undefined) {
+      break;
+    }
+    const oldest = state.buffers.get(oldestId);
+    state.buffers.delete(oldestId);
+    state.totalBytes -= oldest?.bytes ?? 0;
+  }
+}
+
+function takeCommandOutput(state: CommandOutputBufferState, itemId: string): string | undefined {
+  const buffered = state.buffers.get(itemId);
+  if (!buffered) {
+    return undefined;
+  }
+  state.buffers.delete(itemId);
+  state.totalBytes -= buffered.bytes;
+  return buffered.text;
+}
+
+function appendBoundedCommandSummary(
+  commands: CodexCommandSummary[],
+  command: CodexCommandSummary,
+  maxCommands: number,
+  maxBytes: number,
+): void {
+  commands.push(fitCommandSummaryToBytes(command, maxBytes));
+  while (commands.length > maxCommands || commandSummariesTextBytes(commands) > maxBytes) {
+    commands.shift();
+  }
+}
+
+function fitCommandSummaryToBytes(
+  command: CodexCommandSummary,
+  maxBytes: number,
+): CodexCommandSummary {
+  let remaining = maxBytes;
+  const takeRequired = (value: string): string => {
+    const bounded = truncateUtf8Text(value, remaining).text;
+    remaining -= Buffer.byteLength(bounded, "utf8");
+    return bounded;
+  };
+  const takeOptional = (value: string | undefined): string | undefined => {
+    if (!value || remaining <= 0) {
+      return undefined;
+    }
+    return takeRequired(value);
+  };
+  const boundedCommand = takeRequired(command.command);
+  const outputPreview = takeOptional(command.outputPreview);
+  const cwd = takeOptional(command.cwd);
+  const status = takeOptional(command.status);
+  return {
+    command: boundedCommand,
+    cwd,
+    status,
+    exitCode: command.exitCode,
+    durationMs: command.durationMs,
+    outputPreview,
+  };
+}
+
+function commandSummariesTextBytes(commands: CodexCommandSummary[]): number {
+  return commands.reduce(
+    (total, command) =>
+      total +
+      [command.command, command.cwd, command.status, command.outputPreview].reduce(
+        (bytes, value) => bytes + (value ? Buffer.byteLength(value, "utf8") : 0),
+        0,
+      ),
+    0,
+  );
+}
+
+function truncateUtf8Text(value: string, maxBytes: number): BoundedCommandOutput {
+  const bytes = Buffer.byteLength(value, "utf8");
+  if (bytes <= maxBytes) {
+    return { text: value, bytes, truncated: false };
+  }
+  const marker = byteTruncationMarker(maxBytes);
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const contentBudget = Math.max(0, maxBytes - markerBytes);
+  let contentBytes = 0;
+  let endIndex = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (contentBytes + characterBytes > contentBudget) {
+      break;
+    }
+    contentBytes += characterBytes;
+    endIndex += character.length;
+  }
+  const text = `${value.slice(0, endIndex)}${marker}`;
+  return {
+    text,
+    bytes: Buffer.byteLength(text, "utf8"),
+    truncated: true,
+  };
+}
+
+function truncateTextChars(value: string, maxChars: number): string {
+  let count = 0;
+  for (const _character of value) {
+    count += 1;
+    if (count > maxChars) {
+      break;
+    }
+  }
+  if (count <= maxChars) {
+    return value;
+  }
+
+  const marker = charTruncationMarker(maxChars);
+  const contentBudget = Math.max(0, maxChars - [...marker].length);
+  let contentChars = 0;
+  let endIndex = 0;
+  for (const character of value) {
+    if (contentChars >= contentBudget) {
+      break;
+    }
+    contentChars += 1;
+    endIndex += character.length;
+  }
+  return `${value.slice(0, endIndex)}${marker}`;
+}
+
+function byteTruncationMarker(maxBytes: number): string {
+  const fullMarkerBytes = Buffer.byteLength(truncationMarker, "utf8");
+  if (maxBytes >= fullMarkerBytes) {
+    return truncationMarker;
+  }
+  return maxBytes >= 3 ? "..." : ".".repeat(maxBytes);
+}
+
+function charTruncationMarker(maxChars: number): string {
+  if (maxChars >= [...truncationMarker].length) {
+    return truncationMarker;
+  }
+  return maxChars >= 3 ? "..." : ".".repeat(maxChars);
+}
+
+function createBoundedUtf8Collector(stream: Readable, maxBytes: number) {
+  const decoder = new StringDecoder("utf8");
+  let text = "";
+  let truncated = false;
+  let finished = false;
+
+  const append = (value: string) => {
+    if (!value || truncated) {
+      return;
+    }
+    const bounded = truncateUtf8Text(`${text}${value}`, maxBytes);
+    text = bounded.text;
+    truncated = bounded.truncated;
+  };
+  const onData = (chunk: Buffer | string) => {
+    if (truncated) {
+      return;
+    }
+    append(typeof chunk === "string" ? chunk : decoder.write(chunk));
+  };
+  const finish = () => {
+    if (!finished) {
+      finished = true;
+      stream.off("data", onData);
+      append(decoder.end());
+    }
+    return text;
+  };
+  stream.on("data", onData);
+  stream.once("end", finish);
+  return { finish };
+}
+
+function appServerJsonLineLimit(config: BridgeConfig): number {
+  // JSON string escaping can expand one input character to six ASCII bytes (for example \u0000).
+  const charBudget = Math.max(config.chatOutputMaxChars, config.runDiffMaxChars) * 6;
+  const desired = Math.max(config.runLogMaxBytes, charBudget) + 64 * 1_024;
+  return Math.max(
+    minAppServerJsonLineBytes,
+    Math.min(maxAppServerJsonLineBytes, desired),
+  );
+}
+
+function createBoundedLineReader(
+  stream: Readable,
+  maxLineBytes: number,
+  onLine: (line: string) => void,
+  onOversizedLine: () => void,
+) {
+  const lineBuffer = Buffer.allocUnsafe(maxLineBytes);
+  let lineLength = 0;
+  let discarding = false;
+  let closed = false;
+
+  const finishLine = () => {
+    if (!discarding) {
+      const contentLength =
+        lineLength > 0 && lineBuffer[lineLength - 1] === 0x0d ? lineLength - 1 : lineLength;
+      onLine(lineBuffer.toString("utf8", 0, contentLength));
+    }
+    lineLength = 0;
+    discarding = false;
+  };
+  const onData = (value: Buffer | string) => {
+    const chunk = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newlineIndex = chunk.indexOf(0x0a, offset);
+      const segmentEnd = newlineIndex === -1 ? chunk.length : newlineIndex;
+      const segmentLength = segmentEnd - offset;
+      if (!discarding && segmentLength > 0) {
+        if (lineLength + segmentLength > maxLineBytes) {
+          lineLength = 0;
+          discarding = true;
+          onOversizedLine();
+        } else {
+          chunk.copy(lineBuffer, lineLength, offset, segmentEnd);
+          lineLength += segmentLength;
+        }
+      }
+      if (newlineIndex === -1) {
+        break;
+      }
+      finishLine();
+      offset = newlineIndex + 1;
+    }
+  };
+  const onEnd = () => {
+    if (lineLength > 0 || discarding) {
+      finishLine();
+    }
+  };
+  const close = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    stream.off("data", onData);
+    stream.off("end", onEnd);
+  };
+  stream.on("data", onData);
+  stream.on("end", onEnd);
+  return { close };
 }
 
 function getItemName(item: CodexJsonEvent["item"]): string | undefined {

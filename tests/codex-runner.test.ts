@@ -2833,6 +2833,186 @@ process.on("SIGTERM", () => process.exit(0));
     }
   });
 
+  test("applies configured stderr, final text, command count, and diff limits during a run", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  process.stderr.write("错误🙂".repeat(80));
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  for (let index = 1; index <= 4; index += 1) {
+    send({ method: "item/commandExecution/outputDelta", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "cmd_" + index, delta: "ok-" + index } });
+    send({ method: "item/completed", params: { threadId: "thread_fake", turnId: "turn_fake", item: { type: "commandExecution", id: "cmd_" + index, command: "command-" + index, cwd: "/tmp/repo", status: "completed", exitCode: 0, durationMs: index } } });
+  }
+  send({ method: "turn/diff/updated", params: { threadId: "thread_fake", turnId: "turn_fake", diff: "diff --git a/src/a.ts b/src/a.ts\\n+++ b/src/a.ts\\n@@\\n+" + "变更🙂".repeat(80) } });
+  send({ method: "item/completed", params: { threadId: "thread_fake", turnId: "turn_fake", item: { type: "agentMessage", id: "msg_1", text: "最终回复🙂".repeat(80), phase: "final_answer", memoryCitation: null } } });
+  completeTurn("");
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+        CODEX_STDERR_MAX_BYTES: "48",
+        CHAT_OUTPUT_MAX_CHARS: "36",
+        RUN_LOG_MAX_COMMANDS: "2",
+        RUN_LOG_MAX_BYTES: "128",
+        RUN_DIFF_MAX_CHARS: "64",
+      });
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise output limits",
+        cwd: tempDir,
+      });
+
+      expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(48);
+      expect(result.stderr).toContain("[truncated]");
+      expect(result.stderr).not.toContain("�");
+      expect([...result.finalText]).toHaveLength(36);
+      expect(result.finalText).toContain("[truncated]");
+      expect(result.finalText).not.toContain("�");
+      expect(result.summary?.commands.map((command) => command.command)).toEqual([
+        "command-3",
+        "command-4",
+      ]);
+      expect([...(result.summary?.diff ?? "")]).toHaveLength(64);
+      expect(result.summary?.diff).toContain("[truncated]");
+      expect(result.summary?.diff).not.toContain("�");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds command output buffers and summaries by configured UTF-8 bytes", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({ method: "item/commandExecution/outputDelta", params: { threadId: "thread_fake", turnId: "turn_fake", itemId: "cmd_big", delta: "日志🙂".repeat(100) } });
+  send({ method: "item/completed", params: { threadId: "thread_fake", turnId: "turn_fake", item: { type: "commandExecution", id: "cmd_big", command: "cmd", exitCode: 0 } } });
+  completeTurn("done");
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+        RUN_LOG_MAX_COMMANDS: "5",
+        RUN_LOG_MAX_BYTES: "48",
+      });
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise command log limits",
+        cwd: tempDir,
+      });
+      const command = result.summary?.commands[0];
+      const commandTextBytes = [
+        command?.command,
+        command?.cwd,
+        command?.status,
+        command?.outputPreview,
+      ].reduce((total, value) => total + Buffer.byteLength(value ?? "", "utf8"), 0);
+
+      expect(commandTextBytes).toBeLessThanOrEqual(48);
+      expect(command?.outputPreview).toContain("[truncated]");
+      expect(command?.outputPreview).not.toContain("�");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails oversized app-server JSON lines instead of leaving requests pending", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  process.stdout.write("x".repeat(300000) + "\\n");
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+        CHAT_OUTPUT_MAX_CHARS: "32",
+        RUN_LOG_MAX_BYTES: "32",
+        RUN_DIFF_MAX_CHARS: "32",
+      });
+      await expect(
+        new CodexRunner(config, new ConsoleLogger("error")).listThreads(),
+      ).rejects.toThrow("oversized JSON line");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds stderr for short-lived app-server requests", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  process.stderr.write("短请求错误🙂".repeat(100));
+  process.exit(1);
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+        CODEX_STDERR_MAX_BYTES: "40",
+      });
+      let errorMessage = "";
+      try {
+        await new CodexRunner(config, new ConsoleLogger("error")).listThreads();
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
+      const stderrSuffix = errorMessage.split("\n").slice(1).join("\n");
+
+      expect(errorMessage).toContain("[truncated]");
+      expect(Buffer.byteLength(stderrSuffix, "utf8")).toBeLessThanOrEqual(40);
+      expect(stderrSuffix).not.toContain("�");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("retries app-server steering while the active turn is still settling", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
     const fakeCodex = path.join(tempDir, "fake-codex.cjs");
