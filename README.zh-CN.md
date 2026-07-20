@@ -290,8 +290,7 @@ bun run check
 
 本地开发和 pull request 流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。在共享 chat 中运行 Chat2Codex 或报告安全问题前，请先阅读 [SECURITY.md](SECURITY.md)。
 
-## 版本路线
+## 后续功能
 
-1. **v0.5（当前 Unreleased 开发）：**规划中的交互与生产安全收口范围已实现：`requestUserInput`、标准 MCP form/URL elicitation、额外权限审批、durable job/outbox 投递、按 chat/thread 复用 app-server session、session/并发池上限、子进程优雅退出、附件配额与过期清理、输出上限、状态留存和日志轮转。这不表示 v0.5 已经发布。
-2. **v0.6：**通过 `thread/fork.lastTurnId` 从指定历史 turn 分叉，并保持原 thread 不变。这个操作不是文件系统回滚，也不会恢复本地文件变更。
-3. 后续再在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。
+1. 通过 `thread/fork.lastTurnId` 从指定历史 turn 分叉，并保持原 thread 不变。这个操作不是文件系统回滚，也不会恢复本地文件变更。
+2. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。

@@ -7,6 +7,8 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.5.0 - 2026-07-20
+
 ### Added
 
 - `/plan <task>` now runs one turn with the app-server Plan collaboration mode,

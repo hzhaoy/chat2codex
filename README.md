@@ -470,17 +470,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local development and pull request
 guidance. See [SECURITY.md](SECURITY.md) before running Chat2Codex in a shared
 chat or reporting a security issue.
 
-## Version Roadmap
+## Next Features To Add
 
-1. **v0.5 (current Unreleased development):** the planned interaction and
-   production-hardening scope is implemented: `requestUserInput`, standard MCP
-   form/URL elicitation, additional-permission approval, durable job/outbox
-   delivery, chat/thread app-server session reuse, bounded session/concurrency
-   pools, graceful child-process shutdown, attachment quotas and expiry, output
-   limits, state retention, and log rotation. This does not indicate a published
-   v0.5 release.
-2. **v0.6:** fork from a selected historical turn with
+1. Fork from a selected historical turn with
    `thread/fork.lastTurnId`, leaving the source thread unchanged. This is not a
    filesystem rollback and does not restore local file changes.
-3. Later: introduce a chat-adapter boundary before adding Slack, Discord, or
+2. Introduce a chat-adapter boundary before adding Slack, Discord, or
    other platforms.
