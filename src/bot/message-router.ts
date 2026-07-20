@@ -9,6 +9,7 @@ import {
   type CodexApprovalDecision,
   type CodexApprovalRequest,
   type CodexCommandSummary,
+  type CodexCollaborationMode,
   type CodexForkThreadInput,
   type CodexMcpElicitationField,
   type CodexMcpElicitationRequest,
@@ -41,6 +42,7 @@ import { BridgeConfig } from "../config/env.js";
 import { JsonStateStore } from "../state/store.js";
 import {
   BridgeState,
+  createSessionEpoch,
   type DurableCodexJob,
   type DurableCodexJobStatus,
   type DurableOutboxMessage,
@@ -202,6 +204,8 @@ export interface StatusCardHandle {
 
 export interface CodexClient {
   run(input: CodexRunInput): Promise<CodexRunResult>;
+  invalidateChatSession?(chatId: string, reason?: string): Promise<void>;
+  dispose?(): Promise<void>;
   listThreads?(input?: CodexThreadListInput): Promise<CodexThreadListResult>;
   readThread?(threadId: string): Promise<CodexThread | null>;
   searchThreads?(input: CodexThreadSearchInput): Promise<CodexThreadSearchResult>;
@@ -212,7 +216,9 @@ export interface CodexClient {
 }
 
 interface PendingApproval {
+  key: string;
   chatId: string;
+  originSender: SenderIdentity;
   request: CodexApprovalRequest;
   resolve: (decision: CodexApprovalDecision) => void;
   handle: StatusCardHandle | null;
@@ -246,6 +252,8 @@ interface QueuedRunState {
   controller: AbortController;
   cwd: string;
   prompt: string;
+  collaborationMode: CodexCollaborationMode;
+  sessionEpoch: string;
   messageId?: string;
   threadId?: string;
   chatType?: ChatType;
@@ -330,11 +338,16 @@ export class MessageRouter {
   private readonly activeUserInputs = new Map<string, PendingUserInput>();
   private readonly activePermissionApprovals = new Map<string, PendingPermissionApproval>();
   private readonly activeMcpElicitations = new Map<string, PendingMcpElicitation>();
-  private readonly statusCardRuns = new Map<string, { chatId: string; prompt: string }>();
+  private readonly statusCardRuns = new Map<
+    string,
+    { chatId: string; prompt: string; collaborationMode: CodexCollaborationMode }
+  >();
   private readonly globalRunWaiters: GlobalRunWaiter[] = [];
+  private readonly activeCodexRunTasks = new Set<Promise<CodexRunResult>>();
   private activeGlobalRuns = 0;
   private readonly codex: CodexClient;
   private disposed = false;
+  private disposePromise: Promise<void> | null = null;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -346,19 +359,83 @@ export class MessageRouter {
     this.codex = codex ?? new CodexRunner(config, logger);
   }
 
-  dispose(): void {
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
     this.disposed = true;
     for (const timer of this.outboxRetryTimers.values()) {
       clearTimeout(timer);
     }
     this.outboxRetryTimers.clear();
+    for (const pending of this.pendingRunSteers.values()) {
+      clearTimeout(pending.timeoutTimer);
+    }
+    this.pendingRunSteers.clear();
+    for (const queuedRun of this.queuedRuns.values()) {
+      queuedRun.controller.abort();
+    }
+    this.queuedRuns.clear();
+    for (const run of this.activeRuns.values()) {
+      if (run.timeoutTimer) {
+        clearTimeout(run.timeoutTimer);
+      }
+      run.controller.abort();
+    }
     for (const waiter of this.globalRunWaiters.splice(0)) {
       waiter.signal.removeEventListener("abort", waiter.abortListener);
       waiter.resolve(null);
     }
+    this.disposePromise = (async () => {
+      const errors: unknown[] = [];
+      if (this.state) {
+        const now = new Date().toISOString();
+        try {
+          await this.mutateState((state) => {
+            for (const job of Object.values(state.jobs)) {
+              if (job.status !== "running") {
+                continue;
+              }
+              interruptDurableJob(state, job, now, "bridge_shutdown");
+              markMessageProcessed(state, job.messageId);
+            }
+          });
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      try {
+        await this.codex.dispose?.();
+      } catch (error) {
+        errors.push(error);
+      }
+      const taskResults = await Promise.allSettled([
+        ...this.activeCodexRunTasks,
+        ...this.messageTasks.values(),
+        ...this.queues.values(),
+        ...this.outboxTasks.values(),
+        this.attachmentTaskTail,
+      ]);
+      for (const result of taskResults) {
+        if (result.status === "rejected") {
+          this.logger.warn("Router task failed during bridge shutdown", result.reason);
+        }
+      }
+      await this.stateMutationTail;
+      if (errors.length === 1) {
+        throw errors[0];
+      }
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "Failed to dispose Chat2Codex cleanly");
+      }
+    })();
+    return this.disposePromise;
   }
 
   async start(): Promise<void> {
+    if (this.disposed) {
+      throw new Error("Cannot start a disposed MessageRouter.");
+    }
     this.state = await this.store.load();
     await this.recoverDurableState();
     for (const jobId of new Set(
@@ -380,6 +457,9 @@ export class MessageRouter {
   }
 
   async accept(message: IncomingTextMessage): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     if (this.requireState().processedMessageIds.includes(message.messageId)) {
       return;
     }
@@ -450,6 +530,7 @@ export class MessageRouter {
           markMessageProcessed(state, message.messageId);
           return "rejected" as const;
         }
+        const turn = parseCodexTurnRequest(routedText(message));
         state.jobs[message.messageId] = {
           id: message.messageId,
           kind: "codex_run",
@@ -457,7 +538,8 @@ export class MessageRouter {
           chatId: message.chatId,
           chatType: message.chatType,
           cwd: session.cwd,
-          prompt: routedText(message),
+          prompt: turn.prompt,
+          collaborationMode: turn.collaborationMode,
           threadId: session.threadId,
           status: "queued",
           createdAt: now,
@@ -539,7 +621,9 @@ export class MessageRouter {
     outcome: EventDiagnosticOutcome,
     diagnostic: IncomingEventDiagnostic,
   ): Promise<void> {
-    const state = this.requireState();
+    if (this.disposed) {
+      return;
+    }
     const snapshot: EventDiagnosticSnapshot = {
       at: new Date().toISOString(),
       outcome,
@@ -554,17 +638,21 @@ export class MessageRouter {
       textLength: diagnostic.textLength,
       botIdentityResolved: diagnostic.botIdentityResolved,
     };
-    const diagnostics = diagnostic.chatId
-      ? ensureChatDiagnostics(state, diagnostic.chatId)
-      : state.diagnostics;
-    diagnostics.lastEvent = snapshot;
-    if (outcome === "dropped") {
-      diagnostics.lastDroppedEvent = snapshot;
-    }
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const diagnostics = diagnostic.chatId
+        ? ensureChatDiagnostics(state, diagnostic.chatId)
+        : state.diagnostics;
+      diagnostics.lastEvent = snapshot;
+      if (outcome === "dropped") {
+        diagnostics.lastDroppedEvent = snapshot;
+      }
+    });
   }
 
   enqueue(message: IncomingTextMessage): Promise<void> {
+    if (this.disposed) {
+      return Promise.resolve();
+    }
     if (!message.attachments?.length && isStopCommand(message)) {
       return this.handleImmediateStop(message);
     }
@@ -607,6 +695,9 @@ export class MessageRouter {
   }
 
   async handleCardAction(action: IncomingCardAction): Promise<CardActionResponse | undefined> {
+    if (this.disposed) {
+      return cardActionToast("warning", "Chat2Codex 正在关闭，这个卡片操作已忽略。");
+    }
     const access = decideAccess(this.config.access, {
       chatId: action.chatId,
       chatType: this.chatTypeForAction(action.chatId),
@@ -658,10 +749,18 @@ export class MessageRouter {
       return this.handleSessionPageCardAction(action);
     }
     if (action.action === selectProjectCardAction) {
-      return this.handleSelectProjectCardAction(action);
+      return this.enqueueSessionCardAction(
+        action.chatId,
+        "当前 chat 有任务排队或运行中，完成或停止后再切换项目。",
+        () => this.handleSelectProjectCardAction(action),
+      );
     }
     if (action.action === resumeThreadCardAction) {
-      return this.handleResumeThreadCardAction(action);
+      return this.enqueueSessionCardAction(
+        action.chatId,
+        "当前 chat 有任务排队或运行中，完成或停止后再切换会话。",
+        () => this.handleResumeThreadCardAction(action),
+      );
     }
 
     return cardActionToast("warning", "这个卡片操作已被忽略。");
@@ -676,6 +775,9 @@ export class MessageRouter {
       })
       .then(async () => {
         this.decrementQueueDepth(chatId);
+        if (this.disposed) {
+          return;
+        }
         await task();
       })
       .finally(() => {
@@ -686,6 +788,25 @@ export class MessageRouter {
 
     this.queues.set(chatId, next);
     return next;
+  }
+
+  private async enqueueSessionCardAction<T>(
+    chatId: string,
+    busyMessage: string,
+    task: () => Promise<T>,
+  ): Promise<T | CardActionResponse> {
+    if (
+      this.queues.has(chatId) ||
+      this.queuedRuns.has(chatId) ||
+      this.activeRuns.has(chatId)
+    ) {
+      return cardActionToast("warning", busyMessage);
+    }
+    let result!: T;
+    await this.enqueueTask(chatId, async () => {
+      result = await task();
+    });
+    return result;
   }
 
   private processMessage(
@@ -722,6 +843,9 @@ export class MessageRouter {
     }
 
     await action();
+    if (this.disposed) {
+      return;
+    }
     await this.mutateState((currentState) => {
       const job = currentState.jobs[message.messageId];
       if (job?.status === "queued") {
@@ -821,6 +945,10 @@ export class MessageRouter {
       await this.compactThread(message.chatId, message.chatType);
       return;
     }
+    if (!hasAttachments && text === "/plan") {
+      await this.sender.sendText(message.chatId, "用法：/plan <任务>（以 Plan 模式执行这一轮）");
+      return;
+    }
     if (!hasAttachments && (text === "/new" || text === "/reset")) {
       await this.resetSession(message.chatId);
       return;
@@ -830,7 +958,8 @@ export class MessageRouter {
       return;
     }
 
-    const prompt = await this.buildCodexPrompt(message, text);
+    const turn = parseCodexTurnRequest(text);
+    const prompt = await this.buildCodexPrompt(message, turn.prompt);
     if (!prompt) {
       return;
     }
@@ -841,6 +970,7 @@ export class MessageRouter {
       message.chatType,
       message.messageId,
       message.sender,
+      turn.collaborationMode,
     );
   }
 
@@ -873,6 +1003,7 @@ export class MessageRouter {
     chatType?: ChatType,
     messageId?: string,
     originSender?: SenderIdentity,
+    collaborationMode: CodexCollaborationMode = "default",
   ): Promise<void> {
     const state = this.requireState();
     const session = this.ensureSession(chatId, state, chatType);
@@ -898,6 +1029,7 @@ export class MessageRouter {
         }
         job.cwd = currentSession.cwd;
         job.prompt = prompt;
+        job.collaborationMode = collaborationMode;
         job.threadId = currentSession.threadId;
         job.updatedAt = now;
         currentState.jobs[messageId] = job;
@@ -913,6 +1045,8 @@ export class MessageRouter {
       controller: new AbortController(),
       cwd: session.cwd,
       prompt,
+      collaborationMode,
+      sessionEpoch: session.sessionEpoch,
       messageId,
       threadId: session.threadId,
       chatType: session.chatType ?? chatType,
@@ -962,7 +1096,11 @@ export class MessageRouter {
   ): Promise<void> {
     const state = this.requireState();
     const session = this.ensureSession(chatId, state, queuedRun.chatType);
-    if (session.cwd !== queuedRun.cwd || session.threadId !== queuedRun.threadId) {
+    if (
+      session.cwd !== queuedRun.cwd ||
+      session.threadId !== queuedRun.threadId ||
+      session.sessionEpoch !== queuedRun.sessionEpoch
+    ) {
       await this.sender.sendText(
         chatId,
         "任务排队期间项目或会话已变化；为避免在错误工作区执行，这次任务已取消。",
@@ -1007,7 +1145,7 @@ export class MessageRouter {
       startedAt,
       updatedAt: startedAt,
     });
-    this.rememberStatusCardRun(statusCard, chatId, prompt);
+    this.rememberStatusCardRun(statusCard, chatId, prompt, queuedRun.collaborationMode);
 
     const controller = queuedRun.controller;
     if (controller.signal.aborted) {
@@ -1066,15 +1204,53 @@ export class MessageRouter {
     );
     this.activeRuns.set(chatId, runState);
     try {
-      const result = await this.codex.run({
+      const codexRunTask = this.codex.run({
         prompt,
         cwd: session.cwd,
         threadId: session.threadId,
+        collaborationMode: queuedRun.collaborationMode,
+        sessionScope:
+          queuedRun.originSender && hasStableSenderIdentity(queuedRun.originSender)
+            ? {
+                chatId,
+                sessionEpoch: queuedRun.sessionEpoch,
+                principal: { ...queuedRun.originSender },
+              }
+            : undefined,
+        onThreadBound: async (threadId) => {
+          if (this.disposed) {
+            throw new Error("Chat2Codex is shutting down; refusing to bind a Codex thread.");
+          }
+          await this.mutateState((currentState) => {
+            const currentSession = this.ensureSession(chatId, currentState, queuedRun.chatType);
+            if (
+              currentSession.cwd !== queuedRun.cwd ||
+              currentSession.threadId !== queuedRun.threadId ||
+              currentSession.sessionEpoch !== queuedRun.sessionEpoch
+            ) {
+              throw new Error("The chat session changed before the Codex thread could be bound.");
+            }
+            const now = new Date().toISOString();
+            currentSession.threadId = threadId;
+            currentSession.updatedAt = now;
+            if (queuedRun.messageId) {
+              const job = currentState.jobs[queuedRun.messageId];
+              if (!job || isTerminalJobStatus(job.status)) {
+                throw new Error("The durable Codex job ended before its thread could be bound.");
+              }
+              job.threadId = threadId;
+              job.updatedAt = now;
+            }
+          });
+          queuedRun.threadId = threadId;
+          runState.threadId = threadId;
+        },
         signal: controller.signal,
         onProgress: reportProgress,
         onApprovalRequest: (request) =>
           this.requestApproval(
             chatId,
+            queuedRun.originSender,
             request,
             controller.signal,
             statusCard,
@@ -1111,8 +1287,18 @@ export class MessageRouter {
           void this.flushPendingSteers(chatId, runState);
         },
       });
+      this.activeCodexRunTasks.add(codexRunTask);
+      let result: CodexRunResult;
+      try {
+        result = await codexRunTask;
+      } finally {
+        this.activeCodexRunTasks.delete(codexRunTask);
+      }
 
       if (result.cancelled || controller.signal.aborted) {
+        if (this.disposed) {
+          return;
+        }
         if (runState.timedOut) {
           await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt, queuedRun.messageId);
           return;
@@ -1241,6 +1427,9 @@ export class MessageRouter {
       }
     } catch (error) {
       if (controller.signal.aborted) {
+        if (this.disposed) {
+          return;
+        }
         if (runState.timedOut) {
           await this.reportRunTimeout(chatId, statusCard, session.cwd, prompt, session.threadId, startedAt, queuedRun.messageId);
           return;
@@ -1284,8 +1473,14 @@ export class MessageRouter {
           this.directoryAllowedForChat(candidate, session.chatType)
         ) {
           fallbackCwd = candidate;
-          session.cwd = candidate;
-          delete session.threadId;
+          await this.mutateState((currentState) => {
+            const currentSession = this.ensureSession(chatId, currentState, queuedRun.chatType);
+            currentSession.cwd = candidate;
+            delete currentSession.threadId;
+            currentSession.sessionEpoch = createSessionEpoch();
+            currentSession.updatedAt = new Date().toISOString();
+          });
+          await this.invalidateCodexSession(chatId, "cwd_missing_fallback");
         }
       }
       let failure = formatCodexStartupFailure(
@@ -1304,9 +1499,13 @@ export class MessageRouter {
         ].join("\n");
       }
       if (!cwdMissing && failedThreadId && isThreadResumeReadFailure(error)) {
-        delete session.threadId;
-        session.updatedAt = new Date().toISOString();
-        await this.store.save(state);
+        await this.mutateState((currentState) => {
+          const currentSession = this.ensureSession(chatId, currentState, queuedRun.chatType);
+          delete currentSession.threadId;
+          currentSession.sessionEpoch = createSessionEpoch();
+          currentSession.updatedAt = new Date().toISOString();
+        });
+        await this.invalidateCodexSession(chatId, "thread_resume_failed");
         await this.recordRecentFailure(chatId, {
           category: "thread_unavailable",
           cwd: failedCwd,
@@ -1385,7 +1584,9 @@ export class MessageRouter {
       await this.cancelPermissionApprovalsForChat(chatId);
       await this.cancelMcpElicitationsForChat(chatId);
       if (this.activeRuns.get(chatId) === runState) {
-        await this.reportUnsentPendingSteers(chatId, runState);
+        if (!this.disposed) {
+          await this.reportUnsentPendingSteers(chatId, runState);
+        }
         this.activeRuns.delete(chatId);
       }
     }
@@ -2288,8 +2489,10 @@ export class MessageRouter {
       this.directoryAllowedForChat(project.cwd, chatType),
     );
     session.lastProjects = projects;
-    session.updatedAt = new Date().toISOString();
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const currentSession = this.ensureSession(chatId, currentState, chatType);
+      currentSession.updatedAt = new Date().toISOString();
+    });
 
     if (!projects.length) {
       await this.sender.sendText(
@@ -2366,7 +2569,7 @@ export class MessageRouter {
       return;
     }
 
-    await this.applyProjectSelection(chatId, state, current, cwd);
+    await this.applyProjectSelection(chatId, cwd);
     await this.sendMarkdown(
       chatId,
       ["**已进入项目**", `\`${cwd}\``, "", "发送 `/sessions` 查看会话，或 `/new` 新建对话。"].join(
@@ -2402,8 +2605,10 @@ export class MessageRouter {
 
     const threads = result.threads.filter((thread) => thread.cwd === session.cwd);
     session.lastThreads = threads.map((thread) => toThreadSelection(thread));
-    session.updatedAt = new Date().toISOString();
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const currentSession = this.ensureSession(chatId, currentState, chatType);
+      currentSession.updatedAt = new Date().toISOString();
+    });
 
     if (!threads.length) {
       await this.sender.sendText(
@@ -2627,7 +2832,7 @@ export class MessageRouter {
       return;
     }
 
-    await this.applyThreadSelection(chatId, state, current, selection);
+    await this.applyThreadSelection(chatId, selection);
     await this.sendMarkdown(
       chatId,
       [
@@ -2665,6 +2870,7 @@ export class MessageRouter {
       return;
     }
 
+    await this.rotateSessionEpoch(chatId, "thread_fork");
     let forked: CodexThread;
     try {
       forked = await this.codex.forkThread({
@@ -2682,7 +2888,7 @@ export class MessageRouter {
     }
 
     const forkSelection = toThreadSelection(forked);
-    await this.applyThreadSelection(chatId, state, current, forkSelection);
+    await this.applyThreadSelection(chatId, forkSelection);
     await this.sendMarkdown(
       chatId,
       [
@@ -2717,6 +2923,7 @@ export class MessageRouter {
       return;
     }
 
+    await this.rotateSessionEpoch(chatId, "thread_compact");
     try {
       await this.codex.compactThread(session.threadId);
     } catch (error) {
@@ -2724,8 +2931,10 @@ export class MessageRouter {
       return;
     }
 
-    session.updatedAt = new Date().toISOString();
-    await this.store.save(state);
+    await this.mutateState((currentState) => {
+      const currentSession = this.ensureSession(chatId, currentState, chatType);
+      currentSession.updatedAt = new Date().toISOString();
+    });
     await this.sendMarkdown(
       chatId,
       [
@@ -2789,36 +2998,40 @@ export class MessageRouter {
 
   private async applyProjectSelection(
     chatId: string,
-    state: BridgeState,
-    current: { chatType?: ChatType; lastProjects?: ProjectSelection[] },
     cwd: string,
   ): Promise<void> {
-    state.chats[chatId] = {
-      cwd,
-      chatType: current.chatType,
-      updatedAt: new Date().toISOString(),
-      lastProjects: current.lastProjects,
-      lastTurns: undefined,
-    };
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const current = this.ensureSession(chatId, state);
+      state.chats[chatId] = {
+        cwd,
+        sessionEpoch: createSessionEpoch(),
+        chatType: current.chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current.lastProjects,
+        lastTurns: undefined,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "project_changed");
   }
 
   private async applyThreadSelection(
     chatId: string,
-    state: BridgeState,
-    current: { chatType?: ChatType; lastProjects?: ProjectSelection[]; lastThreads?: ThreadSelection[] },
     selection: ThreadSelection,
   ): Promise<void> {
-    state.chats[chatId] = {
-      cwd: selection.cwd,
-      threadId: selection.threadId,
-      chatType: current.chatType,
-      updatedAt: new Date().toISOString(),
-      lastProjects: current.lastProjects,
-      lastThreads: current.lastThreads,
-      lastTurns: undefined,
-    };
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const current = this.ensureSession(chatId, state);
+      state.chats[chatId] = {
+        cwd: selection.cwd,
+        threadId: selection.threadId,
+        sessionEpoch: createSessionEpoch(),
+        chatType: current.chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current.lastProjects,
+        lastThreads: current.lastThreads,
+        lastTurns: undefined,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "thread_changed");
   }
 
   private async handleUserInputCardAction(
@@ -3756,6 +3969,7 @@ export class MessageRouter {
         this.chatTypeForAction(action.chatId),
         undefined,
         action.sender,
+        run.collaborationMode,
       ),
     ).catch(
       (error) => {
@@ -3819,13 +4033,6 @@ export class MessageRouter {
   private async handleSelectProjectCardAction(
     action: IncomingCardAction,
   ): Promise<CardActionResponse | undefined> {
-    if (
-      this.queues.has(action.chatId) ||
-      this.queuedRuns.has(action.chatId) ||
-      this.activeRuns.has(action.chatId)
-    ) {
-      return cardActionToast("warning", "当前 chat 有任务排队或运行中，完成或停止后再切换项目。");
-    }
     const index = action.projectIndex;
     if (!index || index < 1) {
       return cardActionToast("warning", "无法进入项目：缺少项目编号。");
@@ -3840,7 +4047,7 @@ export class MessageRouter {
       return cardActionToast("error", this.formatDirectoryDenied(selected.cwd));
     }
 
-    await this.applyProjectSelection(action.chatId, state, session, selected.cwd);
+    await this.applyProjectSelection(action.chatId, selected.cwd);
     const card = buildProjectListCard({
       currentCwd: selected.cwd,
       projects: session.lastProjects ?? [],
@@ -3858,13 +4065,6 @@ export class MessageRouter {
   private async handleResumeThreadCardAction(
     action: IncomingCardAction,
   ): Promise<CardActionResponse | undefined> {
-    if (
-      this.queues.has(action.chatId) ||
-      this.queuedRuns.has(action.chatId) ||
-      this.activeRuns.has(action.chatId)
-    ) {
-      return cardActionToast("warning", "当前 chat 有任务排队或运行中，完成或停止后再切换会话。");
-    }
     const index = action.threadIndex;
     if (!index || index < 1) {
       return cardActionToast("warning", "无法继续会话：缺少会话编号。");
@@ -3882,7 +4082,7 @@ export class MessageRouter {
       return cardActionToast("error", this.formatDirectoryDenied(selected.cwd));
     }
 
-    await this.applyThreadSelection(action.chatId, state, session, selected);
+    await this.applyThreadSelection(action.chatId, selected);
     const card = buildSessionListCard({
       cwd: selected.cwd,
       currentThreadId: selected.threadId,
@@ -3911,9 +4111,21 @@ export class MessageRouter {
     if (!action.approvalId) {
       return cardActionToast("warning", "无法处理审批：缺少审批上下文。");
     }
-    const pending = this.activeApprovals.get(action.approvalId);
-    if (!pending || pending.chatId !== action.chatId) {
+    const pending = this.activeApprovals.get(
+      interactiveRequestKey(action.chatId, action.approvalId),
+    );
+    if (!pending) {
       return cardActionToast("warning", "无法处理审批：当前服务没有这条待审批请求。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以处理这条审批请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      pending.handle.messageId !== action.messageId
+    ) {
+      return cardActionToast("warning", "无法处理审批：卡片上下文不匹配。");
     }
     if (action.decisionIndex === undefined) {
       return cardActionToast("warning", "无法处理审批：缺少审批选项。");
@@ -3926,7 +4138,7 @@ export class MessageRouter {
       return cardActionToast("warning", "无法处理审批：审批选项已失效。");
     }
 
-    this.activeApprovals.delete(action.approvalId);
+    this.activeApprovals.delete(pending.key);
     if (pending.timeoutTimer) {
       clearTimeout(pending.timeoutTimer);
     }
@@ -3945,6 +4157,7 @@ export class MessageRouter {
 
   private async requestApproval(
     chatId: string,
+    originSender: SenderIdentity | undefined,
     request: CodexApprovalRequest,
     signal: AbortSignal,
     statusCard: StatusCardHandle | null,
@@ -3953,6 +4166,21 @@ export class MessageRouter {
     startedAt: string,
   ): Promise<CodexApprovalDecision> {
     if (signal.aborted) {
+      return "cancel";
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已取消这次 Codex 审批请求。",
+      );
+      return "cancel";
+    }
+    const key = interactiveRequestKey(chatId, request.id);
+    if (this.activeApprovals.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的 Codex 审批请求；为避免审批错配，已取消后到请求。",
+      );
       return "cancel";
     }
     if (this.interactionLimitReached(chatId)) {
@@ -3972,19 +4200,21 @@ export class MessageRouter {
     return new Promise<CodexApprovalDecision>((resolve) => {
       const createdAtMs = Date.now();
       const pending: PendingApproval = {
+        key,
         chatId,
+        originSender: { ...originSender },
         request,
         resolve,
         handle: null,
         createdAt: new Date(createdAtMs).toISOString(),
         createdAtMs,
       };
-      this.activeApprovals.set(request.id, pending);
+      this.activeApprovals.set(key, pending);
       const cancel = () => {
-        if (this.activeApprovals.get(request.id) !== pending) {
+        if (this.activeApprovals.get(key) !== pending) {
           return;
         }
-        this.activeApprovals.delete(request.id);
+        this.activeApprovals.delete(key);
         if (pending.timeoutTimer) {
           clearTimeout(pending.timeoutTimer);
         }
@@ -4003,10 +4233,10 @@ export class MessageRouter {
 
       if (this.config.codexApprovalTimeoutMs > 0) {
         pending.timeoutTimer = setTimeout(() => {
-          if (this.activeApprovals.get(request.id) !== pending) {
+          if (this.activeApprovals.get(key) !== pending) {
             return;
           }
-          this.activeApprovals.delete(request.id);
+          this.activeApprovals.delete(key);
           pending.cancelledAt = new Date().toISOString();
           pending.cancelReason = "timeout";
           resolve("cancel");
@@ -4046,7 +4276,7 @@ export class MessageRouter {
         updatedAt: new Date().toISOString(),
       })
         .then((handle) => {
-          if (this.activeApprovals.get(request.id) === pending) {
+          if (this.activeApprovals.get(key) === pending) {
             pending.handle = handle;
             return;
           }
@@ -4073,8 +4303,8 @@ export class MessageRouter {
         })
         .catch((error: unknown) => {
           this.logger.warn("Approval card creation failed; cancelling approval request", error);
-          if (this.activeApprovals.get(request.id) === pending) {
-            this.activeApprovals.delete(request.id);
+          if (this.activeApprovals.get(key) === pending) {
+            this.activeApprovals.delete(key);
             resolve("cancel");
           }
         });
@@ -4084,10 +4314,10 @@ export class MessageRouter {
   private async cancelApprovalsForChat(chatId: string): Promise<void> {
     const pending = [...this.activeApprovals.values()].filter((approval) => approval.chatId === chatId);
     for (const approval of pending) {
-      if (this.activeApprovals.get(approval.request.id) !== approval) {
+      if (this.activeApprovals.get(approval.key) !== approval) {
         continue;
       }
-      this.activeApprovals.delete(approval.request.id);
+      this.activeApprovals.delete(approval.key);
       if (approval.timeoutTimer) {
         clearTimeout(approval.timeoutTimer);
       }
@@ -4106,12 +4336,13 @@ export class MessageRouter {
     handle: StatusCardHandle | null,
     chatId: string,
     prompt: string,
+    collaborationMode: CodexCollaborationMode,
   ): void {
     if (!handle) {
       return;
     }
 
-    this.statusCardRuns.set(handle.messageId, { chatId, prompt });
+    this.statusCardRuns.set(handle.messageId, { chatId, prompt, collaborationMode });
     while (this.statusCardRuns.size > maxRememberedStatusCards) {
       const oldestKey = this.statusCardRuns.keys().next().value;
       if (!oldestKey) {
@@ -4267,17 +4498,20 @@ export class MessageRouter {
   }
 
   private async resetSession(chatId: string): Promise<void> {
-    const state = this.requireState();
-    const current = this.ensureSession(chatId, state);
-    const cwd = current.cwd;
-    state.chats[chatId] = {
-      cwd,
-      chatType: current.chatType,
-      updatedAt: new Date().toISOString(),
-      lastProjects: current.lastProjects,
-      lastThreads: current.lastThreads,
-    };
-    await this.store.save(state);
+    let cwd = this.config.codexWorkdir;
+    await this.mutateState((state) => {
+      const current = this.ensureSession(chatId, state);
+      cwd = current.cwd;
+      state.chats[chatId] = {
+        cwd,
+        sessionEpoch: createSessionEpoch(),
+        chatType: current.chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current.lastProjects,
+        lastThreads: current.lastThreads,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "session_reset");
     await this.sendMarkdown(chatId, ["**已新建当前项目的 Codex 会话**", `\`${cwd}\``].join("\n"));
   }
 
@@ -4303,16 +4537,31 @@ export class MessageRouter {
       return;
     }
 
-    const state = this.requireState();
-    const current = state.chats[chatId];
-    state.chats[chatId] = {
-      cwd: nextCwd,
-      chatType,
-      updatedAt: new Date().toISOString(),
-      lastProjects: current?.lastProjects,
-    };
-    await this.store.save(state);
+    await this.mutateState((state) => {
+      const current = state.chats[chatId];
+      state.chats[chatId] = {
+        cwd: nextCwd,
+        sessionEpoch: createSessionEpoch(),
+        chatType,
+        updatedAt: new Date().toISOString(),
+        lastProjects: current?.lastProjects,
+      };
+    });
+    await this.invalidateCodexSession(chatId, "cwd_changed");
     await this.sender.sendText(chatId, `已切换 cwd，并重置 session：\n${nextCwd}`);
+  }
+
+  private async rotateSessionEpoch(chatId: string, reason: string): Promise<void> {
+    await this.mutateState((state) => {
+      const session = this.ensureSession(chatId, state);
+      session.sessionEpoch = createSessionEpoch();
+      session.updatedAt = new Date().toISOString();
+    });
+    await this.invalidateCodexSession(chatId, reason);
+  }
+
+  private async invalidateCodexSession(chatId: string, reason: string): Promise<void> {
+    await this.codex.invalidateChatSession?.(chatId, reason);
   }
 
   private ensureSession(
@@ -4322,6 +4571,7 @@ export class MessageRouter {
   ) {
     const session = state.chats[chatId] ?? {
       cwd: this.config.codexWorkdir,
+      sessionEpoch: createSessionEpoch(),
       updatedAt: new Date().toISOString(),
     };
     if (chatType) {
@@ -5232,6 +5482,7 @@ function isReplaySafeRouterCommand(text: string): boolean {
     text === "/logs" ||
     text === "/files" ||
     text === "/summary" ||
+    text === "/plan" ||
     text === "/projects" ||
     text === "/threads" ||
     text === "/sessions" ||
@@ -5265,6 +5516,7 @@ function isBuiltInRouterCommand(text: string): boolean {
     text === "/threads" ||
     text === "/sessions" ||
     text === "/compact" ||
+    text === "/plan" ||
     text === "/new" ||
     text === "/reset" ||
     text === "/steer" ||
@@ -5555,6 +5807,22 @@ function routedText(message: IncomingTextMessage): string {
     return normalizeRoutedText(message.text);
   }
   return message.text.trim();
+}
+
+function parseCodexTurnRequest(text: string): {
+  prompt: string;
+  collaborationMode: CodexCollaborationMode;
+} {
+  if (text === "/plan") {
+    return { prompt: "", collaborationMode: "plan" };
+  }
+  if (text.startsWith("/plan ")) {
+    return {
+      prompt: text.slice("/plan".length).trim(),
+      collaborationMode: "plan",
+    };
+  }
+  return { prompt: text, collaborationMode: "default" };
 }
 
 function isStopCommand(message: IncomingTextMessage): boolean {

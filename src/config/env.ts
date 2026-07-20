@@ -34,15 +34,15 @@ const positiveIntegerEnv = (defaultValue: number, maximum: number) =>
     return value;
   }, z.number().int().positive().max(maximum));
 
-const timeoutEnv = () =>
+const timeoutEnv = (defaultValue = 0) =>
   z.preprocess((value) => {
     if (value === undefined || value === "") {
-      return 0;
+      return defaultValue;
     }
     if (typeof value === "string") {
       const trimmed = value.trim();
       if (!trimmed) {
-        return 0;
+        return defaultValue;
       }
       return Number(trimmed);
     }
@@ -81,6 +81,8 @@ const configSchema = z.object({
   CODEX_RUN_TIMEOUT_MS: timeoutEnv().default(0),
   CODEX_APPROVAL_TIMEOUT_MS: timeoutEnv().default(0),
   CODEX_MAX_CONCURRENT_RUNS: positiveIntegerEnv(2, 256),
+  CODEX_APP_SERVER_IDLE_TTL_MS: timeoutEnv(900_000).default(900_000),
+  CODEX_MAX_APP_SERVER_SESSIONS: positiveIntegerEnv(8, 256),
   CODEX_MODEL: z.string().optional(),
   CODEX_SKIP_GIT_REPO_CHECK: booleanEnv(false),
   CODEX_GROUP_ALLOWED_ROOTS: z.string().default(""),
@@ -114,6 +116,13 @@ const configSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT"],
       message: "must not exceed BRIDGE_MAX_PENDING_MESSAGES",
+    });
+  }
+  if (config.CODEX_MAX_APP_SERVER_SESSIONS < config.CODEX_MAX_CONCURRENT_RUNS) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["CODEX_MAX_APP_SERVER_SESSIONS"],
+      message: "must be greater than or equal to CODEX_MAX_CONCURRENT_RUNS",
     });
   }
   if (config.ATTACHMENT_MAX_FILE_BYTES > config.ATTACHMENT_MAX_TOTAL_BYTES) {
@@ -160,6 +169,8 @@ export function loadConfig(env: NodeJS.ProcessEnv) {
     codexRunTimeoutMs: parsed.CODEX_RUN_TIMEOUT_MS,
     codexApprovalTimeoutMs: parsed.CODEX_APPROVAL_TIMEOUT_MS,
     codexMaxConcurrentRuns: parsed.CODEX_MAX_CONCURRENT_RUNS,
+    codexAppServerIdleTtlMs: parsed.CODEX_APP_SERVER_IDLE_TTL_MS,
+    codexMaxAppServerSessions: parsed.CODEX_MAX_APP_SERVER_SESSIONS,
     codexModel: parsed.CODEX_MODEL?.trim() || undefined,
     codexSkipGitRepoCheck: parsed.CODEX_SKIP_GIT_REPO_CHECK,
     codexGroupAllowedRoots: groupAllowedRoots.length > 0 ? groupAllowedRoots : [codexWorkdir],

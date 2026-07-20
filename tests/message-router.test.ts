@@ -60,6 +60,17 @@ const silentLogger: Logger = {
   error() {},
 };
 
+class ToggleFailingStateStore extends JsonStateStore {
+  failSaves = false;
+
+  override async save(state: Parameters<JsonStateStore["save"]>[0]): Promise<void> {
+    if (this.failSaves) {
+      throw new Error("simulated state save failure");
+    }
+    await super.save(state);
+  }
+}
+
 class CollectingSender implements ChatSender {
   readonly messages: Array<{ chatId: string; text: string; kind: "text" | "markdown" }> = [];
 
@@ -431,6 +442,61 @@ class FakeCodex implements CodexClient {
   }
 }
 
+class SessionAwareCodex extends FakeCodex {
+  readonly invalidations: Array<{ chatId: string; reason?: string }> = [];
+  disposeCount = 0;
+
+  override async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const threadId = input.threadId ?? "thread_session";
+    await input.onThreadBound?.(threadId);
+    return {
+      threadId,
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  async invalidateChatSession(chatId: string, reason?: string): Promise<void> {
+    this.invalidations.push({ chatId, reason });
+  }
+
+  async dispose(): Promise<void> {
+    this.disposeCount += 1;
+  }
+}
+
+class EarlyBindingCodex extends SessionAwareCodex {
+  readonly threadBound = deferred<void>();
+  readonly continueTurn = deferred<void>();
+  turnContinued = false;
+
+  override async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    const threadId = input.threadId ?? "thread_early_bound";
+    await input.onThreadBound?.(threadId);
+    this.threadBound.resolve();
+    await Promise.race([
+      this.continueTurn.promise,
+      new Promise<void>((resolve) => input.signal?.addEventListener("abort", () => resolve(), { once: true })),
+    ]);
+    this.turnContinued = true;
+    return {
+      threadId,
+      finalText: input.signal?.aborted ? "" : "done",
+      stderr: "",
+      exitCode: input.signal?.aborted ? null : 0,
+      cancelled: input.signal?.aborted,
+    };
+  }
+
+  override async dispose(): Promise<void> {
+    this.continueTurn.resolve();
+    await super.dispose();
+  }
+}
+
 class ListingCodex extends FakeCodex {
   readonly listInputs: CodexThreadListInput[] = [];
   readonly readIds: string[] = [];
@@ -526,6 +592,14 @@ class ListingCodex extends FakeCodex {
   }
 }
 
+class LifecycleCodex extends ListingCodex {
+  readonly invalidations: Array<{ chatId: string; reason?: string }> = [];
+
+  async invalidateChatSession(chatId: string, reason?: string): Promise<void> {
+    this.invalidations.push({ chatId, reason });
+  }
+}
+
 class ResumeReadFailingCodex extends ListingCodex {
   override async run(input: CodexRunInput): Promise<CodexRunResult> {
     this.runs.push(input);
@@ -585,6 +659,14 @@ class BlockingCodex implements CodexClient {
       }
       input.signal?.addEventListener("abort", finishCancelled, { once: true });
     });
+  }
+}
+
+class DisposableBlockingCodex extends BlockingCodex {
+  disposeCount = 0;
+
+  async dispose(): Promise<void> {
+    this.disposeCount += 1;
   }
 }
 
@@ -659,16 +741,19 @@ class FirstBlockingThenDoneCodex implements CodexClient {
 
 class ApprovalCodex implements CodexClient {
   readonly runs: CodexRunInput[] = [];
+  readonly decisions: Array<{ prompt: string; decision: CodexApprovalDecision | undefined }> = [];
   decision: CodexApprovalDecision | undefined;
 
   constructor(private readonly request: CodexApprovalRequest) {}
 
   async run(input: CodexRunInput): Promise<CodexRunResult> {
     this.runs.push(input);
-    this.decision = await input.onApprovalRequest?.(this.request);
+    const decision = await input.onApprovalRequest?.(this.request);
+    this.decision = decision;
+    this.decisions.push({ prompt: input.prompt, decision });
     return {
       threadId: "thread_test",
-      finalText: `decision=${formatDecisionForTest(this.decision)}`,
+      finalText: `decision=${formatDecisionForTest(decision)}`,
       stderr: "",
       exitCode: 0,
     };
@@ -973,6 +1058,38 @@ class ThrowingCodex implements CodexClient {
 }
 
 describe("MessageRouter access control", () => {
+  test("routes /plan as a single Plan turn and restores Default mode afterward", async () => {
+    await withRouter({}, async ({ router, codex, sender }) => {
+      await router.enqueue({
+        messageId: "m_plan_turn",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/plan ask one question",
+      });
+      await router.enqueue({
+        messageId: "m_default_turn",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "continue normally",
+      });
+      await router.enqueue({
+        messageId: "m_plan_usage",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/plan",
+      });
+
+      expect(codex.runs.map(({ prompt, collaborationMode }) => ({ prompt, collaborationMode }))).toEqual([
+        { prompt: "ask one question", collaborationMode: "plan" },
+        { prompt: "continue normally", collaborationMode: "default" },
+      ]);
+      expect(sender.messages.at(-1)?.text).toBe("用法：/plan <任务>（以 Plan 模式执行这一轮）");
+    });
+  });
+
   test("persists accepted events without waiting for a long Codex run", async () => {
     const codex = new BlockingCodex();
     await withRouterAndCodex({}, codex, async ({ router, config }) => {
@@ -1005,6 +1122,80 @@ describe("MessageRouter access control", () => {
       expect(completed.pendingMessages.m_durable).toBeUndefined();
       expect(completed.processedMessageIds).toContain("m_durable");
     });
+  });
+
+  test("graceful disposal interrupts only running jobs and preserves queued inbox work", async () => {
+    const codex = new DisposableBlockingCodex();
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await router.accept({
+        messageId: "m_shutdown_running",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "running during shutdown",
+      });
+      await waitFor(() => codex.runs.length === 1);
+      await waitForState(store, (state) => state.jobs.m_shutdown_running?.status === "running");
+
+      await router.accept({
+        messageId: "m_shutdown_queued",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "queued for restart",
+      });
+      await waitForState(store, (state) => state.jobs.m_shutdown_queued?.status === "queued");
+
+      await router.dispose();
+      await router.dispose();
+
+      const stopped = await store.load();
+      expect(codex.disposeCount).toBe(1);
+      expect(stopped.jobs.m_shutdown_running).toMatchObject({
+        status: "interrupted",
+        interruptionReason: "bridge_shutdown",
+      });
+      expect(stopped.pendingMessages.m_shutdown_running).toBeUndefined();
+      expect(stopped.processedMessageIds).toContain("m_shutdown_running");
+      expect(stopped.jobs.m_shutdown_queued?.status).toBe("queued");
+      expect(stopped.pendingMessages.m_shutdown_queued?.text).toBe("queued for restart");
+      expect(stopped.processedMessageIds).not.toContain("m_shutdown_queued");
+
+      await router.recordEventDiagnostic("routed", {
+        chatId: "oc_chat",
+        mentionCount: 0,
+        startsWithMention: false,
+        attachmentCount: 0,
+        textLength: 4,
+        botIdentityResolved: true,
+      });
+      expect((await store.load()).diagnostics).toEqual(stopped.diagnostics);
+    });
+  });
+
+  test("still disposes Codex children when shutdown state persistence fails", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-dispose-failure-"));
+    const config = loadConfig({
+      FEISHU_APP_ID: "cli_test",
+      FEISHU_APP_SECRET: "secret",
+      CODEX_WORKDIR: tempDir,
+      BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+      ALLOWED_USER_IDS: "ou_user",
+    });
+    const store = new ToggleFailingStateStore(config.bridgeStatePath);
+    const codex = new SessionAwareCodex();
+    const router = new MessageRouter(config, store, new CollectingSender(), silentLogger, codex);
+    try {
+      await router.start();
+      store.failSaves = true;
+      await expect(router.dispose()).rejects.toThrow("simulated state save failure");
+      expect(codex.disposeCount).toBe(1);
+    } finally {
+      store.failSaves = false;
+      await router.dispose().catch(() => undefined);
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   test("serializes Codex runs from different chats that target the same workspace", async () => {
@@ -1704,7 +1895,7 @@ describe("MessageRouter access control", () => {
       expect(failedDelivery?.status).toBe("pending");
       expect(failedDelivery?.lastError).toContain("simulated final delivery failure");
       expect(failedSender.idempotencyKeys).toEqual([failedDelivery?.idempotencyKey]);
-      failedRouter.dispose();
+      await failedRouter.dispose();
       failedRouter = undefined;
 
       const replayCodex = new FakeCodex();
@@ -1733,8 +1924,8 @@ describe("MessageRouter access control", () => {
         Object.values(replayed.outbox).find((delivery) => delivery.jobId === "m_replay")?.text,
       ).toBe("");
     } finally {
-      failedRouter?.dispose();
-      replayRouter?.dispose();
+      await failedRouter?.dispose();
+      await replayRouter?.dispose();
       await rm(tempDir, { recursive: true, force: true });
     }
   });
@@ -1861,7 +2052,7 @@ describe("MessageRouter access control", () => {
       expect(sender.messages[0]?.text).toContain("当前 chat");
     } finally {
       sender.releaseSend.resolve();
-      router?.dispose();
+      await router?.dispose();
       await rm(tempDir, { recursive: true, force: true });
     }
   });
@@ -1910,7 +2101,7 @@ describe("MessageRouter access control", () => {
       expect(codex.runs).toHaveLength(0);
       expect(sender.messages).toHaveLength(0);
     } finally {
-      router?.dispose();
+      await router?.dispose();
       await rm(tempDir, { recursive: true, force: true });
     }
   });
@@ -1973,7 +2164,7 @@ describe("MessageRouter access control", () => {
       expect(sender.messages[0]?.text).toContain("不会自动重放");
       expect(sender.messages[0]?.text).not.toContain("Codex");
     } finally {
-      router?.dispose();
+      await router?.dispose();
       await rm(tempDir, { recursive: true, force: true });
     }
   });
@@ -2077,7 +2268,7 @@ describe("MessageRouter access control", () => {
       );
     } finally {
       codex.complete(0, "thread_recovered_queue");
-      router?.dispose();
+      await router?.dispose();
       await rm(tempDir, { recursive: true, force: true });
     }
   });
@@ -3200,6 +3391,131 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("persists an app-server thread binding before the first turn continues", async () => {
+    const codex = new EarlyBindingCodex();
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      await router.accept({
+        messageId: "m_early_bind",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "bind before turn",
+      });
+      await codex.threadBound.promise;
+
+      const state = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(codex.turnContinued).toBe(false);
+      expect(state.chats.oc_chat?.threadId).toBe("thread_early_bound");
+      expect(state.jobs.m_early_bind).toMatchObject({
+        status: "running",
+        threadId: "thread_early_bound",
+      });
+      expect(codex.runs[0]?.sessionScope?.sessionEpoch).toBe(
+        state.chats.oc_chat?.sessionEpoch,
+      );
+
+      codex.continueTurn.resolve();
+      await waitForState(
+        new JsonStateStore(config.bridgeStatePath),
+        (current) => current.jobs.m_early_bind?.status === "completed",
+      );
+    });
+  });
+
+  test("keeps one scope across turns and rotates the principal without trusting missing ids", async () => {
+    const codex = new SessionAwareCodex();
+    await withRouterAndCodex(
+      {
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        ALLOWED_USER_IDS: "ou_user,ou_other",
+      },
+      codex,
+      async ({ router }) => {
+        await router.enqueue({
+          messageId: "m_scope_1",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: "first turn",
+        });
+        await router.enqueue({
+          messageId: "m_scope_2",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_user" },
+          text: "second turn",
+        });
+        await router.enqueue({
+          messageId: "m_scope_3",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_other" },
+          text: "new principal",
+        });
+        await router.enqueue({
+          messageId: "m_scope_no_id",
+          chatId: "oc_direct_without_id",
+          chatType: "direct",
+          sender: {},
+          text: "single use only",
+        });
+
+        expect(codex.runs[0]?.sessionScope).toBeDefined();
+        expect(codex.runs[1]?.sessionScope?.sessionEpoch).toBe(
+          codex.runs[0]?.sessionScope?.sessionEpoch,
+        );
+        expect(codex.runs[1]?.threadId).toBe("thread_session");
+        expect(codex.runs[2]?.sessionScope?.sessionEpoch).toBe(
+          codex.runs[0]?.sessionScope?.sessionEpoch,
+        );
+        expect(codex.runs[2]?.sessionScope?.principal.openId).toBe("ou_other");
+        expect(codex.runs[3]?.sessionScope).toBeUndefined();
+      },
+    );
+  });
+
+  test("rotates and invalidates app-server sessions at every thread or cwd lifecycle boundary", async () => {
+    const codex = new LifecycleCodex([
+      {
+        id: "thread_source",
+        cwd: "/repo/a",
+        name: "Source thread",
+        updatedAt: 3_000,
+      },
+    ]);
+    await withRouterAndCodex({}, codex, async ({ router, config }) => {
+      const projectDir = path.join(config.codexWorkdir, "project-next");
+      const cdDir = path.join(config.codexWorkdir, "cwd-next");
+      await mkdir(projectDir);
+      await mkdir(cdDir);
+      const command = (messageId: string, text: string): IncomingTextMessage => ({
+        messageId,
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text,
+      });
+
+      await router.enqueue(command("m_resume_lifecycle", "/resume thread_source"));
+      await router.enqueue(command("m_compact_lifecycle", "/compact"));
+      await router.enqueue(command("m_fork_lifecycle", "/fork"));
+      await router.enqueue(command("m_new_lifecycle", "/new"));
+      await router.enqueue(command("m_project_lifecycle", `/project ${projectDir}`));
+      await router.enqueue(command("m_cd_lifecycle", `/cd ${cdDir}`));
+
+      expect(codex.invalidations).toEqual([
+        { chatId: "oc_chat", reason: "thread_changed" },
+        { chatId: "oc_chat", reason: "thread_compact" },
+        { chatId: "oc_chat", reason: "thread_fork" },
+        { chatId: "oc_chat", reason: "thread_changed" },
+        { chatId: "oc_chat", reason: "session_reset" },
+        { chatId: "oc_chat", reason: "project_changed" },
+        { chatId: "oc_chat", reason: "cwd_changed" },
+      ]);
+    });
+  });
+
   test("runs Codex for allowlisted group messages", async () => {
     await withRouter(
       { ALLOW_GROUPS: "true", ALLOWED_CHAT_IDS: "oc_group" },
@@ -4128,6 +4444,132 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("approval card action rejects a mismatched card message id", async () => {
+    const codex = new ApprovalCodex({
+      id: "approval_1",
+      kind: "command",
+      command: "rm -rf build",
+      decisions: ["accept", "decline"],
+    });
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m1",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "run command",
+      });
+      await waitFor(() => sender.approvalCards.length === 1);
+
+      const rejected = await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: "oma_wrong",
+        approvalId: "approval_1",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+
+      expect(expectToast(rejected).toast).toMatchObject({
+        type: "warning",
+        content: "无法处理审批：卡片上下文不匹配。",
+      });
+      expect(codex.decision).toBeUndefined();
+
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_1",
+        decisionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      await running;
+      expect(codex.decision).toBe("decline");
+    });
+  });
+
+  test("keeps identical approval request ids isolated by chat", async () => {
+    const codex = new ApprovalCodex({
+      id: "approval_shared",
+      kind: "command",
+      command: "rm -rf build",
+      decisions: ["accept", "decline"],
+    });
+    const sender = new CardCollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      const firstCwd = path.join(config.codexWorkdir, "first");
+      const secondCwd = path.join(config.codexWorkdir, "second");
+      await Promise.all([
+        mkdir(firstCwd, { recursive: true }),
+        mkdir(secondCwd, { recursive: true }),
+      ]);
+      await Promise.all([
+        router.enqueue({
+          messageId: "m_cd_first",
+          chatId: "oc_first",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: `/cd ${firstCwd}`,
+        }),
+        router.enqueue({
+          messageId: "m_cd_second",
+          chatId: "oc_second",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: `/cd ${secondCwd}`,
+        }),
+      ]);
+
+      const firstRun = router.enqueue({
+        messageId: "m_first",
+        chatId: "oc_first",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "first command",
+      });
+      const secondRun = router.enqueue({
+        messageId: "m_second",
+        chatId: "oc_second",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "second command",
+      });
+      await waitFor(() => sender.approvalCards.length === 2);
+
+      const firstCard = sender.approvalCards.find((card) => card.chatId === "oc_first");
+      const secondCard = sender.approvalCards.find((card) => card.chatId === "oc_second");
+      expect(firstCard).toBeDefined();
+      expect(secondCard).toBeDefined();
+
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_first",
+        messageId: firstCard?.handle.messageId,
+        approvalId: "approval_shared",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_second",
+        messageId: secondCard?.handle.messageId,
+        approvalId: "approval_shared",
+        decisionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      await Promise.all([firstRun, secondRun]);
+
+      expect(codex.decisions).toEqual(
+        expect.arrayContaining([
+          { prompt: "first command", decision: "accept" },
+          { prompt: "second command", decision: "decline" },
+        ]),
+      );
+    });
+  });
+
   test("rejects card callbacks for approval decisions hidden by disclosure guards", async () => {
     const request: CodexApprovalRequest = {
       id: "approval_file_1",
@@ -4290,6 +4732,60 @@ describe("MessageRouter access control", () => {
     );
   });
 
+  test("an allowlisted group member cannot approve another member's Codex request", async () => {
+    const codex = new ApprovalCodex({
+      id: "approval_1",
+      kind: "command",
+      command: "rm -rf build",
+      decisions: ["accept", "decline"],
+    });
+    const sender = new CardCollectingSender();
+    await withRouterAndSender(
+      {
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        ALLOWED_USER_IDS: "ou_origin,ou_other",
+      },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m1",
+          chatId: "oc_group",
+          chatType: "group",
+          sender: { openId: "ou_origin" },
+          text: "@_user_1 run command",
+        });
+        await waitFor(() => sender.approvalCards.length === 1);
+
+        const rejected = await router.handleCardAction({
+          action: "resolve_approval",
+          chatId: "oc_group",
+          messageId: sender.approvalCards[0]?.handle.messageId,
+          approvalId: "approval_1",
+          decisionIndex: 0,
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(rejected).toast).toMatchObject({
+          type: "error",
+          content: "只有发起当前 Codex 任务的用户可以处理这条审批请求。",
+        });
+        expect(codex.decision).toBeUndefined();
+
+        await router.handleCardAction({
+          action: "resolve_approval",
+          chatId: "oc_group",
+          messageId: sender.approvalCards[0]?.handle.messageId,
+          approvalId: "approval_1",
+          decisionIndex: 1,
+          sender: { openId: "ou_origin" },
+        });
+        await running;
+        expect(codex.decision).toBe("decline");
+      },
+    );
+  });
+
   test("marks a late approval card cancelled when the Codex run already finished", async () => {
     const request: CodexApprovalRequest = {
       id: "approval_1",
@@ -4333,7 +4829,7 @@ describe("MessageRouter access control", () => {
     });
   });
 
-  test("marks a late approval card resolved when the user clicks before card creation returns", async () => {
+  test("rejects approval actions until the card message id is known", async () => {
     const request: CodexApprovalRequest = {
       id: "approval_1",
       kind: "command",
@@ -4362,26 +4858,23 @@ describe("MessageRouter access control", () => {
         sender: { openId: "ou_user" },
       });
 
-      expect(response).toMatchObject({
-        card: {
-          type: "raw",
-          data: {
-            header: {
-              title: {
-                content: "Codex 审批已处理",
-              },
-            },
-          },
-        },
+      expect(expectToast(response).toast).toMatchObject({
+        type: "warning",
+        content: "无法处理审批：卡片上下文不匹配。",
       });
-      expect(JSON.stringify(response)).toContain("已选择：Approve。");
-      expect(JSON.stringify(response)).not.toContain("resolve_approval");
+      expect(codex.decision).toBeUndefined();
       expect(sender.approvalCardUpdates).toHaveLength(0);
 
       sender.releaseCreate.resolve();
-      await waitFor(
-        () => sender.approvalCards.length === 1 && sender.approvalCardUpdates.length === 1,
-      );
+      await waitFor(() => sender.approvalCards.length === 1);
+      await router.handleCardAction({
+        action: "resolve_approval",
+        chatId: "oc_chat",
+        messageId: sender.approvalCards[0]?.handle.messageId,
+        approvalId: "approval_1",
+        decisionIndex: 0,
+        sender: { openId: "ou_user" },
+      });
       await running;
 
       expect(codex.decision).toBe("accept");
@@ -5688,7 +6181,7 @@ async function withRouterAndSender<TCodex extends CodexClient, TSender extends C
     await router.start();
     await testBody({ router, sender, codex, config });
   } finally {
-    router?.dispose();
+    await router?.dispose();
     await rm(tempDir, { recursive: true, force: true });
   }
 }

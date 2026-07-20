@@ -31,6 +31,7 @@ describe("JsonStateStore", () => {
       await store.save({
         chats: {
           oc_chat: {
+            sessionEpoch: "epoch_1",
             cwd: tempDir,
             updatedAt: "2026-06-29T00:00:00.000Z",
             threadId: "thread_1",
@@ -66,6 +67,7 @@ describe("JsonStateStore", () => {
 
       const loaded = await store.load();
       expect(loaded.chats.oc_chat?.threadId).toBe("thread_1");
+      expect(loaded.chats.oc_chat?.sessionEpoch).toBe("epoch_1");
       expect(loaded.processedMessageIds).toHaveLength(500);
       expect(loaded.processedMessageIds[0]).toBe("m10");
       expect(loaded.diagnostics.lastEvent?.messageId).toBe("m1");
@@ -116,6 +118,7 @@ describe("JsonStateStore", () => {
         stores[index % stores.length]!.save({
           chats: {
             oc_chat: {
+              sessionEpoch: `epoch_${index}`,
               cwd: tempDir,
               updatedAt: `2026-06-29T00:00:${String(index).padStart(2, "0")}.000Z`,
               threadId: `thread_${index}`,
@@ -133,6 +136,7 @@ describe("JsonStateStore", () => {
 
       const loaded = await stores[0]!.load();
       expect(loaded.chats.oc_chat?.threadId).toBe("thread_49");
+      expect(loaded.chats.oc_chat?.sessionEpoch).toBe("epoch_49");
       expect(loaded.processedMessageIds).toEqual(["m49"]);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
@@ -157,6 +161,43 @@ describe("JsonStateStore", () => {
       expect(loaded.jobs).toEqual({});
       expect(loaded.outbox).toEqual({});
       expect(loaded.processedMessageIds).toEqual(["legacy"]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("adds and persists a session epoch when loading legacy chat state", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const statePath = path.join(tempDir, "state.json");
+    try {
+      await Bun.write(
+        statePath,
+        JSON.stringify({
+          chats: {
+            oc_legacy: {
+              cwd: tempDir,
+              updatedAt: "2026-06-29T00:00:00.000Z",
+              threadId: "thread_legacy",
+            },
+          },
+          jobs: {},
+          outbox: {},
+          pendingMessages: {},
+          processedMessageIds: [],
+          diagnostics: {},
+        }),
+      );
+
+      const store = new JsonStateStore(statePath);
+      const loaded = await store.load();
+      const generatedEpoch = loaded.chats.oc_legacy?.sessionEpoch;
+      expect(generatedEpoch).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+
+      await store.save(loaded);
+      const reloaded = await store.load();
+      expect(reloaded.chats.oc_legacy?.sessionEpoch).toBe(generatedEpoch);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

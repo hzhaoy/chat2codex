@@ -1,5 +1,6 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { isDeepStrictEqual } from "node:util";
@@ -30,6 +31,8 @@ const maxPermissionEntries = 64;
 const maxPermissionPathLength = 4_096;
 const maxPermissionGlobDepth = 128;
 const serverRequestCallbackGraceMs = 25;
+const maxServerRequestTombstones = 256;
+const serverRequestTombstoneTtlMs = 5 * 60 * 1000;
 const maxChangedFiles = 200;
 const maxChangedFilePathChars = 4_096;
 const minAppServerJsonLineBytes = 256 * 1_024;
@@ -40,6 +43,9 @@ export interface CodexRunInput {
   prompt: string;
   cwd: string;
   threadId?: string;
+  collaborationMode?: CodexCollaborationMode;
+  sessionScope?: CodexSessionScope;
+  onThreadBound?: (threadId: string) => void | Promise<void>;
   signal?: AbortSignal;
   onProgress?: (update: CodexProgressUpdate) => void | Promise<void>;
   onApprovalRequest?: (request: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
@@ -56,6 +62,20 @@ export interface CodexRunInput {
     context: CodexServerRequestContext,
   ) => Promise<CodexPermissionApprovalDecision>;
   onRunControl?: (control: CodexRunControl) => void;
+}
+
+export type CodexCollaborationMode = "default" | "plan";
+
+export interface CodexSessionScope {
+  chatId: string;
+  sessionEpoch: string;
+  principal: CodexSessionPrincipal;
+}
+
+export interface CodexSessionPrincipal {
+  openId?: string;
+  userId?: string;
+  unionId?: string;
 }
 
 export interface CodexRunResult {
@@ -476,6 +496,12 @@ const knownUnsupportedServerRequestMethods = new Set([
 
 export class CodexRunner {
   private appServerCliVersion?: string;
+  private readonly sessionsByChat = new Map<string, CodexAppServerSession>();
+  private readonly ownerByThread = new Map<string, CodexAppServerSession>();
+  private readonly sessionExpiryTimers = new Map<CodexAppServerSession, NodeJS.Timeout>();
+  private readonly singleUseChildren = new Set<ChildProcessWithoutNullStreams>();
+  private sessionMutationTail: Promise<void> = Promise.resolve();
+  private disposed = false;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -607,6 +633,95 @@ export class CodexRunner {
   }
 
   async run(input: CodexRunInput): Promise<CodexRunResult> {
+    if (this.disposed) {
+      throw new Error("Codex session manager is disposed.");
+    }
+    if (input.signal?.aborted) {
+      return cancelledRunResult(input.threadId);
+    }
+    if (!isReusableSessionScope(input.sessionScope)) {
+      return this.runSingleUse(input);
+    }
+    let cwdKey: string;
+    try {
+      cwdKey = await realpath(input.cwd);
+    } catch (error) {
+      this.logger.warn("Codex session cwd could not be canonicalized; using a single-use process", {
+        cwd: input.cwd,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return this.runSingleUse(input);
+    }
+
+    let runPromise!: Promise<CodexRunResult>;
+    await this.mutateSessions(async () => {
+      if (this.disposed) {
+        throw new Error("Codex session manager is disposed.");
+      }
+      await this.evictExpiredSessions();
+      const descriptor = createSessionDescriptor(this.config, input.sessionScope!, cwdKey, input.threadId);
+      let session = this.sessionsByChat.get(descriptor.scope.chatId);
+      if (session && !session.matches(descriptor)) {
+        if (session.isActive()) {
+          throw new Error("The current Codex chat session is still running and cannot be rotated.");
+        }
+        await this.removeSession(session, "scope_changed");
+        session = undefined;
+      }
+
+      if (session && session.isActive()) {
+        throw new Error("The Codex app-server session already has an active turn.");
+      }
+
+      if (!session) {
+        if (input.threadId) {
+          const owner = this.ownerByThread.get(input.threadId);
+          if (owner) {
+            if (owner.isActive()) {
+              throw new Error("The requested Codex thread already has an active app-server session.");
+            }
+            await this.removeSession(owner, "thread_owner_transferred");
+          }
+        }
+        await this.ensureSessionCapacity();
+        session = this.createSession(descriptor);
+      }
+
+      runPromise = session.run(input);
+    });
+    return runPromise;
+  }
+
+  async invalidateChatSession(chatId: string, reason = "chat_invalidated"): Promise<void> {
+    await this.mutateSessions(async () => {
+      const session = this.sessionsByChat.get(chatId);
+      if (session) {
+        await this.removeSession(session, reason);
+      }
+    });
+  }
+
+  async dispose(): Promise<void> {
+    await this.mutateSessions(async () => {
+      if (this.disposed) {
+        return;
+      }
+      this.disposed = true;
+      const sessions = [...this.sessionsByChat.values()];
+      const singleUseChildren = [...this.singleUseChildren];
+      this.sessionsByChat.clear();
+      this.ownerByThread.clear();
+      await Promise.all([
+        ...sessions.map((session) => session.close("manager_disposed")),
+        ...singleUseChildren.map((child) => stopChildProcess(child)),
+      ]);
+    });
+  }
+
+  private async runSingleUse(input: CodexRunInput): Promise<CodexRunResult> {
+    if (this.disposed) {
+      throw new Error("Codex session manager is disposed.");
+    }
     if (input.signal?.aborted) {
       return {
         threadId: input.threadId,
@@ -631,6 +746,10 @@ export class CodexRunner {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: buildCodexChildEnv(),
+    });
+    this.singleUseChildren.add(child);
+    child.once("close", () => {
+      this.singleUseChildren.delete(child);
     });
 
     const pendingInteractiveRequests = new Map<string | number, PendingInteractiveRequest>();
@@ -900,7 +1019,17 @@ export class CodexRunner {
         ? await sendRequest("thread/resume", buildThreadResumeParams(this.config, input))
         : await sendRequest("thread/start", buildThreadStartParams(this.config, input));
       threadId = extractThreadId(threadResult) ?? threadId;
+      if (threadId) {
+        await input.onThreadBound?.(threadId);
+      }
 
+      const collaborationMode = input.collaborationMode
+        ? buildCollaborationMode(
+            input.collaborationMode,
+            this.config.codexModel ??
+              requireDefaultModel(await sendRequest("model/list", { includeHidden: false })),
+          )
+        : undefined;
       const turnResult = await sendRequest("turn/start", {
         threadId,
         input: [
@@ -914,6 +1043,7 @@ export class CodexRunner {
         approvalPolicy: this.config.codexApprovalPolicy,
         sandboxPolicy: sandboxModeToPolicy(this.config.codexSandbox),
         ...(this.config.codexModel ? { model: this.config.codexModel } : {}),
+        ...(collaborationMode ? { collaborationMode } : {}),
       });
       activeTurnId = extractTurnId(turnResult) ?? activeTurnId;
       input.onRunControl?.({
@@ -975,6 +1105,158 @@ export class CodexRunner {
         this.config.runDiffMaxChars,
       ),
     };
+  }
+
+  private createSession(descriptor: CodexSessionDescriptor): CodexAppServerSession {
+    const session = new CodexAppServerSession(
+      this.config,
+      this.logger,
+      descriptor,
+      {
+        handleServerRequest: (message, context, respond) => {
+          this.handleAppServerRequest(
+            message,
+            context.input.onApprovalRequest,
+            context.input.onUserInputRequest,
+            context.input.onMcpElicitationRequest,
+            context.input.onPermissionApprovalRequest,
+            context.pendingInteractiveRequests,
+            context.input.signal,
+            respond,
+            (decision) => {
+              if (decision === "cancel") {
+                context.approvalCancelled = true;
+              }
+            },
+          );
+        },
+        bindThread: (boundSession, threadId) =>
+          this.bindSessionThread(boundSession, threadId),
+        onInitialized: (result) => this.rememberAppServerInfo(result),
+        onDead: (deadSession) => this.forgetDeadSession(deadSession),
+        onIdle: (idleSession) => this.scheduleSessionExpiry(idleSession),
+      },
+    );
+    this.sessionsByChat.set(descriptor.scope.chatId, session);
+    if (descriptor.threadId) {
+      this.ownerByThread.set(descriptor.threadId, session);
+    }
+    return session;
+  }
+
+  private async bindSessionThread(
+    session: CodexAppServerSession,
+    threadId: string,
+  ): Promise<void> {
+    await this.mutateSessions(async () => {
+      if (this.sessionsByChat.get(session.chatId) !== session || !session.isHealthy()) {
+        throw new Error("The Codex app-server session expired before its thread was bound.");
+      }
+      const owner = this.ownerByThread.get(threadId);
+      if (owner && owner !== session) {
+        if (owner.isActive()) {
+          throw new Error("The Codex thread is already active in another app-server session.");
+        }
+        await this.removeSession(owner, "thread_owner_transferred");
+      }
+      const previousThreadId = session.threadId;
+      if (previousThreadId && previousThreadId !== threadId) {
+        throw new Error("The Codex app-server session cannot change its bound thread.");
+      }
+      session.bindThread(threadId);
+      this.ownerByThread.set(threadId, session);
+    });
+  }
+
+  private forgetDeadSession(session: CodexAppServerSession): void {
+    if (this.sessionsByChat.get(session.chatId) === session) {
+      this.sessionsByChat.delete(session.chatId);
+    }
+    if (session.threadId && this.ownerByThread.get(session.threadId) === session) {
+      this.ownerByThread.delete(session.threadId);
+    }
+    this.clearSessionExpiry(session);
+  }
+
+  private scheduleSessionExpiry(session: CodexAppServerSession): void {
+    this.clearSessionExpiry(session);
+    const ttlMs = this.config.codexAppServerIdleTtlMs;
+    if (ttlMs <= 0 || !session.isHealthy() || session.isActive()) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void this.mutateSessions(async () => {
+        if (
+          this.sessionsByChat.get(session.chatId) === session &&
+          !session.isActive() &&
+          Date.now() - session.lastUsedAt >= ttlMs
+        ) {
+          await this.removeSession(session, "idle_ttl_expired");
+        }
+      }).catch((error: unknown) => {
+        this.logger.warn("Failed to expire an idle Codex app-server session", error);
+      });
+    }, ttlMs);
+    timer.unref?.();
+    this.sessionExpiryTimers.set(session, timer);
+  }
+
+  private clearSessionExpiry(session: CodexAppServerSession): void {
+    const timer = this.sessionExpiryTimers.get(session);
+    if (timer) {
+      clearTimeout(timer);
+      this.sessionExpiryTimers.delete(session);
+    }
+  }
+
+  private async evictExpiredSessions(): Promise<void> {
+    const ttlMs = this.config.codexAppServerIdleTtlMs;
+    if (ttlMs <= 0) {
+      return;
+    }
+    const expired = [...this.sessionsByChat.values()].filter(
+      (session) => !session.isActive() && Date.now() - session.lastUsedAt >= ttlMs,
+    );
+    for (const session of expired) {
+      await this.removeSession(session, "idle_ttl_expired");
+    }
+  }
+
+  private async ensureSessionCapacity(): Promise<void> {
+    while (this.sessionsByChat.size >= this.config.codexMaxAppServerSessions) {
+      const candidate = [...this.sessionsByChat.values()]
+        .filter((session) => !session.isActive())
+        .sort((left, right) => left.lastUsedAt - right.lastUsedAt)[0];
+      if (!candidate) {
+        throw new Error("All Codex app-server sessions are active; capacity is exhausted.");
+      }
+      await this.removeSession(candidate, "lru_capacity_eviction");
+    }
+  }
+
+  private async removeSession(session: CodexAppServerSession, reason: string): Promise<void> {
+    if (this.sessionsByChat.get(session.chatId) === session) {
+      this.sessionsByChat.delete(session.chatId);
+    }
+    if (session.threadId && this.ownerByThread.get(session.threadId) === session) {
+      this.ownerByThread.delete(session.threadId);
+    }
+    this.clearSessionExpiry(session);
+    await session.close(reason);
+  }
+
+  private async mutateSessions<T>(operation: () => Promise<T> | T): Promise<T> {
+    const previous = this.sessionMutationTail;
+    let release!: () => void;
+    this.sessionMutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private handleAppServerRequest(
@@ -1131,9 +1413,33 @@ export class CodexRunner {
       return;
     }
 
-    Promise.resolve()
-      .then(() => onApprovalRequest(approval))
+    if (runSignal?.aborted) {
+      return;
+    }
+    const pending: PendingInteractiveRequest = {
+      controller: new AbortController(),
+      threadId: approval.threadId ?? "",
+    };
+    pendingInteractiveRequests.set(requestId, pending);
+    deferServerRequestCallback()
+      .then(() => {
+        if (
+          pending.controller.signal.aborted ||
+          pendingInteractiveRequests.get(requestId) !== pending
+        ) {
+          return undefined;
+        }
+        return onApprovalRequest(approval);
+      })
       .then((decision) => {
+        if (
+          decision === undefined ||
+          pending.controller.signal.aborted ||
+          pendingInteractiveRequests.get(requestId) !== pending
+        ) {
+          return;
+        }
+        pendingInteractiveRequests.delete(requestId);
         if (!isCodexApprovalDecision(decision) || !isOfferedDecision(decision, approval.decisions)) {
           this.logger.warn("Codex approval callback returned an unavailable decision; cancelling", {
             requestId: approval.id,
@@ -1146,6 +1452,13 @@ export class CodexRunner {
         respond({ id: requestId, result: { decision } });
       })
       .catch((error: unknown) => {
+        if (
+          pending.controller.signal.aborted ||
+          pendingInteractiveRequests.get(requestId) !== pending
+        ) {
+          return;
+        }
+        pendingInteractiveRequests.delete(requestId);
         this.logger.warn("Codex approval callback failed; cancelling approval request", error);
         onApprovalDecision("cancel");
         respond({ id: requestId, result: { decision: "cancel" } });
@@ -1275,10 +1588,17 @@ export class CodexRunner {
   }
 
   private async requestAppServer(method: string, params: Record<string, unknown>): Promise<unknown> {
+    if (this.disposed) {
+      throw new Error("Codex session manager is disposed.");
+    }
     const child = spawn(this.config.codexBin, buildCodexAppServerArgs(), {
       cwd: this.config.codexWorkdir,
       stdio: ["pipe", "pipe", "pipe"],
       env: buildCodexChildEnv(),
+    });
+    this.singleUseChildren.add(child);
+    child.once("close", () => {
+      this.singleUseChildren.delete(child);
     });
     const stderrCollector = createBoundedUtf8Collector(
       child.stderr,
@@ -1454,6 +1774,870 @@ export class CodexRunner {
       this.appServerCliVersion = version;
     }
   }
+}
+
+interface CodexSessionDescriptor {
+  scope: CodexSessionScope;
+  cwdKey: string;
+  threadId?: string;
+  policyKey: string;
+}
+
+interface ScopedRunContext {
+  generation: string;
+  input: CodexRunInput;
+  threadId?: string;
+  turnId?: string;
+  finalText: string;
+  turnCompleted: boolean;
+  turnError: string | null;
+  approvalCancelled: boolean;
+  summary: CodexRunSummary;
+  commandOutputBuffers: CommandOutputBufferState;
+  pendingInteractiveRequests: Map<string | number, PendingInteractiveRequest>;
+  resolveTurn: () => void;
+  turnDone: Promise<void>;
+  abortListener: () => void;
+  interruptSent: boolean;
+  interruptFallbackTimer: NodeJS.Timeout | null;
+  stderrText: string;
+  stderrTruncated: boolean;
+}
+
+interface ScopedTransportRequest {
+  method: string;
+  generation?: string;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+}
+
+interface ServerRequestTombstone {
+  count: number;
+  threadId: string;
+  expiresAt: number;
+}
+
+interface CodexAppServerSessionCallbacks {
+  handleServerRequest(
+    message: JsonRpcRequest,
+    context: ScopedRunContext,
+    respond: (response: JsonRpcServerResponse) => void,
+  ): void;
+  bindThread(session: CodexAppServerSession, threadId: string): Promise<void>;
+  onInitialized(result: unknown): void;
+  onDead(session: CodexAppServerSession): void;
+  onIdle(session: CodexAppServerSession): void;
+}
+
+class CodexAppServerSession {
+  readonly generation = randomUUID();
+  readonly chatId: string;
+  lastUsedAt = Date.now();
+
+  private readonly child: ChildProcessWithoutNullStreams;
+  private readonly stderrCollector: ReturnType<typeof createPerRunUtf8Collector>;
+  private readonly stdoutReader: ReturnType<typeof createBoundedLineReader>;
+  private readonly pendingRequests = new Map<string, ScopedTransportRequest>();
+  private readonly serverRequestTombstones = new Map<
+    string | number,
+    ServerRequestTombstone
+  >();
+  private readonly closePromise: Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }>;
+  private resolveClose!: (exit: {
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }) => void;
+  private requestSeq = 0;
+  private initialized?: Promise<void>;
+  private collaborationModeModel?: string;
+  private threadAttached = false;
+  private activeRun?: ScopedRunContext;
+  private dead = false;
+  private closeStarted = false;
+  private forceKillTimer: NodeJS.Timeout | null = null;
+
+  constructor(
+    private readonly config: BridgeConfig,
+    private readonly logger: Logger,
+    private readonly descriptor: CodexSessionDescriptor,
+    private readonly callbacks: CodexAppServerSessionCallbacks,
+  ) {
+    this.chatId = descriptor.scope.chatId;
+    this.logger.info("Starting reusable Codex app-server session", {
+      chatId: this.chatId,
+      cwd: descriptor.cwdKey,
+      resume: Boolean(descriptor.threadId),
+      generation: this.generation,
+    });
+    this.child = spawn(this.config.codexBin, buildCodexAppServerArgs(), {
+      cwd: descriptor.cwdKey,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: buildCodexChildEnv(),
+    });
+    this.stderrCollector = createPerRunUtf8Collector(
+      this.child.stderr,
+      (value) => {
+        const context = this.activeRun;
+        if (!context || context.stderrTruncated) {
+          return;
+        }
+        const bounded = truncateUtf8Text(
+          `${context.stderrText}${value}`,
+          this.config.codexStderrMaxBytes,
+        );
+        context.stderrText = bounded.text;
+        context.stderrTruncated = bounded.truncated;
+      },
+    );
+    this.closePromise = new Promise((resolve) => {
+      this.resolveClose = resolve;
+    });
+    this.stdoutReader = createBoundedLineReader(
+      this.child.stdout,
+      appServerJsonLineLimit(this.config),
+      (line) => this.handleLine(line),
+      () => {
+        this.logger.warn("Discarded an oversized Codex app-server JSON line", {
+          chatId: this.chatId,
+          generation: this.generation,
+        });
+        void this.close("oversized_json_line");
+      },
+    );
+    this.child.once("error", (error) => {
+      this.rejectPendingRequests(error);
+    });
+    this.child.once("close", (code, signal) => {
+      this.dead = true;
+      this.abortPendingInteractiveRequests(this.activeRun);
+      this.rejectPendingRequests(new Error("Codex app-server exited before responding."));
+      if (this.forceKillTimer) {
+        clearTimeout(this.forceKillTimer);
+        this.forceKillTimer = null;
+      }
+      this.stdoutReader.close();
+      this.stderrCollector.finish();
+      this.resolveClose({ code, signal });
+      this.callbacks.onDead(this);
+    });
+  }
+
+  get threadId(): string | undefined {
+    return this.descriptor.threadId;
+  }
+
+  bindThread(threadId: string): void {
+    this.descriptor.threadId = threadId;
+  }
+
+  matches(expected: CodexSessionDescriptor): boolean {
+    return (
+      this.isHealthy() &&
+      this.descriptor.scope.chatId === expected.scope.chatId &&
+      this.descriptor.scope.sessionEpoch === expected.scope.sessionEpoch &&
+      sameStableSessionPrincipal(
+        this.descriptor.scope.principal,
+        expected.scope.principal,
+      ) &&
+      this.descriptor.cwdKey === expected.cwdKey &&
+      this.descriptor.policyKey === expected.policyKey &&
+      this.descriptor.threadId === expected.threadId
+    );
+  }
+
+  isHealthy(): boolean {
+    return (
+      !this.dead &&
+      !this.closeStarted &&
+      this.child.exitCode === null &&
+      this.child.signalCode === null
+    );
+  }
+
+  isActive(): boolean {
+    return this.activeRun !== undefined;
+  }
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    if (!this.isHealthy()) {
+      throw new Error("The Codex app-server session is no longer healthy.");
+    }
+    if (this.activeRun) {
+      throw new Error("The Codex app-server session already has an active turn.");
+    }
+    if (input.signal?.aborted) {
+      return cancelledRunResult(input.threadId ?? this.threadId);
+    }
+
+    let resolveTurn!: () => void;
+    const turnDone = new Promise<void>((resolve) => {
+      resolveTurn = resolve;
+    });
+    const context: ScopedRunContext = {
+      generation: randomUUID(),
+      input,
+      threadId: this.threadId,
+      finalText: "",
+      turnCompleted: false,
+      turnError: null,
+      approvalCancelled: false,
+      summary: createEmptyRunSummary(),
+      commandOutputBuffers: { buffers: new Map(), totalBytes: 0 },
+      pendingInteractiveRequests: new Map(),
+      resolveTurn,
+      turnDone,
+      abortListener: () => this.requestInterrupt(context),
+      interruptSent: false,
+      interruptFallbackTimer: null,
+      stderrText: "",
+      stderrTruncated: false,
+    };
+    this.activeRun = context;
+    this.lastUsedAt = Date.now();
+    input.signal?.addEventListener("abort", context.abortListener, { once: true });
+
+    let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    try {
+      await this.ensureInitialized();
+      await this.ensureThread(context);
+      if (input.signal?.aborted) {
+        await this.close("aborted_before_turn_start");
+        return cancelledRunResult(context.threadId);
+      }
+
+      const collaborationMode = input.collaborationMode
+        ? buildCollaborationMode(
+            input.collaborationMode,
+            await this.resolveCollaborationModeModel(context.generation),
+          )
+        : undefined;
+      const turnResult = await this.sendRequest(
+        "turn/start",
+        {
+          threadId: context.threadId,
+          input: [
+            {
+              type: "text",
+              text: input.prompt,
+              text_elements: [],
+            },
+          ],
+          cwd: input.cwd,
+          approvalPolicy: this.config.codexApprovalPolicy,
+          sandboxPolicy: sandboxModeToPolicy(this.config.codexSandbox),
+          ...(this.config.codexModel ? { model: this.config.codexModel } : {}),
+          ...(collaborationMode ? { collaborationMode } : {}),
+        },
+        context.generation,
+      );
+      context.turnId = extractTurnId(turnResult) ?? context.turnId;
+      if (!context.threadId || !context.turnId) {
+        throw new Error("Codex app-server did not return an active thread and turn.");
+      }
+      if (input.signal?.aborted) {
+        this.requestInterrupt(context);
+      }
+      input.onRunControl?.({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        steer: (text: string) =>
+          steerAppServerTurn({
+            text,
+            getThreadId: () => context.threadId,
+            getTurnId: () => context.turnId,
+            isTurnCompleted: () => context.turnCompleted,
+            isAborted: () => Boolean(input.signal?.aborted),
+            sendRequest: (method, params) =>
+              this.sendRequest(method, params, context.generation),
+          }),
+      });
+
+      const outcome = await Promise.race([
+        context.turnDone.then(() => ({ kind: "turn" as const })),
+        this.closePromise.then((closed) => ({ kind: "exit" as const, closed })),
+      ]);
+      if (outcome.kind === "exit") {
+        exit = outcome.closed;
+      }
+
+      const stderr = context.stderrText.trim();
+      const cancelled = Boolean(
+        input.signal?.aborted || (context.approvalCancelled && !context.finalText.trim()),
+      );
+      if (!context.finalText.trim()) {
+        context.finalText = cancelled
+          ? ""
+          : context.turnCompleted && !context.turnError
+            ? "(Codex finished without a final text response.)"
+            : [context.turnError, stderr].filter(Boolean).join("\n");
+      }
+      context.finalText = truncateTextChars(
+        context.finalText.trim(),
+        this.config.chatOutputMaxChars,
+      );
+      return {
+        threadId: context.threadId,
+        finalText: context.finalText,
+        stderr,
+        exitCode:
+          cancelled || (context.turnCompleted && !context.turnError)
+            ? 0
+            : (exit?.code ?? 1),
+        signal: exit?.signal ?? null,
+        cancelled,
+        summary: finalizeRunSummary(
+          context.summary,
+          this.config.runLogMaxCommands,
+          this.config.runLogMaxBytes,
+          this.config.runDiffMaxChars,
+        ),
+      };
+    } catch (error) {
+      await this.close("run_failed");
+      throw error;
+    } finally {
+      input.signal?.removeEventListener("abort", context.abortListener);
+      if (context.interruptFallbackTimer) {
+        clearTimeout(context.interruptFallbackTimer);
+      }
+      this.rememberServerRequestTombstones(context);
+      this.abortPendingInteractiveRequests(context);
+      this.rejectGenerationRequests(
+        context.generation,
+        new Error("The Codex turn is no longer active."),
+      );
+      if (this.activeRun === context) {
+        this.activeRun = undefined;
+      }
+      this.lastUsedAt = Date.now();
+      if (this.isHealthy()) {
+        this.callbacks.onIdle(this);
+      }
+    }
+  }
+
+  async close(reason: string): Promise<void> {
+    if (!this.closeStarted) {
+      this.closeStarted = true;
+      this.abortPendingInteractiveRequests(this.activeRun);
+      this.logger.info("Stopping reusable Codex app-server session", {
+        chatId: this.chatId,
+        generation: this.generation,
+        pid: this.child.pid,
+        reason,
+      });
+      if (this.child.exitCode === null && this.child.signalCode === null) {
+        this.child.kill("SIGTERM");
+        this.forceKillTimer = setTimeout(() => {
+          if (this.child.exitCode === null && this.child.signalCode === null) {
+            this.child.kill("SIGKILL");
+          }
+        }, 5000);
+        this.forceKillTimer.unref?.();
+      }
+    }
+    if (this.dead || this.child.exitCode !== null || this.child.signalCode !== null) {
+      return;
+    }
+    await this.closePromise;
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (!this.initialized) {
+      this.initialized = (async () => {
+        const result = await this.sendRequest("initialize", {
+          clientInfo: {
+            name: "chat2codex",
+            title: "Chat2Codex",
+            version: await readPackageVersion(),
+          },
+          capabilities: {
+            experimentalApi: true,
+            requestAttestation: false,
+          },
+        });
+        this.callbacks.onInitialized(result);
+        this.sendJson({ method: "initialized" });
+      })();
+    }
+    await this.initialized;
+  }
+
+  private async ensureThread(context: ScopedRunContext): Promise<void> {
+    if (this.threadAttached) {
+      context.threadId = this.threadId;
+      return;
+    }
+    const requestedThreadId = this.threadId;
+    const result = requestedThreadId
+      ? await this.sendRequest(
+          "thread/resume",
+          buildThreadResumeParams(this.config, context.input),
+          context.generation,
+        )
+      : await this.sendRequest(
+          "thread/start",
+          buildThreadStartParams(this.config, context.input),
+          context.generation,
+        );
+    const threadId = extractThreadId(result) ?? context.threadId;
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a thread id.");
+    }
+    context.threadId = threadId;
+    await this.callbacks.bindThread(this, threadId);
+    if (!requestedThreadId) {
+      await context.input.onThreadBound?.(threadId);
+    }
+    this.threadAttached = true;
+  }
+
+  private async resolveCollaborationModeModel(generation: string): Promise<string> {
+    if (this.config.codexModel) {
+      return this.config.codexModel;
+    }
+    if (!this.collaborationModeModel) {
+      this.collaborationModeModel = requireDefaultModel(
+        await this.sendRequest("model/list", { includeHidden: false }, generation),
+      );
+    }
+    return this.collaborationModeModel;
+  }
+
+  private requestInterrupt(context: ScopedRunContext): void {
+    if (this.activeRun !== context || context.turnCompleted) {
+      return;
+    }
+    this.rememberServerRequestTombstones(context);
+    this.abortPendingInteractiveRequests(context);
+    if (context.threadId && context.turnId && !context.interruptSent) {
+      context.interruptSent = true;
+      void this.sendRequest(
+        "turn/interrupt",
+        { threadId: context.threadId, turnId: context.turnId },
+        context.generation,
+      ).catch((error: unknown) => {
+        this.logger.warn("Codex turn/interrupt failed; waiting for process fallback", error);
+      });
+    }
+    if (!context.interruptFallbackTimer) {
+      context.interruptFallbackTimer = setTimeout(() => {
+        if (this.activeRun === context && !context.turnCompleted) {
+          void this.close("turn_interrupt_timeout");
+        }
+      }, 5000);
+      context.interruptFallbackTimer.unref?.();
+    }
+  }
+
+  private sendJson(message: unknown): void {
+    if (!this.child.stdin.writable || this.child.stdin.destroyed || !this.isHealthy()) {
+      throw new Error("Codex app-server stdin is not writable.");
+    }
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  private sendRequest(
+    method: string,
+    params: unknown,
+    generation?: string,
+  ): Promise<unknown> {
+    const id = String(++this.requestSeq);
+    const promise = new Promise<unknown>((resolve, reject) => {
+      this.pendingRequests.set(id, { method, generation, resolve, reject });
+    });
+    try {
+      this.sendJson({ id: Number(id), method, params });
+    } catch (error) {
+      this.pendingRequests.delete(id);
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      return Promise.reject(normalized);
+    }
+    return promise;
+  }
+
+  private handleLine(line: string): void {
+    const message = parseJsonLine(line);
+    if (!message) {
+      return;
+    }
+    if (isJsonRpcResponse(message)) {
+      const pending = this.pendingRequests.get(String(message.id));
+      if (!pending) {
+        return;
+      }
+      this.pendingRequests.delete(String(message.id));
+      if (message.error) {
+        pending.reject(new Error(message.error.message ?? "Codex app-server request failed."));
+        return;
+      }
+      const context = this.activeRun;
+      if (context && pending.generation === context.generation) {
+        if (pending.method === "turn/start") {
+          context.turnId = extractTurnId(message.result) ?? context.turnId;
+        } else if (pending.method === "thread/start" || pending.method === "thread/resume") {
+          context.threadId = extractThreadId(message.result) ?? context.threadId;
+        }
+      }
+      pending.resolve(message.result);
+      return;
+    }
+    if (isJsonRpcRequest(message)) {
+      this.handleServerRequest(message);
+      return;
+    }
+    if (isInvalidJsonRpcRequestEnvelope(message)) {
+      this.safeSend({ id: null, error: { code: -32600, message: "Invalid Request" } });
+      return;
+    }
+    if (isJsonRpcNotification(message)) {
+      this.handleNotification(message);
+    }
+  }
+
+  private handleServerRequest(message: JsonRpcRequest): void {
+    const context = this.activeRun;
+    const requestThreadId = getString(message.params, "threadId");
+    const requestTurnId = message.params?.turnId;
+    const isActiveMcpSessionRequest =
+      message.method === "mcpServer/elicitation/request" && requestTurnId == null;
+    const belongsToActiveTurn = Boolean(
+      context &&
+        context.threadId &&
+        context.turnId &&
+        requestThreadId === context.threadId &&
+        (requestTurnId === context.turnId || isActiveMcpSessionRequest),
+    );
+    if (!context || !belongsToActiveTurn || context.turnCompleted) {
+      const failClosedContext = createFailClosedRunContext(
+        this.descriptor.cwdKey,
+        context?.threadId,
+      );
+      this.callbacks.handleServerRequest(message, failClosedContext, (response) =>
+        this.safeSend(response),
+      );
+      return;
+    }
+    const generation = context.generation;
+    this.callbacks.handleServerRequest(message, context, (response) => {
+      if (this.activeRun === context && context.generation === generation && !context.turnCompleted) {
+        this.safeSend(response);
+      }
+    });
+  }
+
+  private handleNotification(message: JsonRpcNotification): void {
+    const context = this.activeRun;
+    if (!context) {
+      return;
+    }
+    if (message.method === "serverRequest/resolved") {
+      if (getString(message.params, "threadId") === context.threadId) {
+        const requestId = message.params?.requestId;
+        if (isRequestId(requestId) && this.consumeServerRequestTombstone(requestId, context)) {
+          return;
+        }
+        abortResolvedInteractiveRequest(message, context.pendingInteractiveRequests);
+      }
+      return;
+    }
+    if (message.method === "thread/started") {
+      return;
+    }
+    if (message.method === "turn/started") {
+      if (getString(message.params, "threadId") !== context.threadId) {
+        return;
+      }
+      const startedTurnId = getString(asRecord(message.params?.turn), "id");
+      if (context.turnId && startedTurnId !== context.turnId) {
+        return;
+      }
+      context.turnId = startedTurnId ?? context.turnId;
+    }
+    if (!notificationBelongsToRun(message, context) || context.turnCompleted) {
+      return;
+    }
+
+    if (message.method === "turn/completed") {
+      const turn = asRecord(message.params?.turn);
+      context.summary.durationMs = getNumber(turn, "durationMs") ?? context.summary.durationMs;
+      context.turnCompleted = true;
+      if (getString(turn, "status") === "failed") {
+        context.turnError = truncateTextChars(
+          formatTurnError(turn?.error),
+          this.config.chatOutputMaxChars,
+        );
+      }
+      context.resolveTurn();
+    } else if (message.method === "error") {
+      if (message.params?.willRetry !== true) {
+        context.turnError = truncateTextChars(
+          getString(asRecord(message.params?.error), "message") ?? "Codex reported an error.",
+          this.config.chatOutputMaxChars,
+        );
+      }
+      this.logger.warn("Codex emitted an error notification", message);
+    } else if (message.method === "item/completed") {
+      const item = asRecord(message.params?.item);
+      if (getString(item, "type") === "agentMessage") {
+        const text = getString(item, "text");
+        if (text && /\S/u.test(text) && getString(item, "phase") !== "commentary") {
+          context.finalText = truncateTextChars(text, this.config.chatOutputMaxChars);
+        }
+      }
+      recordCompletedItem(
+        context.summary,
+        item,
+        context.commandOutputBuffers,
+        this.config.runLogMaxCommands,
+        this.config.runLogMaxBytes,
+      );
+    } else if (message.method === "turn/diff/updated") {
+      const diff = getString(message.params, "diff");
+      if (diff !== undefined) {
+        const boundedDiff = truncateTextChars(diff, this.config.runDiffMaxChars);
+        context.summary.diff = boundedDiff;
+        context.summary.diffStat = summarizeUnifiedDiff(boundedDiff);
+        addChangedFiles(context.summary, filesFromUnifiedDiff(boundedDiff));
+      }
+    } else if (message.method === "item/commandExecution/outputDelta") {
+      const itemId = getString(message.params, "itemId");
+      const delta = getString(message.params, "delta");
+      if (
+        itemId !== undefined &&
+        itemId.length <= maxInteractiveIdentityLength &&
+        delta !== undefined
+      ) {
+        appendCommandOutput(
+          context.commandOutputBuffers,
+          itemId,
+          delta,
+          this.config.runLogMaxCommands,
+          this.config.runLogMaxBytes,
+        );
+      }
+    } else if (message.method === "item/fileChange/patchUpdated") {
+      const changes = Array.isArray(message.params?.changes) ? message.params.changes : [];
+      recordFileChanges(context.summary, changes);
+    }
+
+    const progress = summarizeCodexAppServerProgress(message);
+    if (progress && context.input.onProgress && !context.input.signal?.aborted) {
+      Promise.resolve(context.input.onProgress(progress)).catch((error: unknown) => {
+        this.logger.warn("Codex progress callback failed", error);
+      });
+    }
+  }
+
+  private safeSend(response: JsonRpcServerResponse): void {
+    try {
+      this.sendJson(response);
+    } catch (error) {
+      this.logger.warn("Failed to respond to Codex app-server request", error);
+    }
+  }
+
+  private abortPendingInteractiveRequests(context: ScopedRunContext | undefined): void {
+    if (!context) {
+      return;
+    }
+    for (const pending of context.pendingInteractiveRequests.values()) {
+      pending.controller.abort();
+    }
+    context.pendingInteractiveRequests.clear();
+  }
+
+  private rememberServerRequestTombstones(context: ScopedRunContext): void {
+    if (!context.threadId) {
+      return;
+    }
+    this.pruneServerRequestTombstones();
+    for (const requestId of context.pendingInteractiveRequests.keys()) {
+      const existing = this.serverRequestTombstones.get(requestId);
+      this.serverRequestTombstones.delete(requestId);
+      this.serverRequestTombstones.set(requestId, {
+        count: Math.min((existing?.count ?? 0) + 1, 8),
+        threadId: context.threadId,
+        expiresAt: Date.now() + serverRequestTombstoneTtlMs,
+      });
+    }
+    while (this.serverRequestTombstones.size > maxServerRequestTombstones) {
+      const oldest = this.serverRequestTombstones.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.serverRequestTombstones.delete(oldest);
+    }
+  }
+
+  private consumeServerRequestTombstone(
+    requestId: string | number,
+    context: ScopedRunContext,
+  ): boolean {
+    this.pruneServerRequestTombstones();
+    const tombstone = this.serverRequestTombstones.get(requestId);
+    if (!tombstone || tombstone.threadId !== context.threadId) {
+      return false;
+    }
+    if (tombstone.count <= 1) {
+      this.serverRequestTombstones.delete(requestId);
+    } else {
+      tombstone.count -= 1;
+    }
+    return true;
+  }
+
+  private pruneServerRequestTombstones(): void {
+    const now = Date.now();
+    for (const [requestId, tombstone] of this.serverRequestTombstones) {
+      if (tombstone.expiresAt <= now) {
+        this.serverRequestTombstones.delete(requestId);
+      }
+    }
+  }
+
+  private rejectGenerationRequests(generation: string, error: Error): void {
+    for (const [id, pending] of this.pendingRequests) {
+      if (pending.generation === generation) {
+        this.pendingRequests.delete(id);
+        pending.reject(error);
+      }
+    }
+  }
+
+  private rejectPendingRequests(error: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
+  }
+}
+
+function createSessionDescriptor(
+  config: BridgeConfig,
+  scope: CodexSessionScope,
+  cwdKey: string,
+  threadId: string | undefined,
+): CodexSessionDescriptor {
+  return {
+    scope: {
+      chatId: scope.chatId,
+      sessionEpoch: scope.sessionEpoch,
+      principal: { ...scope.principal },
+    },
+    cwdKey,
+    threadId,
+    policyKey: JSON.stringify({
+      codexBin: config.codexBin,
+      sandbox: config.codexSandbox,
+      approvalPolicy: config.codexApprovalPolicy,
+      model: config.codexModel ?? null,
+      skipGitRepoCheck: config.codexSkipGitRepoCheck,
+    }),
+  };
+}
+
+function isReusableSessionScope(scope: CodexSessionScope | undefined): scope is CodexSessionScope {
+  return Boolean(
+    scope &&
+      scope.chatId.trim() &&
+      scope.sessionEpoch.trim() &&
+      Object.values(scope.principal).some(
+        (value) => typeof value === "string" && value.trim().length > 0,
+      ),
+  );
+}
+
+function sameStableSessionPrincipal(
+  left: CodexSessionPrincipal,
+  right: CodexSessionPrincipal,
+): boolean {
+  return (["openId", "userId", "unionId"] as const).some((key) => {
+    const leftValue = left[key]?.trim();
+    const rightValue = right[key]?.trim();
+    return Boolean(leftValue && rightValue && leftValue === rightValue);
+  });
+}
+
+function notificationBelongsToRun(
+  message: JsonRpcNotification,
+  context: ScopedRunContext,
+): boolean {
+  const threadId = getString(message.params, "threadId");
+  const turnId =
+    getString(message.params, "turnId") ?? getString(asRecord(message.params?.turn), "id");
+  return Boolean(
+    context.threadId &&
+      context.turnId &&
+      threadId === context.threadId &&
+      turnId === context.turnId,
+  );
+}
+
+function cancelledRunResult(threadId: string | undefined): CodexRunResult {
+  return {
+    threadId,
+    finalText: "",
+    stderr: "",
+    exitCode: null,
+    signal: null,
+    cancelled: true,
+  };
+}
+
+async function stopChildProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    let forceKillTimer: NodeJS.Timeout | null = null;
+    const finish = () => {
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+      resolve();
+    };
+    child.once("close", finish);
+    child.kill("SIGTERM");
+    forceKillTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+    }, 5000);
+    forceKillTimer.unref?.();
+  });
+}
+
+function createFailClosedRunContext(
+  cwd: string,
+  threadId: string | undefined,
+): ScopedRunContext {
+  let resolveTurn!: () => void;
+  const turnDone = new Promise<void>((resolve) => {
+    resolveTurn = resolve;
+  });
+  return {
+    generation: randomUUID(),
+    input: { prompt: "", cwd },
+    threadId,
+    finalText: "",
+    turnCompleted: false,
+    turnError: null,
+    approvalCancelled: false,
+    summary: createEmptyRunSummary(),
+    commandOutputBuffers: { buffers: new Map(), totalBytes: 0 },
+    pendingInteractiveRequests: new Map(),
+    resolveTurn,
+    turnDone,
+    abortListener: () => undefined,
+    interruptSent: false,
+    interruptFallbackTimer: null,
+    stderrText: "",
+    stderrTruncated: false,
+  };
 }
 
 export function summarizeCodexProgress(event: CodexJsonEvent): CodexProgressUpdate | null {
@@ -1955,6 +3139,24 @@ function createBoundedUtf8Collector(stream: Readable, maxBytes: number) {
       append(decoder.end());
     }
     return text;
+  };
+  stream.on("data", onData);
+  stream.once("end", finish);
+  return { finish };
+}
+
+function createPerRunUtf8Collector(stream: Readable, append: (value: string) => void) {
+  const decoder = new StringDecoder("utf8");
+  let finished = false;
+  const onData = (chunk: Buffer | string) => {
+    append(typeof chunk === "string" ? chunk : decoder.write(chunk));
+  };
+  const finish = () => {
+    if (!finished) {
+      finished = true;
+      stream.off("data", onData);
+      append(decoder.end());
+    }
   };
   stream.on("data", onData);
   stream.once("end", finish);
@@ -3726,6 +4928,32 @@ function sandboxModeToPolicy(mode: BridgeConfig["codexSandbox"]): Record<string,
     excludeTmpdirEnvVar: false,
     excludeSlashTmp: false,
   };
+}
+
+function buildCollaborationMode(
+  mode: CodexCollaborationMode,
+  model: string,
+): Record<string, unknown> {
+  return {
+    mode,
+    settings: {
+      model,
+      developer_instructions: null,
+    },
+  };
+}
+
+function requireDefaultModel(result: unknown): string {
+  const data = asRecord(result)?.data;
+  const models: unknown[] = Array.isArray(data) ? data : [];
+  const defaultModel = models
+    .map((entry) => asRecord(entry))
+    .find((entry) => entry?.isDefault === true);
+  const model = getString(defaultModel, "model") ?? getString(defaultModel, "id");
+  if (!model) {
+    throw new Error("Codex app-server did not advertise a default model for collaboration mode.");
+  }
+  return model;
 }
 
 function extractThreadId(result: unknown): string | undefined {

@@ -9,6 +9,9 @@ numbers once releases are published.
 
 ### Added
 
+- `/plan <task>` now runs one turn with the app-server Plan collaboration mode,
+  making Codex `request_user_input` available without leaving later ordinary
+  messages in Plan mode.
 - Codex `item/tool/requestUserInput` requests can now pause a turn for
   sender-bound Feishu/Lark card answers or an explicit
   `/answer <reply-code> <value>` text reply. Multi-question requests support
@@ -24,6 +27,10 @@ numbers once releases are published.
   failure retries the stored delivery with a stable idempotency key instead of
   executing the Codex turn again; runs interrupted by a bridge restart are
   reported for manual inspection rather than replayed automatically.
+- Consecutive turns in the same chat/thread scope now reuse one Codex app-server
+  process, preserving session-scoped grants until the sender, cwd, thread,
+  policy, or session epoch changes. Idle TTL and LRU session-cap settings bound
+  the resident process pool.
 
 ### Changed
 
@@ -41,6 +48,9 @@ numbers once releases are published.
   and structured log entries. File logs now rotate by configured size/count.
 - Terminal jobs and delivered outbox records now use configurable count-based
   retention while active jobs and undelivered replies remain protected.
+- `SIGINT` and `SIGTERM` now stop the Lark connection and all reusable,
+  single-use, and transient Codex children before releasing the instance lock;
+  queued durable jobs remain available for restart recovery.
 
 ### Security
 
@@ -55,6 +65,10 @@ numbers once releases are published.
   substitute permissions or enable `strictAutoReview`. Permission and MCP card
   callbacks are bound to the original sender and card message, and late or
   malformed actions fail closed.
+- Reusable sessions are keyed by stable sender identity and canonical execution
+  scope. Thread ownership is exclusive, late turn/request events are generation
+  checked, and messages without a stable sender identity fall back to a
+  single-turn process so they cannot inherit session grants.
 
 ## 0.4.1 - 2026-07-19
 

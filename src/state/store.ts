@@ -6,6 +6,7 @@ import {
   type BridgeState,
   type DurableCodexJob,
   type DurableOutboxMessage,
+  createSessionEpoch,
   emptyState,
 } from "./types.js";
 
@@ -48,6 +49,7 @@ export class JsonStateStore {
         processedMessageIds: parsed.processedMessageIds ?? [],
         diagnostics: parsed.diagnostics ?? {},
       };
+      normalizeChatSessionEpochs(state);
       enforceDurableRetention(
         state,
         this.jobRetentionCount,
@@ -63,6 +65,7 @@ export class JsonStateStore {
   }
 
   async save(state: BridgeState): Promise<void> {
+    normalizeChatSessionEpochs(state);
     enforceDurableRetention(
       state,
       this.jobRetentionCount,
@@ -109,6 +112,17 @@ export class JsonStateStore {
       if (saveQueues.get(queueKey) === currentSave) {
         saveQueues.delete(queueKey);
       }
+    }
+  }
+}
+
+function normalizeChatSessionEpochs(state: BridgeState): void {
+  for (const session of Object.values(state.chats)) {
+    if (
+      typeof session.sessionEpoch !== "string" ||
+      session.sessionEpoch.trim().length === 0
+    ) {
+      session.sessionEpoch = createSessionEpoch();
     }
   }
 }

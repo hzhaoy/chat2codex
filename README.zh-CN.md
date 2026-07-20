@@ -71,13 +71,13 @@ Summarize this repository.
 ## 功能
 
 - 飞书/Lark 长连接机器人，不需要公网 webhook 服务。
-- 每个 chat 对应一个 Codex 会话。
-- 支持 `/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/compact`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/answer`、`/mcp-answer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
+- 每个 chat/thread scope 复用一个 Codex app-server 进程。只要发送者、cwd、thread、策略和 session epoch 不变，连续 turn 会保留同一进程以及 session 级授权。
+- 支持 `/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/compact`、`/plan <任务>`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/answer`、`/mcp-answer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
 - 使用 JSON 保存本地状态。
 - 使用 Codex app-server JSON-RPC 获取机器可读的进度、最终输出和审批回调。
 - Codex 运行时会限频更新状态卡片，并提供停止/重试、本轮详情按钮；卡片不可用时自动回退为文本。
 - 支持用飞书/Lark 审批卡片处理 Codex 命令执行和文件变更审批请求。按钮会根据 Codex 当前提供的审批选项生成，包括 Approve、Approve session、Deny、Cancel turn 等。
-- 支持结构化 Codex `requestUserInput` 提问卡；自由输入可使用显式的 `/answer <回复码> <内容>`。选项会按原始请求在服务端重新校验；secret 问题会安全拒绝，不通过聊天记录收集凭据。
+- `/plan <任务>` 会只把当前一轮切换到 Codex Plan 模式，并支持结构化 `requestUserInput` 提问卡；自由输入可使用显式的 `/answer <回复码> <内容>`。选项会按原始请求在服务端重新校验；secret 问题会安全拒绝，不通过聊天记录收集凭据。下一条普通消息会显式恢复 Default 模式。
 - 支持标准 MCP form 和 URL elicitation，并渲染为绑定原发送者的卡片。类型化表单字段也可以使用 `/mcp-answer <回复码> <JSON 引号包裹的字段 ID> <内容>`；字段值会按原始 schema 校验，敏感字段则安全拒绝。
 - 支持 `item/permissions/requestApproval` 额外权限请求，并用卡片完整展示权限 profile。Chat2Codex 只提供拒绝、当前 turn 授权和当前 session 授权；任何授权都会返回 Codex 原始请求的 profile。
 - 支持飞书/Lark 图片和文件消息，把附件下载为本地路径后随 prompt 传给 Codex。
@@ -134,7 +134,7 @@ bun run protocol:generate
 git diff -- docs/codex-app-server-protocol
 ```
 
-修改 [`src/agent/codex-runner.ts`](src/agent/codex-runner.ts) 前，请先检查协议 schema diff。Chat2Codex 只处理明确支持的 app-server 服务端请求：未知 method 会返回 JSON-RPC method-not-found 错误；格式不合法的审批请求会返回 invalid-params 错误，不会展示或自行补出批准选项。`item/tool/requestUserInput` 已支持卡片和显式 `/answer` 回复；请求字段和回调回答都会重新校验，已撤销请求会拒绝迟到回复，`isSecret` 问题因聊天无法保证遮罩输入而安全拒绝。标准 `mcpServer/elicitation/request` form 和 URL 请求已支持卡片交互，类型化表单值也可以使用 `/mcp-answer` 回复。桥接层不会持久化或回显 `requestUserInput` 与 MCP 的回答值，敏感表单字段会安全拒绝。OpenAI 专用的 MCP form 扩展不会参与能力协商。
+修改 [`src/agent/codex-runner.ts`](src/agent/codex-runner.ts) 前，请先检查协议 schema diff。Chat2Codex 只处理明确支持的 app-server 服务端请求：未知 method 会返回 JSON-RPC method-not-found 错误；格式不合法的审批请求会返回 invalid-params 错误，不会展示或自行补出批准选项。`/plan <任务>` 通过 app-server `collaborationMode` 启动单轮 Plan 模式；`item/tool/requestUserInput` 已支持卡片和显式 `/answer` 回复，请求字段和回调回答都会重新校验，已撤销请求会拒绝迟到回复，`isSecret` 问题因聊天无法保证遮罩输入而安全拒绝。标准 `mcpServer/elicitation/request` form 和 URL 请求已支持卡片交互，类型化表单值也可以使用 `/mcp-answer` 回复。桥接层不会持久化或回显 `requestUserInput` 与 MCP 的回答值，敏感表单字段会安全拒绝。OpenAI 专用的 MCP form 扩展不会参与能力协商。
 
 `item/permissions/requestApproval` 也已支持绑定原发送者的审批卡，并完整展示请求的权限 profile。桥接层只允许 `deny`、`grantTurn` 和 `grantSession` 三种决定。授权时由 runner 克隆其持有的原始 profile；卡片 payload 不能替换权限，也不能开启 `strictAutoReview`。格式错误、信息不完整、已撤销或无法完整展示的请求都会安全拒绝。
 
@@ -228,6 +228,7 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/resume <index\|thread_id>` | 通过编号继续已列出的对话，或直接通过 Codex thread id 加载。 |
 | `/fork [index\|thread_id]` | 分叉当前、已列出或指定的 Codex 会话，并把当前 chat 切到新 thread。 |
 | `/compact` | 请求压缩当前 Codex 会话。 |
+| `/plan <任务>` | 只把当前任务切换到 Codex Plan 模式；需要 Codex 调用 `request_user_input` 时使用，下一条普通消息会恢复 Default 模式。 |
 | `/new` | 在当前项目开始一个新的 Codex 对话。 |
 | `/cd <path>` | 修改当前 chat 的 cwd，并开始一个新的 Codex thread。 |
 | `/stop` | 停止当前 chat 正在运行的 Codex。运行状态卡片里也有停止按钮。 |
@@ -248,7 +249,9 @@ Chat2Codex 默认使用 `CODEX_SANDBOX=workspace-write`，所以 Codex 可以编
 
 `CODEX_RUN_TIMEOUT_MS=0` 和 `CODEX_APPROVAL_TIMEOUT_MS=0` 表示关闭自动超时。对于长期运行的后台机器人，可以设置正整数毫秒值；当 Codex turn 或审批请求卡住时，Chat2Codex 会取消它，并在 `/status` 的近期失败中留下恢复提示。
 
-关键生产资源路径默认都有上限，可以通过 [`.env.example`](.env.example) 中的正整数配置调整：`CODEX_MAX_CONCURRENT_RUNS`；全局的 `BRIDGE_MAX_PENDING_MESSAGES` 与单 chat 的 `BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT` 会约束活动 job、尚未投递的 durable 回复、待处理控制消息和轮内审批/输入等待；另有附件数量/单文件/单消息/存储总量配额与 `ATTACHMENT_RETENTION_HOURS`、聊天回复/stderr/运行日志/diff 输出上限、日志单条/文件轮转上限，以及终态 job/已送达 outbox 的留存条数。留存清理永远不会删除活动 job 或尚未送达的 outbox。附件会流式写入私有临时文件，经配额校验后原子落盘，并在不跟随软链接的前提下惰性清理过期内容。
+关键生产资源路径默认都有上限，可以通过 [`.env.example`](.env.example) 中的正整数配置调整：`CODEX_MAX_CONCURRENT_RUNS`、`CODEX_MAX_APP_SERVER_SESSIONS`；全局的 `BRIDGE_MAX_PENDING_MESSAGES` 与单 chat 的 `BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT` 会约束活动 job、尚未投递的 durable 回复、待处理控制消息和轮内审批/输入等待；另有附件数量/单文件/单消息/存储总量配额与 `ATTACHMENT_RETENTION_HOURS`、聊天回复/stderr/运行日志/diff 输出上限、日志单条/文件轮转上限，以及终态 job/已送达 outbox 的留存条数。留存清理永远不会删除活动 job 或尚未送达的 outbox。附件会流式写入私有临时文件，经配额校验后原子落盘，并在不跟随软链接的前提下惰性清理过期内容。
+
+可复用 app-server session 只保存在内存中。空闲 session 默认在 `CODEX_APP_SERVER_IDLE_TTL_MS` 指定的 15 分钟后关闭；达到 `CODEX_MAX_APP_SERVER_SESSIONS` 上限时，只会淘汰最近最少使用的空闲 session。发送者身份、cwd、thread、策略或 `/new` epoch 变化，以及执行 `/fork`、`/compact` 时，旧 owner 会先关闭，避免同一 thread 被多个进程同时持有。缺少稳定发送者 ID 的消息会退回单 turn 进程，不能继承 session 级授权。收到 `SIGINT`/`SIGTERM` 时，服务会依次关闭飞书连接和所有 Codex 子进程；尚未开始的 durable queued job 保留给重启恢复，running job 标记为 interrupted，绝不会自动重放。
 
 `chat2codex doctor` 和 `/host` 都会提示移动/群机器人常见风险，包括相对路径 `CODEX_BIN`、群聊开启但没有 `ALLOWED_USER_IDS`、关闭运行/审批超时，以及高风险 sandbox 配置。
 
@@ -289,6 +292,6 @@ bun run check
 
 ## 版本路线
 
-1. **v0.5（当前 Unreleased 开发）：**规划中的交互与生产安全收口范围已实现：`requestUserInput`、标准 MCP form/URL elicitation、额外权限审批、durable job/outbox 投递、并发与队列上限、附件配额与过期清理、输出上限、状态留存和日志轮转。这不表示 v0.5 已经发布。
+1. **v0.5（当前 Unreleased 开发）：**规划中的交互与生产安全收口范围已实现：`requestUserInput`、标准 MCP form/URL elicitation、额外权限审批、durable job/outbox 投递、按 chat/thread 复用 app-server session、session/并发池上限、子进程优雅退出、附件配额与过期清理、输出上限、状态留存和日志轮转。这不表示 v0.5 已经发布。
 2. **v0.6：**通过 `thread/fork.lastTurnId` 从指定历史 turn 分叉，并保持原 thread 不变。这个操作不是文件系统回滚，也不会恢复本地文件变更。
 3. 后续再在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。

@@ -11,6 +11,7 @@ upgrade before reporting or validating a suspected vulnerability.
 
 | Version | Supported |
 | --- | --- |
+| `main` / Unreleased | Pre-release testing only |
 | `0.4.x` | Yes |
 | `<= 0.3.x` | No |
 
@@ -49,10 +50,18 @@ paths, screenshots of private chats, or attached documents in public reports.
   run `chat2codex smoke` before treating that CLI version as compatible.
 - Unknown app-server server-request methods are rejected, and malformed
   approval requests return an invalid-params error without offering an
-  approval action. MCP elicitations are cancelled and additional-permission
-  requests receive an empty grant until dedicated user interaction exists.
-  Investigate compatibility warnings instead of weakening this fail-closed
-  behavior.
+  approval action. Supported `requestUserInput`, standard MCP form/URL
+  elicitation, and additional-permission requests are revalidated against the
+  runner's original request before a response is returned. Callbacks are bound
+  to the original sender and card message; malformed, withdrawn, late, secret,
+  or incompletely rendered requests fail closed. Interactive answer values are
+  not persisted or echoed by the bridge. Investigate compatibility warnings
+  instead of weakening this behavior.
+- Session-scoped command and permission grants remain only in the reusable
+  app-server process that received them. The bridge rotates that process when
+  the sender identity, canonical cwd, thread, policy, or session epoch changes;
+  messages without a stable sender identity use a single-turn process and
+  cannot inherit session grants.
 - Approval cards disclose additional permission profiles and every complete
   exec/network policy rule. If any security-relevant detail cannot be rendered
   completely, allow actions are removed and only decline/cancel remain, and the

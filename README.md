@@ -101,9 +101,12 @@ when you need a separate bot instance.
 ## Features
 
 - Feishu/Lark long-connection bot, no public webhook server required.
-- One Codex session per chat.
+- One reusable Codex app-server session per chat/thread scope. Consecutive turns
+  keep the same process—and therefore session-scoped grants—while the sender,
+  cwd, thread, policy, and session epoch remain unchanged.
 - `/status`, `/host`, `/projects`, `/project <index|path>`, `/threads`,
-  `/history`, `/search`, `/resume`, `/fork`, `/compact`, `/new`, `/cd <path>`,
+  `/history`, `/search`, `/resume`, `/fork`, `/compact`, `/plan <task>`, `/new`,
+  `/cd <path>`,
   `/stop`, `/steer`, `/answer`, `/mcp-answer`, `/summary`, `/files`, `/diff`,
   `/logs`, and `/whoami` commands.
 - Local state in JSON.
@@ -115,7 +118,8 @@ when you need a separate bot instance.
   Buttons are generated from Codex's current approval decisions, including
   Approve, Approve session, Deny, and Cancel turn when those options are
   offered.
-- Structured Codex `requestUserInput` questions rendered as sender-bound cards,
+- `/plan <task>` runs one turn in Codex Plan mode. Structured Codex
+  `requestUserInput` questions are rendered as sender-bound cards,
   with an explicit `/answer <reply-code> <value>` fallback for free-form input.
   Options are validated against the original request; secret questions fail
   closed instead of collecting credentials through chat history.
@@ -202,10 +206,11 @@ Review schema diffs before changing
 explicitly supported app-server server requests. Unknown methods return a
 JSON-RPC method-not-found error; malformed approval requests return an
 invalid-params error without exposing or inventing an approval option.
-`item/tool/requestUserInput` is supported through cards and explicit `/answer`
-replies; request fields and callback answers are revalidated, withdrawn
-requests reject late replies, and `isSecret` questions fail closed because chat
-cannot guarantee masked input. Standard `mcpServer/elicitation/request` form and
+`item/tool/requestUserInput` is supported for `/plan <task>` turns through
+cards and explicit `/answer` replies; request fields and callback answers are
+revalidated, withdrawn requests reject late replies, and `isSecret` questions
+fail closed because chat cannot guarantee masked input. Standard
+`mcpServer/elicitation/request` form and
 URL requests are supported through cards, with `/mcp-answer` for typed form
 values. The bridge does not persist or echo `requestUserInput` or MCP answer
 values, and sensitive form fields fail closed. The OpenAI-specific MCP form
@@ -341,6 +346,7 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/resume <index\|thread_id>` | Continue a listed conversation by number, or load one directly by Codex thread id. |
 | `/fork [index\|thread_id]` | Fork the current, listed, or specified Codex conversation and switch this chat to the new thread. |
 | `/compact` | Request compaction for the current Codex conversation. |
+| `/plan <task>` | Run one task in Codex Plan mode. Use this mode when Codex should call `request_user_input`; the next ordinary message returns to Default mode. |
 | `/new` | Start a fresh Codex conversation in the current project. |
 | `/cd <path>` | Change the current chat cwd and start a fresh Codex thread. |
 | `/stop` | Stop the active Codex run for the current chat. The running status card also has a stop button. |
@@ -369,7 +375,7 @@ stuck Codex turn or unattended approval request is cancelled and recorded in
 
 Key production resource paths are bounded by default and can be tuned with the
 positive-integer settings in [`.env.example`](.env.example):
-`CODEX_MAX_CONCURRENT_RUNS`, the global and per-chat
+`CODEX_MAX_CONCURRENT_RUNS`, `CODEX_MAX_APP_SERVER_SESSIONS`, the global and per-chat
 `BRIDGE_MAX_PENDING_MESSAGES` / `BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT` limits,
 which bound active jobs, undelivered durable replies, pending control messages,
 and in-turn approval/input waits,
@@ -380,6 +386,16 @@ Active jobs and undelivered outbox entries are never removed by retention
 pruning. Attachments are streamed into private temporary files, checked against
 the configured quotas, atomically finalized, and lazily expired without
 following symlinks.
+
+Reusable app-server sessions are held only in memory. Idle sessions expire
+after `CODEX_APP_SERVER_IDLE_TTL_MS` (15 minutes by default), and the least
+recently used idle session is closed when `CODEX_MAX_APP_SERVER_SESSIONS` is
+reached. Changing the sender identity, cwd, thread, policy, `/new` epoch, or
+using `/fork`/`/compact` closes the old owner before another process can attach.
+Messages without a stable sender id use a single-turn process and cannot inherit
+session-scoped grants. A graceful `SIGINT`/`SIGTERM` closes the Lark connection
+and all Codex children; queued durable work remains recoverable, while running
+work is marked interrupted and is never replayed automatically.
 
 `chat2codex doctor` and `/host` both surface mobile/team-bot safety warnings,
 including relative `CODEX_BIN`, group chats without `ALLOWED_USER_IDS`,
@@ -459,9 +475,10 @@ chat or reporting a security issue.
 1. **v0.5 (current Unreleased development):** the planned interaction and
    production-hardening scope is implemented: `requestUserInput`, standard MCP
    form/URL elicitation, additional-permission approval, durable job/outbox
-   delivery, bounded concurrency and queues, attachment quotas and expiry,
-   output limits, state retention, and log rotation. This does not indicate a
-   published v0.5 release.
+   delivery, chat/thread app-server session reuse, bounded session/concurrency
+   pools, graceful child-process shutdown, attachment quotas and expiry, output
+   limits, state retention, and log rotation. This does not indicate a published
+   v0.5 release.
 2. **v0.6:** fork from a selected historical turn with
    `thread/fork.lastTurnId`, leaving the source thread unchanged. This is not a
    filesystem rollback and does not restore local file changes.

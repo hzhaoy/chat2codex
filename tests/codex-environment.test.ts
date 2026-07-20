@@ -21,6 +21,8 @@ describe("Codex child environment", () => {
       CODEX_WORKDIR: "/tmp/workspace",
       CODEX_SANDBOX: "workspace-write",
       CODEX_MAX_CONCURRENT_RUNS: "2",
+      CODEX_APP_SERVER_IDLE_TTL_MS: "900000",
+      CODEX_MAX_APP_SERVER_SESSIONS: "8",
       BRIDGE_MAX_PENDING_MESSAGES: "64",
       BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "8",
       ATTACHMENT_MAX_COUNT: "4",
@@ -60,6 +62,8 @@ describe("Codex child environment", () => {
     expect(childEnv.CODEX_SANDBOX).toBeUndefined();
     for (const key of [
       "CODEX_MAX_CONCURRENT_RUNS",
+      "CODEX_APP_SERVER_IDLE_TTL_MS",
+      "CODEX_MAX_APP_SERVER_SESSIONS",
       "BRIDGE_MAX_PENDING_MESSAGES",
       "BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT",
       "ATTACHMENT_MAX_COUNT",

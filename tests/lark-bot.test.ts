@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 
-import { writeAttachmentResponseAtomicallyForTest } from "../src/bot/lark-bot.js";
+import {
+  createBridgeRuntimeForTest,
+  writeAttachmentResponseAtomicallyForTest,
+} from "../src/bot/lark-bot.js";
 
 const tempDirectories: string[] = [];
 
@@ -12,6 +15,56 @@ afterEach(async () => {
   await Promise.all(
     tempDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })),
   );
+});
+
+describe("Lark bridge runtime", () => {
+  test("closes the WebSocket before awaiting router disposal and disposes only once", async () => {
+    const events: string[] = [];
+    const releaseRouter = deferred<void>();
+    const runtime = createBridgeRuntimeForTest(
+      {
+        close() {
+          events.push("websocket:close");
+        },
+      },
+      {
+        async dispose() {
+          events.push("router:dispose:start");
+          await releaseRouter.promise;
+          events.push("router:dispose:end");
+        },
+      },
+    );
+
+    const firstDispose = runtime.dispose();
+    const secondDispose = runtime.dispose();
+    expect(secondDispose).toBe(firstDispose);
+    expect(events).toEqual(["websocket:close", "router:dispose:start"]);
+
+    releaseRouter.resolve(undefined);
+    await firstDispose;
+    expect(events).toEqual(["websocket:close", "router:dispose:start", "router:dispose:end"]);
+  });
+
+  test("still disposes the router when closing the WebSocket fails", async () => {
+    const events: string[] = [];
+    const runtime = createBridgeRuntimeForTest(
+      {
+        close() {
+          events.push("websocket:close");
+          throw new Error("socket close failed");
+        },
+      },
+      {
+        dispose() {
+          events.push("router:dispose");
+        },
+      },
+    );
+
+    await expect(runtime.dispose()).rejects.toThrow("socket close failed");
+    expect(events).toEqual(["websocket:close", "router:dispose"]);
+  });
 });
 
 describe("Lark attachment downloads", () => {
@@ -196,4 +249,15 @@ async function waitForPartFile(directory: string): Promise<void> {
     await Bun.sleep(2);
   }
   throw new Error("Attachment temporary file was not created in time.");
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolver) => {
+    resolve = resolver;
+  });
+  return { promise, resolve };
 }

@@ -3,7 +3,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { checkCodexProtocolCompatibility, parseCommand, runCli } from "../src/cli.js";
+import {
+  checkCodexProtocolCompatibility,
+  createGracefulShutdownController,
+  createUncaughtExceptionHandler,
+  parseCommand,
+  runCli,
+} from "../src/cli.js";
 
 const originalCwd = process.cwd();
 const originalLog = console.log;
@@ -34,6 +40,117 @@ describe("CLI", () => {
   test("start help does not require bridge configuration", async () => {
     await runCli(["start", "--help"]);
     await expect(runCli(["not-a-command"])).rejects.toThrow("Unknown start argument");
+  });
+
+  test("graceful shutdown disposes once and completes without forcing exit", async () => {
+    let disposeCalls = 0;
+    const forceExitCodes: number[] = [];
+    const controller = createGracefulShutdownController(
+      async () => {
+        disposeCalls += 1;
+      },
+      silentLogger,
+      {
+        forceExit: (code) => forceExitCodes.push(code),
+        timeoutMs: 1_000,
+      },
+    );
+
+    controller.request("SIGTERM");
+    await controller.done;
+    controller.request("SIGINT");
+
+    expect(disposeCalls).toBe(1);
+    expect(forceExitCodes).toEqual([]);
+  });
+
+  test("a second shutdown signal forces exit without calling process.exit in tests", async () => {
+    const releaseDispose = deferred<void>();
+    const forceExitCodes: number[] = [];
+    const controller = createGracefulShutdownController(
+      () => releaseDispose.promise,
+      silentLogger,
+      {
+        forceExit: (code) => forceExitCodes.push(code),
+        timeoutMs: 1_000,
+      },
+    );
+
+    controller.request("SIGTERM");
+    controller.request("SIGINT");
+    expect(forceExitCodes).toEqual([130]);
+
+    releaseDispose.resolve();
+    await controller.done;
+  });
+
+  test("a bounded graceful shutdown timeout forces exit", async () => {
+    const releaseDispose = deferred<void>();
+    const forceExitCodes: number[] = [];
+    const controller = createGracefulShutdownController(
+      () => releaseDispose.promise,
+      silentLogger,
+      {
+        forceExit: (code) => forceExitCodes.push(code),
+        timeoutMs: 5,
+      },
+    );
+
+    controller.request("SIGTERM");
+    await Bun.sleep(15);
+    expect(forceExitCodes).toEqual([143]);
+
+    releaseDispose.resolve();
+    await controller.done;
+  });
+
+  test("an uncaught exception uses the active graceful shutdown controller", async () => {
+    let disposeCalls = 0;
+    const forceExitCodes: number[] = [];
+    const exitCodes: number[] = [];
+    const controller = createGracefulShutdownController(
+      async () => {
+        disposeCalls += 1;
+      },
+      silentLogger,
+      {
+        forceExit: (code) => forceExitCodes.push(code),
+        timeoutMs: 1_000,
+      },
+    );
+    const handleUncaughtException = createUncaughtExceptionHandler(
+      () => controller,
+      silentLogger,
+      {
+        forceExit: (code) => forceExitCodes.push(code),
+        setExitCode: (code) => exitCodes.push(code),
+      },
+    );
+
+    handleUncaughtException(new Error("fatal callback failure"));
+    await controller.done;
+
+    expect(disposeCalls).toBe(1);
+    expect(exitCodes).toEqual([1]);
+    expect(forceExitCodes).toEqual([]);
+  });
+
+  test("an early uncaught exception explicitly forces exit when shutdown is unavailable", () => {
+    const forceExitCodes: number[] = [];
+    const exitCodes: number[] = [];
+    const handleUncaughtException = createUncaughtExceptionHandler(
+      () => undefined,
+      silentLogger,
+      {
+        forceExit: (code) => forceExitCodes.push(code),
+        setExitCode: (code) => exitCodes.push(code),
+      },
+    );
+
+    handleUncaughtException(new Error("fatal startup failure"));
+
+    expect(exitCodes).toEqual([1]);
+    expect(forceExitCodes).toEqual([1]);
   });
 
   test("doctor help does not require bridge configuration", async () => {
@@ -212,6 +329,27 @@ describe("CLI", () => {
     }
   });
 });
+
+const silentLogger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value?: T | PromiseLike<T>): void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolver) => {
+    resolve = resolver;
+  });
+  return {
+    promise,
+    resolve: (value) => resolve(value as T | PromiseLike<T>),
+  };
+}
 
 async function runDoctorWithCodexVersion(
   codexVersion: string,

@@ -16,7 +16,7 @@ import {
   readPackageVersion,
 } from "./package-info.js";
 import { acquireBridgeInstanceLock } from "./state/instance-lock.js";
-import { ConsoleLogger } from "./util/logger.js";
+import { ConsoleLogger, type Logger } from "./util/logger.js";
 
 type CliCommand =
   | "doctor"
@@ -51,6 +51,25 @@ interface EnvBackedOptions {
   envFile: string;
   help: boolean;
 }
+
+type ShutdownSignal = "SIGINT" | "SIGTERM";
+
+export interface GracefulShutdownController {
+  done: Promise<void>;
+  request(signal: ShutdownSignal): void;
+}
+
+interface GracefulShutdownOptions {
+  forceExit?: (code: number) => void;
+  timeoutMs?: number;
+}
+
+interface UncaughtExceptionHandlerOptions {
+  forceExit?: (code: number) => void;
+  setExitCode?: (code: number) => void;
+}
+
+const defaultShutdownTimeoutMs = 10_000;
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const { command, args } = parseCommand(argv);
@@ -148,24 +167,160 @@ Options:
     maxFiles: config.logFileMaxFiles,
   });
 
-  process.on("unhandledRejection", (error) => {
+  let runtime: Awaited<ReturnType<typeof runBridge>> | undefined;
+  let instanceLock: Awaited<ReturnType<typeof acquireBridgeInstanceLock>> | undefined;
+  let shutdown: GracefulShutdownController | undefined;
+  let instanceLockCompromised = false;
+  const onUnhandledRejection = (error: unknown) => {
     logger.error("Unhandled rejection", error);
-  });
-  process.on("uncaughtException", (error) => {
-    logger.error("Uncaught exception", error);
-    process.exitCode = 1;
+  };
+  const onUncaughtException = createUncaughtExceptionHandler(() => shutdown, logger);
+  process.on("unhandledRejection", onUnhandledRejection);
+  process.on("uncaughtException", onUncaughtException);
+
+  const onSigint = () => shutdown?.request("SIGINT");
+  const onSigterm = () => shutdown?.request("SIGTERM");
+  try {
+    instanceLock = await acquireBridgeInstanceLock(config.bridgeStatePath, (error) => {
+      logger.error("Chat2Codex instance lock was compromised; stopping the bridge", error);
+      instanceLockCompromised = true;
+      process.exitCode = 1;
+      shutdown?.request("SIGTERM");
+    });
+    let resolveRuntimeReady!: (
+      runtime: Awaited<ReturnType<typeof runBridge>> | undefined,
+    ) => void;
+    const runtimeReady = new Promise<Awaited<ReturnType<typeof runBridge>> | undefined>(
+      (resolve) => {
+        resolveRuntimeReady = resolve;
+      },
+    );
+    shutdown = createGracefulShutdownController(async () => {
+      await (await runtimeReady)?.dispose();
+    }, logger);
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+    if (instanceLockCompromised) {
+      shutdown.request("SIGTERM");
+    }
+    try {
+      runtime = await runBridge(config, logger);
+    } finally {
+      resolveRuntimeReady(runtime);
+    }
+    await shutdown.done;
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    process.removeListener("uncaughtException", onUncaughtException);
+    try {
+      await runtime?.dispose();
+    } finally {
+      await instanceLock?.release();
+    }
+  }
+}
+
+export function createGracefulShutdownController(
+  dispose: () => Promise<void>,
+  logger: Logger,
+  options: GracefulShutdownOptions = {},
+): GracefulShutdownController {
+  const timeoutMs = options.timeoutMs ?? defaultShutdownTimeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Graceful shutdown timeout must be a positive safe integer.");
+  }
+
+  const forceExit = options.forceExit ?? ((code: number) => process.exit(code));
+  let firstSignal: ShutdownSignal | undefined;
+  let settled = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let resolveDone!: () => void;
+  let rejectDone!: (error: unknown) => void;
+  const done = new Promise<void>((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
   });
 
-  const instanceLock = await acquireBridgeInstanceLock(config.bridgeStatePath, (error) => {
-    logger.error("Chat2Codex instance lock was compromised; stopping the bridge", error);
-    process.exit(1);
-  });
-  try {
-    await runBridge(config, logger);
-  } catch (error) {
-    await instanceLock.release();
-    throw error;
-  }
+  const clearShutdownTimer = () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
+  const request = (signal: ShutdownSignal) => {
+    if (settled) {
+      return;
+    }
+    if (firstSignal) {
+      logger.warn("Received a second shutdown signal; forcing exit", { signal });
+      forceExit(shutdownExitCode(signal));
+      return;
+    }
+
+    firstSignal = signal;
+    logger.info("Received shutdown signal; stopping the bridge", { signal, timeoutMs });
+    timer = setTimeout(() => {
+      logger.error("Graceful shutdown timed out; forcing exit", { signal, timeoutMs });
+      forceExit(shutdownExitCode(signal));
+    }, timeoutMs);
+
+    void Promise.resolve()
+      .then(dispose)
+      .then(
+        () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearShutdownTimer();
+          logger.info("Bridge shutdown complete");
+          resolveDone();
+        },
+        (error: unknown) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearShutdownTimer();
+          logger.error("Bridge shutdown failed", error);
+          rejectDone(error);
+        },
+      );
+  };
+
+  return { done, request };
+}
+
+export function createUncaughtExceptionHandler(
+  getShutdown: () => GracefulShutdownController | undefined,
+  logger: Logger,
+  options: UncaughtExceptionHandlerOptions = {},
+): (error: Error) => void {
+  const forceExit = options.forceExit ?? ((code: number) => process.exit(code));
+  const setExitCode =
+    options.setExitCode ??
+    ((code: number) => {
+      process.exitCode = code;
+    });
+
+  return (error: Error) => {
+    logger.error("Uncaught exception", error);
+    setExitCode(1);
+    const activeShutdown = getShutdown();
+    if (!activeShutdown) {
+      logger.error("Uncaught exception occurred before graceful shutdown was available");
+      forceExit(1);
+      return;
+    }
+    activeShutdown.request("SIGTERM");
+  };
+}
+
+function shutdownExitCode(signal: ShutdownSignal): number {
+  return signal === "SIGINT" ? 130 : 143;
 }
 
 async function runSetup(args: string[]): Promise<void> {

@@ -47,7 +47,19 @@ interface AttachmentDownloadResponse {
   getReadableStream(): Readable;
 }
 
-export async function runBridge(config: BridgeConfig, logger: Logger): Promise<void> {
+interface BridgeWebSocketClient {
+  close(params?: { force?: boolean }): void;
+}
+
+interface BridgeMessageRouter {
+  dispose(): void | Promise<void>;
+}
+
+export interface BridgeRuntime {
+  dispose(): Promise<void>;
+}
+
+export async function runBridge(config: BridgeConfig, logger: Logger): Promise<BridgeRuntime> {
   const domain = config.larkDomain === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
   const client = new lark.Client({
     appId: config.feishuAppId,
@@ -324,53 +336,108 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
     sender,
     logger,
   );
-  await router.start();
+  let wsClient: lark.WSClient | undefined;
+  try {
+    await router.start();
 
-  const botIdentity = await resolveBotIdentity(config, logger);
+    const botIdentity = await resolveBotIdentity(config, logger);
 
-  const eventDispatcher = new lark.EventDispatcher({}).register({
-    "im.message.receive_v1": async (event) => {
-      const { incoming, diagnostic } = adaptLarkTextEvent(event, botIdentity);
-      if (!incoming) {
-        await router.recordEventDiagnostic("dropped", diagnostic);
-        logDroppedEvent(logger, diagnostic);
-        return;
-      }
+    const eventDispatcher = new lark.EventDispatcher({}).register({
+      "im.message.receive_v1": async (event) => {
+        const { incoming, diagnostic } = adaptLarkTextEvent(event, botIdentity);
+        if (!incoming) {
+          await router.recordEventDiagnostic("dropped", diagnostic);
+          logDroppedEvent(logger, diagnostic);
+          return;
+        }
 
-      await router.recordEventDiagnostic("routed", diagnostic);
-      logRoutedEvent(logger, diagnostic);
-      await router.accept(incoming);
-    },
-    "card.action.trigger": async (event: unknown) => {
-      const action = adaptLarkCardActionEvent(event);
-      if (!action) {
-        logger.warn("Ignored unknown Lark card action", { eventType: "card.action.trigger" });
-        return cardActionToast("warning", "这个卡片操作已被忽略。");
-      }
-      return router.handleCardAction(action);
-    },
-  });
+        await router.recordEventDiagnostic("routed", diagnostic);
+        logRoutedEvent(logger, diagnostic);
+        await router.accept(incoming);
+      },
+      "card.action.trigger": async (event: unknown) => {
+        const action = adaptLarkCardActionEvent(event);
+        if (!action) {
+          logger.warn("Ignored unknown Lark card action", { eventType: "card.action.trigger" });
+          return cardActionToast("warning", "这个卡片操作已被忽略。");
+        }
+        return router.handleCardAction(action);
+      },
+    });
 
-  const wsClient = new lark.WSClient({
-    appId: config.feishuAppId,
-    appSecret: config.feishuAppSecret,
-    domain,
-  });
+    wsClient = new lark.WSClient({
+      appId: config.feishuAppId,
+      appSecret: config.feishuAppSecret,
+      domain,
+    });
 
-  logger.info("Starting Feishu/Lark long-connection bridge", {
-    domain: config.larkDomain,
-    statePath: config.bridgeStatePath,
-    defaultCwd: config.codexWorkdir,
-    access: {
-      allowDirectMessages: config.access.allowDirectMessages,
-      allowGroups: config.access.allowGroups,
-      allowedChatIds: config.access.allowedChatIds.length,
-      allowedUserIds: config.access.allowedUserIds.length,
-    },
-    botIdentityResolved: Boolean(botIdentity.openId),
-  });
-  wsClient.start({ eventDispatcher });
+    logger.info("Starting Feishu/Lark long-connection bridge", {
+      domain: config.larkDomain,
+      statePath: config.bridgeStatePath,
+      defaultCwd: config.codexWorkdir,
+      access: {
+        allowDirectMessages: config.access.allowDirectMessages,
+        allowGroups: config.access.allowGroups,
+        allowedChatIds: config.access.allowedChatIds.length,
+        allowedUserIds: config.access.allowedUserIds.length,
+      },
+      botIdentityResolved: Boolean(botIdentity.openId),
+    });
+    await wsClient.start({ eventDispatcher });
+    return createBridgeRuntime(wsClient, router);
+  } catch (error) {
+    try {
+      await createBridgeRuntime(wsClient, router).dispose();
+    } catch (disposeError) {
+      logger.error("Failed to clean up the bridge after startup failed", disposeError);
+    }
+    throw error;
+  }
 }
+
+function createBridgeRuntime(
+  wsClient: BridgeWebSocketClient | undefined,
+  router: BridgeMessageRouter,
+): BridgeRuntime {
+  let disposePromise: Promise<void> | undefined;
+  return {
+    dispose() {
+      disposePromise ??= disposeBridgeRuntime(wsClient, router);
+      return disposePromise;
+    },
+  };
+}
+
+async function disposeBridgeRuntime(
+  wsClient: BridgeWebSocketClient | undefined,
+  router: BridgeMessageRouter,
+): Promise<void> {
+  let webSocketError: unknown;
+  try {
+    wsClient?.close();
+  } catch (error) {
+    webSocketError = error;
+  }
+
+  try {
+    await router.dispose();
+  } catch (routerError) {
+    if (webSocketError !== undefined) {
+      throw new AggregateError(
+        [webSocketError, routerError],
+        "Failed to dispose the Feishu/Lark bridge",
+      );
+    }
+    throw routerError;
+  }
+
+  if (webSocketError !== undefined) {
+    throw webSocketError;
+  }
+}
+
+// Exported solely so shutdown ordering and idempotency can be tested without opening a socket.
+export const createBridgeRuntimeForTest = createBridgeRuntime;
 
 async function ensurePrivateDirectory(directory: string): Promise<string> {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });

@@ -31,6 +31,8 @@ describe("loadConfig", () => {
     expect(config.codexRunTimeoutMs).toBe(0);
     expect(config.codexApprovalTimeoutMs).toBe(0);
     expect(config.codexMaxConcurrentRuns).toBe(2);
+    expect(config.codexAppServerIdleTtlMs).toBe(900_000);
+    expect(config.codexMaxAppServerSessions).toBe(8);
     expect(config.bridgeMaxPendingMessages).toBe(64);
     expect(config.bridgeMaxPendingMessagesPerChat).toBe(8);
     expect(config.attachmentMaxCount).toBe(4);
@@ -55,6 +57,8 @@ describe("loadConfig", () => {
       FEISHU_APP_ID: "cli_test",
       FEISHU_APP_SECRET: "secret",
       CODEX_MAX_CONCURRENT_RUNS: "4",
+      CODEX_APP_SERVER_IDLE_TTL_MS: "60000",
+      CODEX_MAX_APP_SERVER_SESSIONS: "6",
       BRIDGE_MAX_PENDING_MESSAGES: "12",
       BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "3",
       ATTACHMENT_MAX_COUNT: "2",
@@ -76,6 +80,8 @@ describe("loadConfig", () => {
 
     expect(config).toMatchObject({
       codexMaxConcurrentRuns: 4,
+      codexAppServerIdleTtlMs: 60_000,
+      codexMaxAppServerSessions: 6,
       bridgeMaxPendingMessages: 12,
       bridgeMaxPendingMessagesPerChat: 3,
       attachmentMaxCount: 2,
@@ -131,6 +137,16 @@ describe("loadConfig", () => {
     expect(config.codexApprovalTimeoutMs).toBe(30_000);
   });
 
+  test("allows disabling idle app-server eviction with a zero TTL", () => {
+    const config = loadConfig({
+      FEISHU_APP_ID: "cli_test",
+      FEISHU_APP_SECRET: "secret",
+      CODEX_APP_SERVER_IDLE_TTL_MS: "0",
+    });
+
+    expect(config.codexAppServerIdleTtlMs).toBe(0);
+  });
+
   test("rejects invalid timeout values", () => {
     expect(() =>
       loadConfig({
@@ -148,11 +164,26 @@ describe("loadConfig", () => {
         CODEX_APPROVAL_TIMEOUT_MS: "1.5",
       }),
     ).toThrow();
+    expect(() =>
+      loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_APP_SERVER_IDLE_TTL_MS: "-1",
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_APP_SERVER_IDLE_TTL_MS: "1.5",
+      }),
+    ).toThrow();
   });
 
   test("rejects invalid resource and retention limits", () => {
     const keys = [
       "CODEX_MAX_CONCURRENT_RUNS",
+      "CODEX_MAX_APP_SERVER_SESSIONS",
       "BRIDGE_MAX_PENDING_MESSAGES",
       "BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT",
       "ATTACHMENT_MAX_COUNT",
@@ -187,6 +218,14 @@ describe("loadConfig", () => {
   });
 
   test("rejects inconsistent aggregate limits", () => {
+    expect(() =>
+      loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_MAX_CONCURRENT_RUNS: "4",
+        CODEX_MAX_APP_SERVER_SESSIONS: "3",
+      }),
+    ).toThrow(/CODEX_MAX_CONCURRENT_RUNS/);
     expect(() =>
       loadConfig({
         FEISHU_APP_ID: "cli_test",

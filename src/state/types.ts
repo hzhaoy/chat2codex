@@ -1,4 +1,8 @@
+import { randomUUID } from "node:crypto";
+
 export interface ChatSession {
+  /** Rotated whenever the chat starts or selects a different logical Codex session. */
+  sessionEpoch: string;
   threadId?: string;
   cwd: string;
   chatType?: "direct" | "group";
@@ -8,6 +12,12 @@ export interface ChatSession {
   lastTurns?: TurnSelection[];
   lastRun?: LastRunSummary;
 }
+
+/**
+ * Creates an opaque, non-sensitive identity for one logical chat session.
+ * Runtime app-server handles and permission grants must never be persisted here.
+ */
+export const createSessionEpoch = (): string => randomUUID();
 
 export interface ProjectSelection {
   cwd: string;
@@ -167,6 +177,8 @@ export interface DurableCodexJob {
   chatType: "direct" | "group";
   cwd: string;
   prompt: string;
+  /** Missing on pre-v0.5 state files and therefore treated as default mode. */
+  collaborationMode?: "default" | "plan";
   threadId?: string;
   status: DurableCodexJobStatus;
   createdAt: string;
