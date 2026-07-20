@@ -1,0 +1,59 @@
+src/agent/codex-runner.ts
+  s_bc0331dd4e9203::t_d40e6d58e2dc96 12-18,27-30,115-149,284-293,471-477,480,566-568,590-593,673,678,777-779,789-850,927,988-990,1008-1011,1391-1539,2245-2253
+src/bot/lark-card-action.ts
+  s_74ea039797948f::t_8d7277b35c9684 7-8,27-28,44-46,118-120,147-148
+src/state/store.ts
+  s_38a6644b381f8e::t_6364f473e02949 20-21
+src/state/types.ts
+  s_38a6644b381f8e::t_b9baa3dac75402 143-187,190-191,199-200
+tests/codex-runner.test.ts
+  s_930974385479b7::t_bb962b1b9807ed 484,486,515-994,1010-1022,1045-1048
+tests/lark-card-action.test.ts
+  s_74ea039797948f::t_c131d61e25ef65 154-231
+tests/lark-card.test.ts
+  s_bc0331dd4e9203::t_9cb975085222bc 9,12-13,464-683,909-927
+tests/state-store.test.ts
+  s_38a6644b381f8e::t_54374f66201fa8 17-18,32-33,87-88,117-118,134-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dc51095d6beb34acc9448c2b1a4cf54b147fc695",
+  "prompts": {},
+  "sessions": {
+    "s_38a6644b381f8e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d4d-b011-7833-a9d4-d30f0f211053",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_74ea039797948f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d4d-5182-7a61-8091-a40019b7e741",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_930974385479b7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d4d-32f6-7ed3-9ca6-702d4f5bacc7",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    },
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
