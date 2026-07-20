@@ -39,6 +39,23 @@ const minAppServerJsonLineBytes = 256 * 1_024;
 const maxAppServerJsonLineBytes = 8 * 1_024 * 1_024;
 const truncationMarker = "\n... [truncated]";
 
+class CodexAppServerExitError extends Error {
+  constructor() {
+    super("Codex app-server exited before responding.");
+    this.name = "CodexAppServerExitError";
+  }
+}
+
+class CodexSessionStartupExitError extends Error {
+  constructor(
+    readonly threadId: string | undefined,
+    cause: CodexAppServerExitError,
+  ) {
+    super(cause.message, { cause });
+    this.name = "CodexSessionStartupExitError";
+  }
+}
+
 export interface CodexRunInput {
   prompt: string;
   cwd: string;
@@ -653,6 +670,14 @@ export class CodexRunner {
       return this.runSingleUse(input);
     }
 
+    return this.runReusable(input, cwdKey, true);
+  }
+
+  private async runReusable(
+    input: CodexRunInput,
+    cwdKey: string,
+    allowStartupRetry: boolean,
+  ): Promise<CodexRunResult> {
     let runPromise!: Promise<CodexRunResult>;
     await this.mutateSessions(async () => {
       if (this.disposed) {
@@ -689,7 +714,34 @@ export class CodexRunner {
 
       runPromise = session.run(input);
     });
-    return runPromise;
+    try {
+      return await runPromise;
+    } catch (error) {
+      if (
+        allowStartupRetry &&
+        error instanceof CodexSessionStartupExitError &&
+        !input.signal?.aborted &&
+        !this.disposed
+      ) {
+        const threadId = error.threadId ?? input.threadId;
+        this.logger.warn(
+          "Reusable Codex app-server exited before turn submission; retrying once",
+          {
+            chatId: input.sessionScope?.chatId,
+            threadId,
+          },
+        );
+        return this.runReusable(
+          {
+            ...input,
+            ...(threadId ? { threadId } : {}),
+          },
+          cwdKey,
+          false,
+        );
+      }
+      throw error;
+    }
   }
 
   async invalidateChatSession(chatId: string, reason = "chat_invalidated"): Promise<void> {
@@ -1788,6 +1840,7 @@ interface ScopedRunContext {
   input: CodexRunInput;
   threadId?: string;
   turnId?: string;
+  turnStartSubmitted: boolean;
   finalText: string;
   turnCompleted: boolean;
   turnError: string | null;
@@ -1913,7 +1966,7 @@ class CodexAppServerSession {
     this.child.once("close", (code, signal) => {
       this.dead = true;
       this.abortPendingInteractiveRequests(this.activeRun);
-      this.rejectPendingRequests(new Error("Codex app-server exited before responding."));
+      this.rejectPendingRequests(new CodexAppServerExitError());
       if (this.forceKillTimer) {
         clearTimeout(this.forceKillTimer);
         this.forceKillTimer = null;
@@ -1980,6 +2033,7 @@ class CodexAppServerSession {
       generation: randomUUID(),
       input,
       threadId: this.threadId,
+      turnStartSubmitted: false,
       finalText: "",
       turnCompleted: false,
       turnError: null,
@@ -2097,6 +2151,9 @@ class CodexAppServerSession {
       };
     } catch (error) {
       await this.close("run_failed");
+      if (!context.turnStartSubmitted && error instanceof CodexAppServerExitError) {
+        throw new CodexSessionStartupExitError(context.threadId, error);
+      }
       throw error;
     } finally {
       input.signal?.removeEventListener("abort", context.abortListener);
@@ -2235,7 +2292,7 @@ class CodexAppServerSession {
 
   private sendJson(message: unknown): void {
     if (!this.child.stdin.writable || this.child.stdin.destroyed || !this.isHealthy()) {
-      throw new Error("Codex app-server stdin is not writable.");
+      throw new CodexAppServerExitError();
     }
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
@@ -2251,6 +2308,14 @@ class CodexAppServerSession {
     });
     try {
       this.sendJson({ id: Number(id), method, params });
+      const context = this.activeRun;
+      if (
+        method === "turn/start" &&
+        generation !== undefined &&
+        context?.generation === generation
+      ) {
+        context.turnStartSubmitted = true;
+      }
     } catch (error) {
       this.pendingRequests.delete(id);
       const normalized = error instanceof Error ? error : new Error(String(error));
@@ -2623,6 +2688,7 @@ function createFailClosedRunContext(
     generation: randomUUID(),
     input: { prompt: "", cwd },
     threadId,
+    turnStartSubmitted: false,
     finalText: "",
     turnCompleted: false,
     turnError: null,

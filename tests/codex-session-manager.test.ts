@@ -704,6 +704,51 @@ describe("Codex app-server session manager", () => {
     }
   });
 
+  test("retries once when the app-server exits before turn/start is submitted", async () => {
+    const fixture = await createSessionFakeCodex();
+    const runner = createRunner(fixture.fakeCodex, fixture.tempDir);
+
+    try {
+      const result = await runner.run({
+        prompt: "after-startup-crash",
+        cwd: fixture.tempDir,
+        threadId: "thread_crash_before_turn_start_once",
+        sessionScope: scope(),
+      });
+
+      expect(result.finalText).toBe("done:after-startup-crash");
+      const received = await readMessages(fixture.receivedPath);
+      expect(received.filter(({ message }) => message.method === "initialize")).toHaveLength(2);
+      expect(received.filter(({ message }) => message.method === "thread/resume")).toHaveLength(2);
+      expect(received.filter(({ message }) => message.method === "turn/start")).toHaveLength(1);
+    } finally {
+      await runner.dispose?.();
+      await rm(fixture.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not retry after turn/start has been submitted", async () => {
+    const fixture = await createSessionFakeCodex();
+    const runner = createRunner(fixture.fakeCodex, fixture.tempDir);
+
+    try {
+      await expect(
+        runner.run({
+          prompt: "crash-during-turn-start",
+          cwd: fixture.tempDir,
+          sessionScope: scope(),
+        }),
+      ).rejects.toThrow("Codex app-server exited before responding.");
+
+      const received = await readMessages(fixture.receivedPath);
+      expect(received.filter(({ message }) => message.method === "initialize")).toHaveLength(1);
+      expect(received.filter(({ message }) => message.method === "turn/start")).toHaveLength(1);
+    } finally {
+      await runner.dispose?.();
+      await rm(fixture.tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("dispose terminates idle sessions and rejects later runs", async () => {
     const fixture = await createSessionFakeCodex();
     const runner = createRunner(fixture.fakeCodex, fixture.tempDir);
@@ -820,6 +865,7 @@ const rl = readline.createInterface({ input: process.stdin });
 let turnSeq = 0;
 let activeTurnId;
 let activeThreadId = "thread_shared";
+const crashBeforeTurnStartPath = ${JSON.stringify(path.join(tempDir, "crash-before-turn-start-once"))};
 let sessionPermissionGranted = false;
 let sessionCommandApproved = false;
 const completedTurns = new Set();
@@ -847,6 +893,10 @@ rl.on("line", (line) => {
     activeThreadId = message.method === "thread/resume" && typeof message.params?.threadId === "string"
       ? message.params.threadId
       : "thread_shared";
+    if (activeThreadId === "thread_crash_before_turn_start_once" && !fs.existsSync(crashBeforeTurnStartPath)) {
+      fs.writeFileSync(crashBeforeTurnStartPath, "crashed");
+      process.exit(24);
+    }
     send({ id: message.id, result: { thread: { id: activeThreadId } } });
     return;
   }
@@ -854,6 +904,7 @@ rl.on("line", (line) => {
     turnSeq += 1;
     activeTurnId = "turn_" + turnSeq;
     const prompt = message.params.input[0].text;
+    if (prompt === "crash-during-turn-start") process.exit(25);
     if (prompt === "delayed-turn-start") {
       setTimeout(() => send({ id: message.id, result: { turn: { id: activeTurnId } } }), 50);
       return;

@@ -54,6 +54,12 @@ numbers once releases are published.
   single-use, and transient Codex children before releasing the instance lock;
   queued durable jobs remain available for restart recovery.
 
+### Fixed
+
+- Reusable sessions now restart once when an app-server exits before the next
+  turn is submitted, closing an idle-process exit race without replaying turns
+  that may already have started.
+
 ### Security
 
 - Secret `requestUserInput` questions fail closed because ordinary chat
