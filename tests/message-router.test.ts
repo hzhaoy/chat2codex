@@ -984,6 +984,174 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("bounds concurrent Codex runs globally while preserving workspace scheduling", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex(
+      { CODEX_MAX_CONCURRENT_RUNS: "1" },
+      codex,
+      async ({ router, config, sender }) => {
+        const secondWorkspace = path.join(config.codexWorkdir, "globally-limited-workspace");
+        await mkdir(secondWorkspace);
+        await router.enqueue({
+          messageId: "m_global_limit_cd",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: `/cd ${secondWorkspace}`,
+        });
+
+        const first = router.enqueue({
+          messageId: "m_global_limit_1",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "first globally limited task",
+        });
+        const second = router.enqueue({
+          messageId: "m_global_limit_2",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "second globally limited task",
+        });
+
+        await waitFor(() => codex.runs.length === 1);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(codex.runs).toHaveLength(1);
+
+        await router.enqueue({
+          messageId: "m_global_limit_status",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        expect(sender.messages.at(-1)?.text).toContain("state=waiting_for_global_capacity");
+
+        codex.complete(0, "thread_global_limit_1");
+        await waitFor(() => codex.runs.length === 2);
+        codex.complete(1, "thread_global_limit_2");
+        await Promise.all([first, second]);
+      },
+    );
+  });
+
+  test("rejects excess durable jobs atomically without blocking control commands", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "1",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      async ({ router, config, sender }) => {
+        await router.accept({
+          messageId: "m_capacity_running",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "occupy the only queue slot",
+        });
+        await waitFor(() => codex.runs.length === 1);
+
+        await Promise.all([
+          router.accept({
+            messageId: "m_capacity_rejected_1",
+            chatId: "oc_chat_2",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "must not run one",
+          }),
+          router.accept({
+            messageId: "m_capacity_rejected_2",
+            chatId: "oc_chat_3",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "must not run two",
+          }),
+        ]);
+        await waitFor(
+          () => sender.messages.filter((message) => message.text.includes("队列已满")).length === 2,
+        );
+
+        await router.accept({
+          messageId: "m_capacity_status",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "/status",
+        });
+        await waitFor(() => sender.messages.some((message) => message.text.includes("active_run:")));
+
+        const store = new JsonStateStore(config.bridgeStatePath);
+        const state = await store.load();
+        for (const messageId of ["m_capacity_rejected_1", "m_capacity_rejected_2"]) {
+          expect(state.jobs[messageId]).toMatchObject({
+            status: "cancelled",
+            interruptionReason: "queue_capacity_reached",
+          });
+          expect(state.pendingMessages[messageId]).toBeUndefined();
+          expect(state.processedMessageIds).toContain(messageId);
+          expect(
+            Object.values(state.outbox).find((delivery) => delivery.jobId === messageId)?.status,
+          ).toBe("delivered");
+        }
+        expect(codex.runs).toHaveLength(1);
+
+        codex.complete(0, "thread_capacity_running");
+        await waitForState(store, (saved) => saved.jobs.m_capacity_running?.status === "completed");
+      },
+    );
+  });
+
+  test("applies the pending-job cap per chat without rejecting another chat", async () => {
+    const codex = new ControlledCodex();
+    await withRouterAndCodex(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "3",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      async ({ router, config, sender }) => {
+        await router.accept({
+          messageId: "m_per_chat_running",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "occupy this chat slot",
+        });
+        await waitFor(() => codex.runs.length === 1);
+
+        await router.accept({
+          messageId: "m_per_chat_rejected",
+          chatId: "oc_chat_1",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "same chat should be rejected",
+        });
+        await router.accept({
+          messageId: "m_other_chat_accepted",
+          chatId: "oc_chat_2",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "other chat may queue",
+        });
+        await waitFor(() => sender.messages.some((message) => message.text.includes("队列已满")));
+
+        const store = new JsonStateStore(config.bridgeStatePath);
+        await waitForState(store, (state) => state.jobs.m_other_chat_accepted?.status === "queued");
+        const queued = await store.load();
+        expect(queued.jobs.m_per_chat_rejected?.status).toBe("cancelled");
+        expect(queued.jobs.m_other_chat_accepted?.status).toBe("queued");
+
+        codex.complete(0, "thread_per_chat_running");
+        await waitFor(() => codex.runs.length === 2);
+        codex.complete(1, "thread_other_chat");
+        await waitForState(store, (state) => state.jobs.m_other_chat_accepted?.status === "completed");
+      },
+    );
+  });
+
   test("replays a failed final delivery after restart without rerunning Codex", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-delivery-"));
     let failedRouter: MessageRouter | undefined;

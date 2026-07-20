@@ -212,6 +212,13 @@ interface QueuedRunState {
   chatType?: ChatType;
   originSender?: SenderIdentity;
   queuedAtMs: number;
+  waitingFor: "workspace" | "global_capacity";
+}
+
+interface GlobalRunWaiter {
+  signal: AbortSignal;
+  resolve: (release: (() => void) | null) => void;
+  abortListener: () => void;
 }
 
 interface PendingUserInput {
@@ -254,6 +261,8 @@ export class MessageRouter {
   private readonly activeApprovals = new Map<string, PendingApproval>();
   private readonly activeUserInputs = new Map<string, PendingUserInput>();
   private readonly statusCardRuns = new Map<string, { chatId: string; prompt: string }>();
+  private readonly globalRunWaiters: GlobalRunWaiter[] = [];
+  private activeGlobalRuns = 0;
   private readonly codex: CodexClient;
   private disposed = false;
 
@@ -273,6 +282,10 @@ export class MessageRouter {
       clearTimeout(timer);
     }
     this.outboxRetryTimers.clear();
+    for (const waiter of this.globalRunWaiters.splice(0)) {
+      waiter.signal.removeEventListener("abort", waiter.abortListener);
+      waiter.resolve(null);
+    }
   }
 
   async start(): Promise<void> {
@@ -304,14 +317,41 @@ export class MessageRouter {
       this.scheduleAcceptedMessage(message);
       return;
     }
-    const accepted = await this.mutateState((state) => {
+    const outcome = await this.mutateState((state) => {
       if (state.processedMessageIds.includes(message.messageId)) {
-        return false;
+        return "duplicate" as const;
       }
-      state.pendingMessages[message.messageId] ??= toPendingMessage(message);
-      if (isDurableCodexCandidate(this.config, message) && !state.jobs[message.messageId]) {
+      const durableCandidate = isDurableCodexCandidate(this.config, message);
+      if (durableCandidate && !state.jobs[message.messageId]) {
         const session = this.ensureSession(message.chatId, state, message.chatType);
         const now = new Date().toISOString();
+        if (queueLimitReached(state, message.chatId, this.config)) {
+          const job: DurableCodexJob = {
+            id: message.messageId,
+            kind: "codex_run",
+            messageId: message.messageId,
+            chatId: message.chatId,
+            chatType: message.chatType,
+            cwd: session.cwd,
+            prompt: "[rejected: queue capacity reached]",
+            threadId: session.threadId,
+            status: "cancelled",
+            createdAt: now,
+            updatedAt: now,
+            completedAt: now,
+            deliveryIds: [],
+            interruptionReason: "queue_capacity_reached",
+          };
+          state.jobs[message.messageId] = job;
+          appendOutboxDeliveries(
+            state,
+            job,
+            [{ kind: "text", text: queueCapacityMessage(this.config) }],
+            now,
+          );
+          markMessageProcessed(state, message.messageId);
+          return "rejected" as const;
+        }
         state.jobs[message.messageId] = {
           id: message.messageId,
           kind: "codex_run",
@@ -327,9 +367,14 @@ export class MessageRouter {
           deliveryIds: [],
         };
       }
-      return true;
+      state.pendingMessages[message.messageId] ??= toPendingMessage(message);
+      return "accepted" as const;
     });
-    if (!accepted) {
+    if (outcome === "duplicate") {
+      return;
+    }
+    if (outcome === "rejected") {
+      this.scheduleOutboxDrain(message.messageId);
       return;
     }
     this.scheduleAcceptedMessage(message);
@@ -706,6 +751,7 @@ export class MessageRouter {
       chatType: session.chatType ?? chatType,
       originSender: originSender ? { ...originSender } : undefined,
       queuedAtMs: Date.now(),
+      waitingFor: "workspace",
     };
     this.queuedRuns.set(chatId, queuedRun);
     let workspaceTaskStarted = false;
@@ -762,6 +808,27 @@ export class MessageRouter {
       return;
     }
     await this.store.save(state);
+
+    queuedRun.waitingFor = "global_capacity";
+    const releaseGlobalRun = await this.acquireGlobalRunPermit(queuedRun.controller.signal);
+    if (!releaseGlobalRun) {
+      return;
+    }
+    try {
+      await this.runCodexWithGlobalPermit(chatId, queuedRun);
+    } finally {
+      releaseGlobalRun();
+    }
+  }
+
+  private async runCodexWithGlobalPermit(
+    chatId: string,
+    queuedRun: QueuedRunState,
+  ): Promise<void> {
+    const state = this.requireState();
+    const session = this.ensureSession(chatId, state, queuedRun.chatType);
+    const prompt = queuedRun.prompt;
+    queuedRun.waitingFor = "workspace";
 
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
@@ -1137,6 +1204,62 @@ export class MessageRouter {
         await this.reportUnsentPendingSteers(chatId, runState);
         this.activeRuns.delete(chatId);
       }
+    }
+  }
+
+  private acquireGlobalRunPermit(signal: AbortSignal): Promise<(() => void) | null> {
+    if (signal.aborted || this.disposed) {
+      return Promise.resolve(null);
+    }
+    if (this.activeGlobalRuns < this.config.codexMaxConcurrentRuns) {
+      this.activeGlobalRuns += 1;
+      return Promise.resolve(this.createGlobalRunRelease());
+    }
+
+    return new Promise((resolve) => {
+      const waiter: GlobalRunWaiter = {
+        signal,
+        resolve,
+        abortListener: () => {
+          const index = this.globalRunWaiters.indexOf(waiter);
+          if (index >= 0) {
+            this.globalRunWaiters.splice(index, 1);
+          }
+          signal.removeEventListener("abort", waiter.abortListener);
+          resolve(null);
+        },
+      };
+      signal.addEventListener("abort", waiter.abortListener, { once: true });
+      this.globalRunWaiters.push(waiter);
+    });
+  }
+
+  private createGlobalRunRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.activeGlobalRuns = Math.max(0, this.activeGlobalRuns - 1);
+      this.grantNextGlobalRunPermit();
+    };
+  }
+
+  private grantNextGlobalRunPermit(): void {
+    while (
+      !this.disposed &&
+      this.activeGlobalRuns < this.config.codexMaxConcurrentRuns &&
+      this.globalRunWaiters.length > 0
+    ) {
+      const waiter = this.globalRunWaiters.shift()!;
+      waiter.signal.removeEventListener("abort", waiter.abortListener);
+      if (waiter.signal.aborted) {
+        waiter.resolve(null);
+        continue;
+      }
+      this.activeGlobalRuns += 1;
+      waiter.resolve(this.createGlobalRunRelease());
     }
   }
 
@@ -4207,6 +4330,36 @@ function isTerminalJobStatus(status: DurableCodexJobStatus): boolean {
   return status !== "queued" && status !== "running";
 }
 
+function queueLimitReached(
+  state: BridgeState,
+  chatId: string,
+  config: BridgeConfig,
+): boolean {
+  let total = 0;
+  let forChat = 0;
+  for (const job of Object.values(state.jobs)) {
+    if (isTerminalJobStatus(job.status)) {
+      continue;
+    }
+    total += 1;
+    if (job.chatId === chatId) {
+      forChat += 1;
+    }
+  }
+  return (
+    total >= config.bridgeMaxPendingMessages ||
+    forChat >= config.bridgeMaxPendingMessagesPerChat
+  );
+}
+
+function queueCapacityMessage(config: BridgeConfig): string {
+  return [
+    "Chat2Codex 当前任务队列已满，这条任务没有执行。",
+    `全局最多保留 ${config.bridgeMaxPendingMessages} 条排队或运行任务；每个 chat 最多 ${config.bridgeMaxPendingMessagesPerChat} 条。`,
+    "请等待已有任务结束后重新发送。控制命令和交互回复不受该上限影响。",
+  ].join("\n");
+}
+
 function appendOutboxDeliveries(
   state: BridgeState,
   job: DurableCodexJob,
@@ -4524,7 +4677,7 @@ function formatQueuedRun(run: QueuedRunState | undefined): string {
     return "(none)";
   }
   return [
-    "state=waiting_for_workspace",
+    `state=${run.waitingFor === "global_capacity" ? "waiting_for_global_capacity" : "waiting_for_workspace"}`,
     `age=${formatDuration(Date.now() - run.queuedAtMs)}`,
     `cwd=${run.cwd}`,
     `thread=${run.threadId ?? "(new)"}`,
