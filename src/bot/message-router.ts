@@ -10,6 +10,12 @@ import {
   type CodexApprovalRequest,
   type CodexCommandSummary,
   type CodexForkThreadInput,
+  type CodexMcpElicitationField,
+  type CodexMcpElicitationRequest,
+  type CodexMcpElicitationResponse,
+  type CodexMcpElicitationValue,
+  type CodexPermissionApprovalDecision,
+  type CodexPermissionApprovalRequest,
   CodexRunner,
   type CodexProgressUpdate,
   type CodexRunControl,
@@ -68,6 +74,7 @@ import {
 } from "./attachment-store.js";
 import {
   answerUserInputCardAction,
+  answerMcpElicitationCardAction,
   cancelUserInputCardAction,
   cardActionCard,
   cardActionToast,
@@ -76,6 +83,8 @@ import {
   retryRunCardAction,
   resumeThreadCardAction,
   resolveApprovalCardAction,
+  resolveMcpElicitationCardAction,
+  resolvePermissionApprovalCardAction,
   selectProjectCardAction,
   showRunDetailCardAction,
   stopRunCardAction,
@@ -86,13 +95,21 @@ import {
 import {
   buildApprovalCard,
   buildHostHealthCard,
+  buildMcpElicitationCard,
+  buildPermissionApprovalCard,
   buildProjectListCard,
   buildSessionListCard,
   buildUserInputCard,
+  getMcpElicitationCardOptionValue,
   isApprovalDecisionIndexAllowed,
+  isMcpElicitationCardDecisionAllowed,
+  isMcpElicitationCardSkipAllowed,
+  isPermissionApprovalCardDecisionAllowed,
   type ApprovalCardInput,
   type HostHealthCardInput,
   type LarkInteractiveCard,
+  type McpElicitationCardInput,
+  type PermissionApprovalCardInput,
   type RunResultCardInput,
   type RunStatusCardInput,
   type UserInputCardInput,
@@ -103,6 +120,7 @@ const maxRememberedStatusCards = 100;
 const pendingRunSteerTtlMs = 30_000;
 const maxPendingSteers = 5;
 const maxUserInputAnswerLength = 4_000;
+const maxMcpTextAnswerLength = 16_384;
 const outboxRetryDelaysMs = [250, 1_000, 5_000, 30_000, 120_000] as const;
 const pendingSteerLimitMessage = "已有 5 条补充指令等待发送，请先等当前 Codex 任务接收后再试。";
 
@@ -155,6 +173,22 @@ export interface ChatSender {
   updateApprovalCard?(handle: StatusCardHandle, input: ApprovalCardInput): Promise<void>;
   createUserInputCard?(chatId: string, input: UserInputCardInput): Promise<StatusCardHandle>;
   updateUserInputCard?(handle: StatusCardHandle, input: UserInputCardInput): Promise<void>;
+  createPermissionApprovalCard?(
+    chatId: string,
+    input: PermissionApprovalCardInput,
+  ): Promise<StatusCardHandle>;
+  updatePermissionApprovalCard?(
+    handle: StatusCardHandle,
+    input: PermissionApprovalCardInput,
+  ): Promise<void>;
+  createMcpElicitationCard?(
+    chatId: string,
+    input: McpElicitationCardInput,
+  ): Promise<StatusCardHandle>;
+  updateMcpElicitationCard?(
+    handle: StatusCardHandle,
+    input: McpElicitationCardInput,
+  ): Promise<void>;
 }
 
 export interface ChatDeliveryOptions {
@@ -240,6 +274,34 @@ interface PendingUserInput {
   terminalCard?: UserInputCardInput;
 }
 
+interface PendingPermissionApproval {
+  key: string;
+  chatId: string;
+  originSender: SenderIdentity;
+  request: CodexPermissionApprovalRequest;
+  resolve: (decision: CodexPermissionApprovalDecision) => void;
+  signal: AbortSignal;
+  abortListener: () => void;
+  handle: StatusCardHandle | null;
+  timeoutTimer?: NodeJS.Timeout;
+  terminalCard?: PermissionApprovalCardInput;
+}
+
+interface PendingMcpElicitation {
+  key: string;
+  chatId: string;
+  originSender: SenderIdentity;
+  request: CodexMcpElicitationRequest;
+  replyCode: string;
+  answers: Map<string, CodexMcpElicitationValue>;
+  completedFieldIds: Set<string>;
+  resolve: (response: CodexMcpElicitationResponse) => void;
+  signal: AbortSignal;
+  abortListener: () => void;
+  handle: StatusCardHandle | null;
+  terminalCard?: McpElicitationCardInput;
+}
+
 interface PendingSteer {
   text: string;
 }
@@ -265,6 +327,8 @@ export class MessageRouter {
   private readonly pendingRunSteers = new Map<string, PendingRunSteers>();
   private readonly activeApprovals = new Map<string, PendingApproval>();
   private readonly activeUserInputs = new Map<string, PendingUserInput>();
+  private readonly activePermissionApprovals = new Map<string, PendingPermissionApproval>();
+  private readonly activeMcpElicitations = new Map<string, PendingMcpElicitation>();
   private readonly statusCardRuns = new Map<string, { chatId: string; prompt: string }>();
   private readonly globalRunWaiters: GlobalRunWaiter[] = [];
   private activeGlobalRuns = 0;
@@ -315,8 +379,11 @@ export class MessageRouter {
     if (this.requireState().processedMessageIds.includes(message.messageId)) {
       return;
     }
-    if (!message.attachments?.length && isUserInputAnswerCommand(message)) {
-      // User-input answers can contain secrets or other private values. Keep the
+    if (
+      !message.attachments?.length &&
+      (isUserInputAnswerCommand(message) || isMcpAnswerCommand(message))
+    ) {
+      // Interactive answers can contain private values. Keep the
       // command in memory only; processMessage still persists its message id so
       // successful deliveries remain deduplicated without persisting the answer.
       this.scheduleAcceptedMessage(message);
@@ -433,6 +500,9 @@ export class MessageRouter {
     if (!message.attachments?.length && isUserInputAnswerCommand(message)) {
       return this.handleImmediateUserInputAnswer(message);
     }
+    if (!message.attachments?.length && isMcpAnswerCommand(message)) {
+      return this.handleImmediateMcpAnswer(message);
+    }
 
     return this.enqueueTask(message.chatId, () => this.handle(message));
   }
@@ -488,6 +558,15 @@ export class MessageRouter {
       action.action === cancelUserInputCardAction
     ) {
       return this.handleUserInputCardAction(action);
+    }
+    if (action.action === resolvePermissionApprovalCardAction) {
+      return this.handlePermissionApprovalCardAction(action);
+    }
+    if (
+      action.action === answerMcpElicitationCardAction ||
+      action.action === resolveMcpElicitationCardAction
+    ) {
+      return this.handleMcpElicitationCardAction(action);
     }
     if (action.action === pageProjectsCardAction) {
       return this.handleProjectPageCardAction(action);
@@ -928,6 +1007,20 @@ export class MessageRouter {
             request,
             context.signal,
           ),
+        onMcpElicitationRequest: (request, context) =>
+          this.requestMcpElicitation(
+            chatId,
+            queuedRun.originSender,
+            request,
+            context.signal,
+          ),
+        onPermissionApprovalRequest: (request, context) =>
+          this.requestPermissionApproval(
+            chatId,
+            queuedRun.originSender,
+            request,
+            context.signal,
+          ),
         onRunControl: (control) => {
           runState.threadId = control.threadId ?? runState.threadId;
           runState.turnId = control.turnId;
@@ -1206,6 +1299,8 @@ export class MessageRouter {
       }
       await this.cancelApprovalsForChat(chatId);
       await this.cancelUserInputsForChat(chatId);
+      await this.cancelPermissionApprovalsForChat(chatId);
+      await this.cancelMcpElicitationsForChat(chatId);
       if (this.activeRuns.get(chatId) === runState) {
         await this.reportUnsentPendingSteers(chatId, runState);
         this.activeRuns.delete(chatId);
@@ -1714,6 +1809,10 @@ export class MessageRouter {
     await this.handleImmediateCommand(message, () => this.answerUserInputFromText(message));
   }
 
+  private async handleImmediateMcpAnswer(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.answerMcpElicitationFromText(message));
+  }
+
   private async handleImmediateCommand(
     message: IncomingTextMessage,
     action: () => Promise<unknown>,
@@ -1943,7 +2042,7 @@ export class MessageRouter {
         this.queuedRuns.size > 0
           ? `${this.activeRuns.size} running / ${this.queuedRuns.size} waiting`
           : `${this.activeRuns.size}`,
-      approvalWait: `${this.activeApprovals.size}`,
+      approvalWait: this.formatInteractionWait(),
       codexBin: this.config.codexBin,
       codexVersion: codex.version,
       defaultCwd: this.config.codexWorkdir,
@@ -1972,8 +2071,52 @@ export class MessageRouter {
       `approval_wait: ${formatApprovalWait(
         [...this.activeApprovals.values()].filter((approval) => approval.chatId === chatId),
       )}`,
+      `interaction_wait: ${this.formatInteractionWait(chatId)}`,
       ...formatRecentFailureStatusLines(diagnostics.recentFailures),
     ];
+  }
+
+  private formatInteractionWait(chatId?: string): string {
+    const inChat = <T extends { chatId: string }>(values: Iterable<T>): number =>
+      [...values].filter((value) => chatId === undefined || value.chatId === chatId).length;
+    return [
+      `approval=${inChat(this.activeApprovals.values())}`,
+      `user_input=${inChat(this.activeUserInputs.values())}`,
+      `permission=${inChat(this.activePermissionApprovals.values())}`,
+      `mcp=${inChat(this.activeMcpElicitations.values())}`,
+    ].join(" ");
+  }
+
+  private interactionLimitReached(chatId: string): boolean {
+    const collections: Array<Iterable<{ chatId: string }>> = [
+      this.activeApprovals.values(),
+      this.activeUserInputs.values(),
+      this.activePermissionApprovals.values(),
+      this.activeMcpElicitations.values(),
+    ];
+    let total = 0;
+    let forChat = 0;
+    for (const collection of collections) {
+      for (const pending of collection) {
+        total += 1;
+        if (pending.chatId === chatId) {
+          forChat += 1;
+        }
+      }
+    }
+    return (
+      total >= this.config.bridgeMaxPendingMessages ||
+      forChat >= this.config.bridgeMaxPendingMessagesPerChat
+    );
+  }
+
+  private warnInteractionLimit(chatId: string, kind: string): void {
+    this.logger.warn("Rejected interactive request at the pending interaction limit", {
+      chatId,
+      kind,
+      maxPending: this.config.bridgeMaxPendingMessages,
+      maxPendingPerChat: this.config.bridgeMaxPendingMessagesPerChat,
+    });
   }
 
   private formatDiagnosticStatusLines(chatId: string, state: BridgeState): string[] {
@@ -2629,6 +2772,10 @@ export class MessageRouter {
       );
       return { answers: {} };
     }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "request_user_input");
+      return { answers: {} };
+    }
 
     return new Promise<CodexUserInputResponse>((resolve) => {
       let pending!: PendingUserInput;
@@ -2654,6 +2801,10 @@ export class MessageRouter {
       };
       this.activeUserInputs.set(key, pending);
       signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) {
+        abortListener();
+        return;
+      }
       void this.presentUserInputRequest(pending);
     });
   }
@@ -2865,6 +3016,536 @@ export class MessageRouter {
       code = randomUUID().replaceAll("-", "").slice(0, 8).toLowerCase();
     } while (
       [...this.activeUserInputs.values()].some(
+        (pending) => pending.replyCode.toLowerCase() === code,
+      )
+    );
+    return code;
+  }
+
+  private async handlePermissionApprovalCardAction(
+    action: IncomingCardAction,
+  ): Promise<CardActionResponse> {
+    if (!action.requestId || !isPermissionApprovalDecision(action.decision)) {
+      return cardActionToast("warning", "无法处理权限请求：缺少请求上下文。");
+    }
+    const pending = this.activePermissionApprovals.get(
+      interactiveRequestKey(action.chatId, action.requestId),
+    );
+    if (!pending) {
+      return cardActionToast("warning", "无法处理权限请求：请求已结束或已失效。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以处理这条权限请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      pending.handle.messageId !== action.messageId
+    ) {
+      return cardActionToast("warning", "无法处理权限请求：卡片上下文不匹配。");
+    }
+    if (!isPermissionApprovalCardDecisionAllowed(pending.request, action.decision)) {
+      return cardActionToast("warning", "权限详情未能完整验证，不能执行这项授权。");
+    }
+
+    const status = action.decision === "deny" ? "declined" : "resolved";
+    const input = this.finishPendingPermissionApproval(pending, status, action.decision);
+    await this.updatePermissionApprovalCard(pending.handle, input);
+    return cardActionCard(buildPermissionApprovalCard(input));
+  }
+
+  private async requestPermissionApproval(
+    chatId: string,
+    originSender: SenderIdentity | undefined,
+    request: CodexPermissionApprovalRequest,
+    signal: AbortSignal,
+  ): Promise<CodexPermissionApprovalDecision> {
+    if (signal.aborted) {
+      return "deny";
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已拒绝这次额外权限请求。",
+      );
+      return "deny";
+    }
+    const key = interactiveRequestKey(chatId, request.id);
+    if (this.activePermissionApprovals.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的额外权限请求；为避免授权错配，已拒绝后到请求。",
+      );
+      return "deny";
+    }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "permission_approval");
+      return "deny";
+    }
+
+    return new Promise<CodexPermissionApprovalDecision>((resolve) => {
+      let pending!: PendingPermissionApproval;
+      const abortListener = () => {
+        if (this.activePermissionApprovals.get(key) !== pending) {
+          return;
+        }
+        const input = this.finishPendingPermissionApproval(pending, "expired", "deny");
+        void this.updatePermissionApprovalCard(pending.handle, input);
+      };
+      pending = {
+        key,
+        chatId,
+        originSender: { ...originSender },
+        request,
+        resolve,
+        signal,
+        abortListener,
+        handle: null,
+      };
+      if (this.config.codexApprovalTimeoutMs > 0) {
+        pending.timeoutTimer = setTimeout(() => {
+          if (this.activePermissionApprovals.get(key) !== pending) {
+            return;
+          }
+          const input = this.finishPendingPermissionApproval(pending, "expired", "deny");
+          void this.updatePermissionApprovalCard(pending.handle, input);
+        }, this.config.codexApprovalTimeoutMs);
+        pending.timeoutTimer.unref?.();
+      }
+      this.activePermissionApprovals.set(key, pending);
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) {
+        abortListener();
+        return;
+      }
+      void this.presentPermissionApproval(pending);
+    });
+  }
+
+  private finishPendingPermissionApproval(
+    pending: PendingPermissionApproval,
+    status: PermissionApprovalCardInput["status"],
+    decision: CodexPermissionApprovalDecision,
+  ): PermissionApprovalCardInput {
+    if (this.activePermissionApprovals.get(pending.key) === pending) {
+      this.activePermissionApprovals.delete(pending.key);
+    }
+    if (pending.timeoutTimer) {
+      clearTimeout(pending.timeoutTimer);
+    }
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    const input: PermissionApprovalCardInput = {
+      status,
+      request: pending.request,
+      ...(status === "resolved" || status === "declined" ? { decision } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    pending.terminalCard = input;
+    pending.resolve(decision);
+    return input;
+  }
+
+  private async presentPermissionApproval(pending: PendingPermissionApproval): Promise<void> {
+    if (!this.sender.createPermissionApprovalCard || !this.sender.updatePermissionApprovalCard) {
+      await this.sendUserInputTextSafely(
+        pending.chatId,
+        "当前聊天适配器不能安全展示额外权限详情，已拒绝这次请求。",
+      );
+      if (this.activePermissionApprovals.get(pending.key) === pending) {
+        this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+      }
+      return;
+    }
+    try {
+      const handle = await this.sender.createPermissionApprovalCard(pending.chatId, {
+        status: "pending",
+        request: pending.request,
+        updatedAt: new Date().toISOString(),
+      });
+      if (this.activePermissionApprovals.get(pending.key) === pending) {
+        pending.handle = handle;
+        return;
+      }
+      if (pending.terminalCard) {
+        await this.updatePermissionApprovalCard(handle, pending.terminalCard);
+      }
+    } catch (error) {
+      this.logger.warn("Permission approval card creation failed; denying", error);
+      if (this.activePermissionApprovals.get(pending.key) === pending) {
+        await this.sendUserInputTextSafely(
+          pending.chatId,
+          "额外权限审批卡发送失败，已按安全策略拒绝这次请求。",
+        );
+        this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+      }
+    }
+  }
+
+  private async updatePermissionApprovalCard(
+    handle: StatusCardHandle | null,
+    input: PermissionApprovalCardInput,
+  ): Promise<boolean> {
+    if (!handle || !this.sender.updatePermissionApprovalCard) {
+      return false;
+    }
+    try {
+      await this.sender.updatePermissionApprovalCard(handle, input);
+      return true;
+    } catch (error) {
+      this.logger.warn("Permission approval card update failed", error);
+      return false;
+    }
+  }
+
+  private async cancelPermissionApprovalsForChat(chatId: string): Promise<void> {
+    for (const pending of [...this.activePermissionApprovals.values()]) {
+      if (pending.chatId !== chatId || this.activePermissionApprovals.get(pending.key) !== pending) {
+        continue;
+      }
+      const input = this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+      await this.updatePermissionApprovalCard(pending.handle, input);
+    }
+  }
+
+  private async handleMcpElicitationCardAction(
+    action: IncomingCardAction,
+  ): Promise<CardActionResponse> {
+    if (!action.requestId) {
+      return cardActionToast("warning", "无法处理 MCP 请求：缺少请求上下文。");
+    }
+    const pending = this.activeMcpElicitations.get(
+      interactiveRequestKey(action.chatId, action.requestId),
+    );
+    if (!pending) {
+      return cardActionToast("warning", "无法处理 MCP 请求：请求已结束或已失效。");
+    }
+    if (!sameStableSenderIdentity(pending.originSender, action.sender)) {
+      return cardActionToast("error", "只有发起当前 Codex 任务的用户可以回答这条 MCP 请求。");
+    }
+    if (
+      !pending.handle ||
+      !action.messageId ||
+      pending.handle.messageId !== action.messageId
+    ) {
+      return cardActionToast("warning", "无法处理 MCP 请求：卡片上下文不匹配。");
+    }
+
+    if (action.action === answerMcpElicitationCardAction) {
+      if (pending.request.mode !== "form" || !action.fieldId) {
+        return cardActionToast("warning", "无法处理 MCP 回答：字段上下文无效。");
+      }
+      const cardInput = this.mcpElicitationCardInput(pending, "pending");
+      if (action.decision === "skip") {
+        if (!isMcpElicitationCardSkipAllowed(cardInput, action.fieldId)) {
+          return cardActionToast("warning", "这个 MCP 字段不能跳过，或当前字段已经变化。");
+        }
+        pending.completedFieldIds.add(action.fieldId);
+      } else {
+        if (action.optionIndex === undefined) {
+          return cardActionToast("warning", "无法处理 MCP 回答：选项上下文无效。");
+        }
+        const value = getMcpElicitationCardOptionValue(
+          cardInput,
+          action.fieldId,
+          action.optionIndex,
+        );
+        if (value === undefined) {
+          return cardActionToast("warning", "MCP 选项已失效，或当前字段已经变化。");
+        }
+        pending.answers.set(action.fieldId, value);
+        pending.completedFieldIds.add(action.fieldId);
+      }
+      const updated = this.mcpElicitationCardInput(pending, "pending");
+      await this.updateMcpElicitationCard(pending.handle, updated);
+      return cardActionCard(buildMcpElicitationCard(updated));
+    }
+
+    if (!isMcpResolutionDecision(action.decision)) {
+      return cardActionToast("warning", "无法处理 MCP 请求：缺少处理决定。");
+    }
+    const cardInput = this.mcpElicitationCardInput(pending, "pending");
+    if (!isMcpElicitationCardDecisionAllowed(cardInput, action.decision)) {
+      return cardActionToast("warning", "MCP 请求未完整验证，不能执行这项操作。");
+    }
+    const response: CodexMcpElicitationResponse =
+      action.decision === "accept"
+        ? pending.request.mode === "form"
+          ? { action: "accept", content: mcpElicitationContent(pending) }
+          : { action: "accept", content: null }
+        : { action: action.decision };
+    const status =
+      action.decision === "accept"
+        ? "resolved"
+        : action.decision === "decline"
+          ? "declined"
+          : "cancelled";
+    const terminal = this.finishPendingMcpElicitation(pending, status, response);
+    await this.updateMcpElicitationCard(pending.handle, terminal);
+    return cardActionCard(buildMcpElicitationCard(terminal));
+  }
+
+  private async requestMcpElicitation(
+    chatId: string,
+    originSender: SenderIdentity | undefined,
+    request: CodexMcpElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<CodexMcpElicitationResponse> {
+    if (signal.aborted) {
+      return { action: "cancel" };
+    }
+    if (!originSender || !hasStableSenderIdentity(originSender)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "无法确认原始请求人的稳定身份，已取消这次 MCP elicitation。",
+      );
+      return { action: "cancel" };
+    }
+    if (
+      request.mode === "form" &&
+      request.fields.some((field) => isSensitiveMcpInputField(field))
+    ) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "这次 MCP 表单包含 secret/password-like 字段；聊天通道不能安全采集或展示，已取消请求。",
+      );
+      return { action: "cancel" };
+    }
+    const key = interactiveRequestKey(chatId, request.id);
+    if (this.activeMcpElicitations.has(key)) {
+      await this.sendUserInputTextSafely(
+        chatId,
+        "收到重复的 MCP elicitation；为避免回答错配，已取消后到请求。",
+      );
+      return { action: "cancel" };
+    }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "mcp_elicitation");
+      return { action: "cancel" };
+    }
+
+    return new Promise<CodexMcpElicitationResponse>((resolve) => {
+      let pending!: PendingMcpElicitation;
+      const abortListener = () => {
+        if (this.activeMcpElicitations.get(key) !== pending) {
+          return;
+        }
+        const input = this.finishPendingMcpElicitation(
+          pending,
+          "expired",
+          { action: "cancel" },
+        );
+        void this.updateMcpElicitationCard(pending.handle, input);
+      };
+      pending = {
+        key,
+        chatId,
+        originSender: { ...originSender },
+        request,
+        replyCode: this.createMcpReplyCode(),
+        answers: new Map(),
+        completedFieldIds: new Set(),
+        resolve,
+        signal,
+        abortListener,
+        handle: null,
+      };
+      this.activeMcpElicitations.set(key, pending);
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) {
+        abortListener();
+        return;
+      }
+      void this.presentMcpElicitation(pending);
+    });
+  }
+
+  private async answerMcpElicitationFromText(message: IncomingTextMessage): Promise<void> {
+    const command = parseMcpAnswerCommand(routedText(message));
+    if (!command) {
+      await this.sender.sendText(
+        message.chatId,
+        "用法：/mcp-answer <replyCode> <fieldId> <内容>",
+      );
+      return;
+    }
+    const pending = [...this.activeMcpElicitations.values()].find(
+      (candidate) =>
+        candidate.chatId === message.chatId &&
+        candidate.replyCode.toLowerCase() === command.replyCode.toLowerCase(),
+    );
+    if (!pending) {
+      await this.sender.sendText(message.chatId, "回复码无效，或这条 MCP 请求已经结束。");
+      return;
+    }
+    if (!sameStableSenderIdentity(pending.originSender, message.sender)) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起当前 Codex 任务的用户可以回答这条 MCP 请求。",
+      );
+      return;
+    }
+    if (pending.request.mode !== "form") {
+      await this.sender.sendText(message.chatId, "URL 型 MCP 请求只能通过原始卡片处理。");
+      return;
+    }
+    const field = nextMcpElicitationField(pending);
+    if (!field || field.name !== command.fieldId) {
+      await this.sender.sendText(
+        message.chatId,
+        "MCP 当前字段已经变化；请按最新卡片或提示中的 fieldId 重试。",
+      );
+      return;
+    }
+    if (isSensitiveMcpInputField(field)) {
+      await this.sender.sendText(
+        message.chatId,
+        "这个字段看起来包含 secret/password；聊天中不会接收该值。",
+      );
+      return;
+    }
+    if (command.answer === "/skip" && !field.required) {
+      pending.completedFieldIds.add(field.name);
+    } else {
+      const parsed = parseMcpTextAnswer(field, command.answer);
+      if (!parsed.ok) {
+        await this.sender.sendText(message.chatId, parsed.message);
+        return;
+      }
+      pending.answers.set(field.name, parsed.value);
+      pending.completedFieldIds.add(field.name);
+    }
+
+    const nextField = nextMcpElicitationField(pending);
+    if (!nextField) {
+      const terminal = this.finishPendingMcpElicitation(
+        pending,
+        "resolved",
+        { action: "accept", content: mcpElicitationContent(pending) },
+      );
+      await this.updateMcpElicitationCard(pending.handle, terminal);
+      await this.sendUserInputTextSafely(
+        message.chatId,
+        "已把 MCP 表单提交给 Codex（回答内容不会在聊天中回显）。",
+      );
+      return;
+    }
+
+    const input = this.mcpElicitationCardInput(pending, "pending");
+    await this.updateMcpElicitationCard(pending.handle, input);
+    await this.sendUserInputTextSafely(message.chatId, formatMcpTextPrompt(pending));
+  }
+
+  private mcpElicitationCardInput(
+    pending: PendingMcpElicitation,
+    status: McpElicitationCardInput["status"],
+  ): McpElicitationCardInput {
+    return {
+      status,
+      request: pending.request,
+      updatedAt: new Date().toISOString(),
+      ...(pending.request.mode === "form" ? { replyCode: pending.replyCode } : {}),
+      ...(status === "pending" || status === "resolved"
+        ? { answeredFieldIds: [...pending.completedFieldIds] }
+        : {}),
+    };
+  }
+
+  private finishPendingMcpElicitation(
+    pending: PendingMcpElicitation,
+    status: McpElicitationCardInput["status"],
+    response: CodexMcpElicitationResponse,
+  ): McpElicitationCardInput {
+    if (this.activeMcpElicitations.get(pending.key) === pending) {
+      this.activeMcpElicitations.delete(pending.key);
+    }
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    const input = this.mcpElicitationCardInput(pending, status);
+    pending.terminalCard = input;
+    pending.resolve(response);
+    return input;
+  }
+
+  private async presentMcpElicitation(pending: PendingMcpElicitation): Promise<void> {
+    if (!this.sender.createMcpElicitationCard || !this.sender.updateMcpElicitationCard) {
+      await this.presentMcpTextFallback(pending);
+      return;
+    }
+    try {
+      const handle = await this.sender.createMcpElicitationCard(
+        pending.chatId,
+        this.mcpElicitationCardInput(pending, "pending"),
+      );
+      if (this.activeMcpElicitations.get(pending.key) === pending) {
+        pending.handle = handle;
+        return;
+      }
+      if (pending.terminalCard) {
+        await this.updateMcpElicitationCard(handle, pending.terminalCard);
+      }
+    } catch (error) {
+      this.logger.warn("MCP elicitation card creation failed", error);
+      if (this.activeMcpElicitations.get(pending.key) === pending) {
+        await this.presentMcpTextFallback(pending);
+      }
+    }
+  }
+
+  private async presentMcpTextFallback(pending: PendingMcpElicitation): Promise<void> {
+    if (pending.request.mode !== "form" || !nextMcpElicitationField(pending)) {
+      await this.sendUserInputTextSafely(
+        pending.chatId,
+        "当前聊天适配器不能安全展示这次 MCP 请求，已取消。",
+      );
+      if (this.activeMcpElicitations.get(pending.key) === pending) {
+        this.finishPendingMcpElicitation(pending, "cancelled", { action: "cancel" });
+      }
+      return;
+    }
+    const delivered = await this.sendUserInputTextSafely(
+      pending.chatId,
+      formatMcpTextPrompt(pending),
+    );
+    if (!delivered && this.activeMcpElicitations.get(pending.key) === pending) {
+      this.finishPendingMcpElicitation(pending, "cancelled", { action: "cancel" });
+    }
+  }
+
+  private async updateMcpElicitationCard(
+    handle: StatusCardHandle | null,
+    input: McpElicitationCardInput,
+  ): Promise<boolean> {
+    if (!handle || !this.sender.updateMcpElicitationCard) {
+      return false;
+    }
+    try {
+      await this.sender.updateMcpElicitationCard(handle, input);
+      return true;
+    } catch (error) {
+      this.logger.warn("MCP elicitation card update failed", error);
+      return false;
+    }
+  }
+
+  private async cancelMcpElicitationsForChat(chatId: string): Promise<void> {
+    for (const pending of [...this.activeMcpElicitations.values()]) {
+      if (pending.chatId !== chatId || this.activeMcpElicitations.get(pending.key) !== pending) {
+        continue;
+      }
+      const input = this.finishPendingMcpElicitation(
+        pending,
+        "cancelled",
+        { action: "cancel" },
+      );
+      await this.updateMcpElicitationCard(pending.handle, input);
+    }
+  }
+
+  private createMcpReplyCode(): string {
+    let code = "";
+    do {
+      code = randomUUID().replaceAll("-", "").slice(0, 8).toLowerCase();
+    } while (
+      [...this.activeMcpElicitations.values()].some(
         (pending) => pending.replyCode.toLowerCase() === code,
       )
     );
@@ -3138,6 +3819,10 @@ export class MessageRouter {
     startedAt: string,
   ): Promise<CodexApprovalDecision> {
     if (signal.aborted) {
+      return "cancel";
+    }
+    if (this.interactionLimitReached(chatId)) {
+      this.warnInteractionLimit(chatId, "approval");
       return "cancel";
     }
 
@@ -4395,6 +5080,8 @@ function isBuiltInRouterCommand(text: string): boolean {
     text.startsWith("/steer ") ||
     text === "/answer" ||
     text.startsWith("/answer ") ||
+    text === "/mcp-answer" ||
+    text.startsWith("/mcp-answer ") ||
     text === "/project" ||
     text.startsWith("/project ") ||
     text === "/history" ||
@@ -4571,6 +5258,11 @@ function isUserInputAnswerCommand(message: IncomingTextMessage): boolean {
   return text === "/answer" || text.startsWith("/answer ");
 }
 
+function isMcpAnswerCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/mcp-answer" || text.startsWith("/mcp-answer ");
+}
+
 function parseUserInputAnswerCommand(
   text: string,
 ): { replyCode: string; answer: string } | null {
@@ -4589,6 +5281,290 @@ function parseUserInputAnswerCommand(
 
 function userInputKey(chatId: string, requestId: string): string {
   return `${chatId}\u0000${requestId}`;
+}
+
+interface ParsedMcpAnswerCommand {
+  replyCode: string;
+  fieldId: string;
+  answer: string;
+}
+
+function parseMcpAnswerCommand(text: string): ParsedMcpAnswerCommand | null {
+  if (!text.startsWith("/mcp-answer ")) {
+    return null;
+  }
+  const rest = text.slice("/mcp-answer".length).trim();
+  const separator = rest.search(/\s/u);
+  if (separator <= 0) {
+    return null;
+  }
+  const replyCode = rest.slice(0, separator);
+  const fieldAndAnswer = rest.slice(separator).trimStart();
+  if (!/^[a-f0-9]{8}$/u.test(replyCode) || !fieldAndAnswer) {
+    return null;
+  }
+  let fieldId = "";
+  let answerText = "";
+  if (fieldAndAnswer.startsWith('"')) {
+    const token = parseJsonStringToken(fieldAndAnswer);
+    if (!token) {
+      return null;
+    }
+    fieldId = token.value;
+    answerText = token.rest;
+  } else {
+    const fieldSeparator = fieldAndAnswer.search(/\s/u);
+    if (fieldSeparator <= 0) {
+      return null;
+    }
+    fieldId = fieldAndAnswer.slice(0, fieldSeparator);
+    answerText = fieldAndAnswer.slice(fieldSeparator);
+  }
+  const answer = answerText.trim();
+  if (!fieldId || fieldId.length > 128 || !answer || answer.length > maxMcpTextAnswerLength) {
+    return null;
+  }
+  return { replyCode, fieldId, answer };
+}
+
+function parseJsonStringToken(text: string): { value: string; rest: string } | null {
+  let escaped = false;
+  for (let index = 1; index < text.length; index += 1) {
+    const character = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character !== '"') {
+      continue;
+    }
+    const token = text.slice(0, index + 1);
+    const rest = text.slice(index + 1);
+    if (!/^\s/u.test(rest)) {
+      return null;
+    }
+    try {
+      const value: unknown = JSON.parse(token);
+      return typeof value === "string" ? { value, rest } : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function interactiveRequestKey(chatId: string, requestId: string): string {
+  return `${chatId}\u0000${requestId}`;
+}
+
+function isPermissionApprovalDecision(
+  value: unknown,
+): value is CodexPermissionApprovalDecision {
+  return value === "deny" || value === "grantTurn" || value === "grantSession";
+}
+
+function isMcpResolutionDecision(
+  value: unknown,
+): value is "accept" | "decline" | "cancel" {
+  return value === "accept" || value === "decline" || value === "cancel";
+}
+
+function nextMcpElicitationField(
+  pending: PendingMcpElicitation,
+): CodexMcpElicitationField | undefined {
+  return pending.request.mode === "form"
+    ? pending.request.fields.find((field) => !pending.completedFieldIds.has(field.name))
+    : undefined;
+}
+
+function mcpElicitationContent(
+  pending: PendingMcpElicitation,
+): Record<string, CodexMcpElicitationValue> {
+  if (pending.request.mode !== "form") {
+    return {};
+  }
+  return Object.fromEntries(
+    pending.request.fields.flatMap((field) => {
+      const value = pending.answers.get(field.name);
+      return value === undefined
+        ? []
+        : [[field.name, Array.isArray(value) ? [...value] : value] as const];
+    }),
+  );
+}
+
+function isSensitiveMcpInputField(field: CodexMcpElicitationField): boolean {
+  const sensitive = (value: string): boolean =>
+    /(?:password|passwd|secret|token|api[\s_-]*key|credential|private[\s_-]*key)/iu.test(value);
+  if (sensitive(`${field.name} ${field.title ?? ""}`)) {
+    return true;
+  }
+  return (
+    (field.type === "enum" || field.type === "multi_select") &&
+    field.options.some((option) => sensitive(`${option.title} ${option.value}`))
+  );
+}
+
+type ParsedMcpTextAnswer =
+  | { ok: true; value: CodexMcpElicitationValue }
+  | { ok: false; message: string };
+
+function parseMcpTextAnswer(
+  field: CodexMcpElicitationField,
+  raw: string,
+): ParsedMcpTextAnswer {
+  if (!raw || raw.length > maxMcpTextAnswerLength) {
+    return { ok: false, message: "MCP 回答为空或超过聊天输入上限。" };
+  }
+  if (field.type === "string") {
+    const decoded = decodeMcpStringAnswer(raw);
+    if (!decoded.ok) {
+      return decoded;
+    }
+    const value = decoded.value;
+    if (
+      value.length > 4_096 ||
+      (field.minLength !== null && value.length < field.minLength) ||
+      (field.maxLength !== null && value.length > field.maxLength)
+    ) {
+      return { ok: false, message: "MCP 文本回答不符合字段长度约束。" };
+    }
+    if (field.format === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)) {
+      return { ok: false, message: "MCP 回答必须是有效的邮箱地址。" };
+    }
+    if (field.format === "uri") {
+      try {
+        if (new URL(value).protocol.length <= 1) {
+          return { ok: false, message: "MCP 回答必须是有效的 URI。" };
+        }
+      } catch {
+        return { ok: false, message: "MCP 回答必须是有效的 URI。" };
+      }
+    }
+    if (
+      field.format === "date" &&
+      (!/^\d{4}-\d{2}-\d{2}$/u.test(value) || Number.isNaN(Date.parse(`${value}T00:00:00Z`)))
+    ) {
+      return { ok: false, message: "MCP 回答必须是 YYYY-MM-DD 日期。" };
+    }
+    if (
+      field.format === "date-time" &&
+      (!/^\d{4}-\d{2}-\d{2}T/u.test(value) || Number.isNaN(Date.parse(value)))
+    ) {
+      return { ok: false, message: "MCP 回答必须是有效的 ISO 日期时间。" };
+    }
+    return { ok: true, value };
+  }
+  if (field.type === "number" || field.type === "integer") {
+    const value = Number(raw);
+    if (
+      !Number.isFinite(value) ||
+      (field.type === "integer" && !Number.isSafeInteger(value)) ||
+      (field.minimum !== null && value < field.minimum) ||
+      (field.maximum !== null && value > field.maximum)
+    ) {
+      return { ok: false, message: "MCP 数值回答不符合字段类型或范围约束。" };
+    }
+    return { ok: true, value };
+  }
+  if (field.type === "boolean") {
+    const value = raw.toLowerCase();
+    if (value !== "true" && value !== "false") {
+      return { ok: false, message: "MCP 布尔回答只能是 true 或 false。" };
+    }
+    return { ok: true, value: value === "true" };
+  }
+  if (field.type === "enum") {
+    const decoded = decodeMcpStringAnswer(raw);
+    if (!decoded.ok) {
+      return decoded;
+    }
+    const direct = field.options.find((option) => option.value === decoded.value);
+    if (direct) {
+      return { ok: true, value: direct.value };
+    }
+    const byTitle = field.options.filter((option) => option.title === decoded.value);
+    return byTitle.length === 1
+      ? { ok: true, value: byTitle[0]!.value }
+      : { ok: false, message: "MCP 回答必须与一个枚举值或唯一标题完全一致。" };
+  }
+
+  let values: unknown;
+  try {
+    values = JSON.parse(raw);
+  } catch {
+    return { ok: false, message: "MCP 多选回答必须是 JSON 字符串数组。" };
+  }
+  const allowed = new Set(field.options.map((option) => option.value));
+  if (
+    !Array.isArray(values) ||
+    !values.every((value) => typeof value === "string") ||
+    new Set(values).size !== values.length ||
+    (field.minItems !== null && values.length < field.minItems) ||
+    (field.maxItems !== null && values.length > field.maxItems) ||
+    !values.every((value) => allowed.has(value))
+  ) {
+    return { ok: false, message: "MCP 多选回答包含无效、重复或超出数量约束的选项。" };
+  }
+  return { ok: true, value: [...values] };
+}
+
+function decodeMcpStringAnswer(
+  raw: string,
+): { ok: true; value: string } | { ok: false; message: string } {
+  if (!raw.startsWith('"')) {
+    return { ok: true, value: raw };
+  }
+  try {
+    const value: unknown = JSON.parse(raw);
+    return typeof value === "string"
+      ? { ok: true, value }
+      : { ok: false, message: "MCP 字符串回答的 JSON 引号格式无效。" };
+  } catch {
+    return { ok: false, message: "MCP 字符串回答的 JSON 引号格式无效。" };
+  }
+}
+
+function formatMcpTextPrompt(pending: PendingMcpElicitation): string {
+  const field = nextMcpElicitationField(pending);
+  if (!field) {
+    return "这条 MCP elicitation 已经结束。";
+  }
+  const sensitive = isSensitiveMcpInputField(field);
+  const options =
+    !sensitive && (field.type === "enum" || field.type === "multi_select")
+      ? field.options.map((option) =>
+          option.title === option.value
+            ? `- ${truncateInline(option.value, 256)}`
+            : `- ${truncateInline(option.title, 160)} (${truncateInline(option.value, 256)})`,
+        )
+      : !sensitive && field.type === "boolean"
+        ? ["- true", "- false"]
+        : [];
+  return [
+    "Codex 正在等待 MCP 结构化输入。",
+    `${truncateInline(field.title ?? field.name, 160)}（fieldId: ${truncateInline(field.name, 128)}，type: ${field.type}，${field.required ? "必填" : "可选"}）`,
+    field.description ? truncateDetail(field.description, 500) : null,
+    ...options,
+    sensitive ? "这个字段看起来包含 secret/password；聊天中不会提供输入入口。" : null,
+    !sensitive && field.type === "multi_select" ? "多选值请使用 JSON 字符串数组。" : null,
+    !field.required
+      ? `发送 /mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} /skip 跳过这个字段。`
+      : null,
+    !sensitive
+      ? `发送 /mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} <内容> 回答当前字段。`
+      : null,
+    !field.required && (field.type === "string" || field.type === "enum")
+      ? '若实际值就是 /skip，请把值写成 JSON 字符串 "/skip"。'
+      : null,
+    "回答内容不会在聊天中回显，也不会写入 Chat2Codex 持久化状态。",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 function hasStableSenderIdentity(sender: SenderIdentity): boolean {

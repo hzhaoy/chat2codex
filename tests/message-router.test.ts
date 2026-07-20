@@ -7,6 +7,10 @@ import { describe, expect, test } from "bun:test";
 import type {
   CodexApprovalDecision,
   CodexApprovalRequest,
+  CodexMcpElicitationRequest,
+  CodexMcpElicitationResponse,
+  CodexPermissionApprovalDecision,
+  CodexPermissionApprovalRequest,
   CodexRunControl,
   CodexProgressUpdate,
   CodexRunInput,
@@ -29,6 +33,8 @@ import type {
 import type {
   ApprovalCardInput,
   LarkInteractiveCard,
+  McpElicitationCardInput,
+  PermissionApprovalCardInput,
   RunStatusCardInput,
   UserInputCardInput,
 } from "../src/bot/lark-card.js";
@@ -159,6 +165,24 @@ class CardCollectingSender extends CollectingSender {
     handle: StatusCardHandle;
     input: UserInputCardInput;
   }> = [];
+  readonly permissionApprovalCards: Array<{
+    chatId: string;
+    input: PermissionApprovalCardInput;
+    handle: StatusCardHandle;
+  }> = [];
+  readonly permissionApprovalCardUpdates: Array<{
+    handle: StatusCardHandle;
+    input: PermissionApprovalCardInput;
+  }> = [];
+  readonly mcpElicitationCards: Array<{
+    chatId: string;
+    input: McpElicitationCardInput;
+    handle: StatusCardHandle;
+  }> = [];
+  readonly mcpElicitationCardUpdates: Array<{
+    handle: StatusCardHandle;
+    input: McpElicitationCardInput;
+  }> = [];
 
   async createStatusCard(chatId: string, input: RunStatusCardInput): Promise<StatusCardHandle> {
     const handle = { messageId: `om_${this.cards.length + 1}` };
@@ -203,6 +227,38 @@ class CardCollectingSender extends CollectingSender {
   ): Promise<void> {
     this.userInputCardUpdates.push({ handle, input });
   }
+
+  async createPermissionApprovalCard(
+    chatId: string,
+    input: PermissionApprovalCardInput,
+  ): Promise<StatusCardHandle> {
+    const handle = { messageId: `omp_${this.permissionApprovalCards.length + 1}` };
+    this.permissionApprovalCards.push({ chatId, input, handle });
+    return handle;
+  }
+
+  async updatePermissionApprovalCard(
+    handle: StatusCardHandle,
+    input: PermissionApprovalCardInput,
+  ): Promise<void> {
+    this.permissionApprovalCardUpdates.push({ handle, input });
+  }
+
+  async createMcpElicitationCard(
+    chatId: string,
+    input: McpElicitationCardInput,
+  ): Promise<StatusCardHandle> {
+    const handle = { messageId: `omm_${this.mcpElicitationCards.length + 1}` };
+    this.mcpElicitationCards.push({ chatId, input, handle });
+    return handle;
+  }
+
+  async updateMcpElicitationCard(
+    handle: StatusCardHandle,
+    input: McpElicitationCardInput,
+  ): Promise<void> {
+    this.mcpElicitationCardUpdates.push({ handle, input });
+  }
 }
 
 class FailingUserInputCardSender extends CardCollectingSender {
@@ -220,6 +276,21 @@ class FailingUserInputCardSender extends CardCollectingSender {
 class FailingUserInputPresentationSender extends FailingUserInputCardSender {
   override async sendText(): Promise<void> {
     throw new Error("simulated user-input fallback failure");
+  }
+}
+
+class FailingPermissionApprovalCardSender extends CardCollectingSender {
+  readonly permissionApprovalCardAttempts: Array<{
+    chatId: string;
+    input: PermissionApprovalCardInput;
+  }> = [];
+
+  override async createPermissionApprovalCard(
+    chatId: string,
+    input: PermissionApprovalCardInput,
+  ): Promise<StatusCardHandle> {
+    this.permissionApprovalCardAttempts.push({ chatId, input });
+    throw new Error("simulated permission-approval card failure");
   }
 }
 
@@ -561,6 +632,74 @@ class UserInputCodex implements CodexClient {
     this.requestStarted.resolve();
     try {
       this.response = await input.onUserInputRequest?.(this.request, {
+        signal: this.requestController.signal,
+      });
+    } finally {
+      input.signal?.removeEventListener("abort", abortRequest);
+    }
+    return {
+      threadId: "thread_test",
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  abortRequest(): void {
+    this.requestController?.abort();
+  }
+}
+
+class PermissionApprovalCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly requestStarted = deferred<void>();
+  decision: CodexPermissionApprovalDecision | undefined;
+  private requestController: AbortController | undefined;
+
+  constructor(private readonly request: CodexPermissionApprovalRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    this.requestController = new AbortController();
+    const abortRequest = () => this.requestController?.abort();
+    input.signal?.addEventListener("abort", abortRequest, { once: true });
+    this.requestStarted.resolve();
+    try {
+      this.decision = await input.onPermissionApprovalRequest?.(this.request, {
+        signal: this.requestController.signal,
+      });
+    } finally {
+      input.signal?.removeEventListener("abort", abortRequest);
+    }
+    return {
+      threadId: "thread_test",
+      finalText: "done",
+      stderr: "",
+      exitCode: 0,
+    };
+  }
+
+  abortRequest(): void {
+    this.requestController?.abort();
+  }
+}
+
+class McpElicitationCodex implements CodexClient {
+  readonly runs: CodexRunInput[] = [];
+  readonly requestStarted = deferred<void>();
+  response: CodexMcpElicitationResponse | undefined;
+  private requestController: AbortController | undefined;
+
+  constructor(private readonly request: CodexMcpElicitationRequest) {}
+
+  async run(input: CodexRunInput): Promise<CodexRunResult> {
+    this.runs.push(input);
+    this.requestController = new AbortController();
+    const abortRequest = () => this.requestController?.abort();
+    input.signal?.addEventListener("abort", abortRequest, { once: true });
+    this.requestStarted.resolve();
+    try {
+      this.response = await input.onMcpElicitationRequest?.(this.request, {
         signal: this.requestController.signal,
       });
     } finally {
@@ -4190,6 +4329,589 @@ describe("MessageRouter access control", () => {
         chatId: "oc_chat",
         messageId: sender.userInputCards[0]?.handle.messageId,
         userInputId: request.id,
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
+  });
+
+  test("binds extra permission approval to the original sender and card", async () => {
+    const request: CodexPermissionApprovalRequest = {
+      id: "permission_1",
+      cwd: "/repo",
+      itemId: "item_1",
+      permissions: {
+        fileSystem: {
+          entries: [{ access: "write", path: { type: "path", path: "/repo/output" } }],
+        },
+        network: { enabled: true },
+      },
+      startedAtMs: 1_750_000_000_000,
+      threadId: "thread_test",
+      turnId: "turn_1",
+      environmentId: null,
+      reason: "Publish the generated artifact.",
+    };
+    const codex = new PermissionApprovalCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_permission",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "publish artifact",
+        });
+        await waitFor(() => sender.permissionApprovalCards.length === 1);
+        const handle = sender.permissionApprovalCards[0]!.handle;
+
+        const wrongSender = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "grantTurn",
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(wrongSender).toast.type).toBe("error");
+        expect(codex.decision).toBeUndefined();
+
+        const wrongCard = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: "om_permission_forged",
+          requestId: request.id,
+          decision: "grantTurn",
+          sender: { openId: "ou_user" },
+        });
+        expect(expectToast(wrongCard).toast.type).toBe("warning");
+        expect(codex.decision).toBeUndefined();
+
+        const forgedDecision = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "accept",
+          sender: { openId: "ou_user" },
+        });
+        expect(expectToast(forgedDecision).toast.type).toBe("warning");
+        expect(codex.decision).toBeUndefined();
+
+        const resolved = await router.handleCardAction({
+          action: "resolve_permission_approval",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "grantSession",
+          sender: { openId: "ou_user" },
+        });
+        expect(resolved).toHaveProperty("card");
+        await running;
+
+        expect(codex.decision).toBe("grantSession");
+        expect(sender.permissionApprovalCardUpdates.at(-1)).toMatchObject({
+          handle,
+          input: {
+            status: "resolved",
+            request,
+            decision: "grantSession",
+          },
+        });
+      },
+    );
+  });
+
+  test("denies extra permissions when approval cards are unavailable or fail to send", async () => {
+    const request: CodexPermissionApprovalRequest = {
+      id: "permission_unavailable",
+      cwd: "/repo",
+      itemId: "item_1",
+      permissions: { network: { enabled: true } },
+      startedAtMs: 1_750_000_000_000,
+      threadId: "thread_test",
+      turnId: "turn_1",
+      environmentId: null,
+      reason: "Access the release endpoint.",
+    };
+
+    const unavailableCodex = new PermissionApprovalCodex(request);
+    const unavailableSender = new CollectingSender();
+    await withRouterAndSender({}, unavailableCodex, unavailableSender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_permission_unavailable",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "request permission",
+      });
+
+      expect(unavailableCodex.decision).toBe("deny");
+      expect(unavailableSender.messages.some((message) => message.text.includes("已拒绝"))).toBe(
+        true,
+      );
+    });
+
+    const failingCodex = new PermissionApprovalCodex({
+      ...request,
+      id: "permission_failed_card",
+    });
+    const failingSender = new FailingPermissionApprovalCardSender();
+    await withRouterAndSender({}, failingCodex, failingSender, async ({ router }) => {
+      await router.enqueue({
+        messageId: "m_permission_failed_card",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "request permission",
+      });
+
+      expect(failingCodex.decision).toBe("deny");
+      expect(failingSender.permissionApprovalCardAttempts).toHaveLength(1);
+      expect(failingSender.messages.some((message) => message.text.includes("安全策略拒绝"))).toBe(
+        true,
+      );
+    });
+  });
+
+  test("expires extra permission approval on abort and rejects late card actions", async () => {
+    const request: CodexPermissionApprovalRequest = {
+      id: "permission_expired",
+      cwd: "/repo",
+      itemId: "item_1",
+      permissions: { network: { enabled: true } },
+      startedAtMs: 1_750_000_000_000,
+      threadId: "thread_test",
+      turnId: "turn_1",
+      environmentId: null,
+      reason: "Access the release endpoint.",
+    };
+    const codex = new PermissionApprovalCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_permission_expired",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "request permission",
+      });
+      await waitFor(() => sender.permissionApprovalCards.length === 1);
+      const handle = sender.permissionApprovalCards[0]!.handle;
+
+      codex.abortRequest();
+      await running;
+      expect(codex.decision).toBe("deny");
+      expect(sender.permissionApprovalCardUpdates.at(-1)?.input.status).toBe("expired");
+
+      const late = await router.handleCardAction({
+        action: "resolve_permission_approval",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        requestId: request.id,
+        decision: "grantTurn",
+        sender: { openId: "ou_user" },
+      });
+      expect(expectToast(late).toast.type).toBe("warning");
+    });
+  });
+
+  test("submits an MCP form from a card option and a private text answer", async () => {
+    const request: CodexMcpElicitationRequest = {
+      id: "mcp_form_1",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Collect release settings.",
+      mode: "form",
+      fields: [
+        {
+          name: "environment",
+          title: "Environment",
+          description: "Select a deployment target.",
+          required: true,
+          type: "enum",
+          default: null,
+          options: [
+            { value: "staging", title: "Staging" },
+            { value: "production", title: "Production" },
+          ],
+        },
+        {
+          name: "release_note",
+          title: "Release note",
+          description: "Provide a private note.",
+          required: true,
+          type: "string",
+          default: null,
+          format: null,
+          minLength: 1,
+          maxLength: 200,
+        },
+      ],
+    };
+    const codex = new McpElicitationCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router, config }) => {
+        const running = router.enqueue({
+        messageId: "m_mcp_form",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "collect release settings",
+      });
+      await waitFor(() => sender.mcpElicitationCards.length === 1);
+      const initial = sender.mcpElicitationCards[0]!;
+
+      const selected = await router.handleCardAction({
+        action: "answer_mcp_elicitation",
+        chatId: "oc_chat",
+        messageId: initial.handle.messageId,
+        requestId: request.id,
+        fieldId: "environment",
+        optionIndex: 1,
+        sender: { openId: "ou_user" },
+      });
+      expect(selected).toHaveProperty("card");
+      expect(sender.mcpElicitationCardUpdates.at(-1)?.input).toMatchObject({
+        status: "pending",
+        answeredFieldIds: ["environment"],
+      });
+
+      await router.accept({
+        messageId: "m_mcp_wrong_sender_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_other" },
+        text: `/mcp-answer ${initial.input.replyCode} release_note forged-value`,
+      });
+      await waitFor(() =>
+        sender.messages.some((message) => message.text.includes("只有发起当前 Codex 任务的用户")),
+      );
+      expect(codex.response).toBeUndefined();
+
+      const privateAnswer = "private release phrase 48f31";
+      const answerMessage: IncomingTextMessage = {
+        messageId: "m_mcp_private_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/mcp-answer ${initial.input.replyCode} release_note ${privateAnswer}`,
+      };
+      await router.accept(answerMessage);
+      await router.accept(answerMessage);
+      await running;
+
+      expect(codex.response).toEqual({
+        action: "accept",
+        content: {
+          environment: "production",
+          release_note: privateAnswer,
+        },
+      });
+      expect(sender.messages.every((message) => !message.text.includes(privateAnswer))).toBe(true);
+      expect(
+        sender.mcpElicitationCardUpdates.every(
+          (update) => !JSON.stringify(update.input).includes(privateAnswer),
+        ),
+      ).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(privateAnswer);
+      expect(
+        persisted.processedMessageIds.filter((id) => id === answerMessage.messageId),
+      ).toHaveLength(1);
+      },
+    );
+  });
+
+  test("answers a leading-whitespace MCP field id and keeps required /skip as data", async () => {
+    const fieldId = " release note";
+    const codex = new McpElicitationCodex({
+      id: "mcp_quoted_field",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Collect a release marker.",
+      mode: "form",
+      fields: [
+        {
+          name: fieldId,
+          title: "Release marker",
+          description: null,
+          required: true,
+          type: "string",
+          default: null,
+          format: null,
+          minLength: 1,
+          maxLength: 20,
+        },
+      ],
+    });
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_mcp_quoted_field",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "collect marker",
+      });
+      await waitFor(() => sender.mcpElicitationCards.length === 1);
+      const card = sender.mcpElicitationCards[0]!;
+
+      await router.accept({
+        messageId: "m_mcp_quoted_field_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/mcp-answer ${card.input.replyCode} ${JSON.stringify(fieldId)} /skip`,
+      });
+      await running;
+
+      expect(codex.response).toEqual({
+        action: "accept",
+        content: { [fieldId]: "/skip" },
+      });
+    });
+  });
+
+  test("bounds pending interactive requests with the configured per-chat limit", async () => {
+    const responses: CodexMcpElicitationResponse[] = [];
+    const request = (id: string): CodexMcpElicitationRequest => ({
+      id,
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Confirm release.",
+      mode: "form",
+      fields: [
+        {
+          name: "confirmed",
+          title: "Confirmed",
+          description: null,
+          required: true,
+          type: "boolean",
+          default: null,
+        },
+      ],
+    });
+    const codex: CodexClient = {
+      async run(input: CodexRunInput): Promise<CodexRunResult> {
+        const first = input.onMcpElicitationRequest!(request("mcp_limit_1"), {
+          signal: new AbortController().signal,
+        });
+        responses.push(
+          await input.onMcpElicitationRequest!(request("mcp_limit_2"), {
+            signal: new AbortController().signal,
+          }),
+        );
+        responses.unshift(await first);
+        return {
+          threadId: "thread_test",
+          finalText: "done",
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+    };
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      {
+        BRIDGE_MAX_PENDING_MESSAGES: "2",
+        BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT: "1",
+      },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_mcp_limit",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "trigger parallel requests",
+        });
+        await waitFor(() => sender.mcpElicitationCards.length === 1);
+        expect(sender.mcpElicitationCards).toHaveLength(1);
+        expect(responses).toEqual([{ action: "cancel" }]);
+
+        const card = sender.mcpElicitationCards[0]!;
+        await router.handleCardAction({
+          action: "resolve_mcp_elicitation",
+          chatId: "oc_chat",
+          messageId: card.handle.messageId,
+          requestId: "mcp_limit_1",
+          decision: "cancel",
+          sender: { openId: "ou_user" },
+        });
+        await running;
+        expect(responses).toEqual([{ action: "cancel" }, { action: "cancel" }]);
+      },
+    );
+  });
+
+  test("fails an MCP form with a required secret-like field closed", async () => {
+    const secretPrompt = "Paste the production credential.";
+    const codex = new McpElicitationCodex({
+      id: "mcp_secret",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: secretPrompt,
+      mode: "form",
+      fields: [
+        {
+          name: "api_token",
+          title: "API token",
+          description: "Used to access production.",
+          required: true,
+          type: "string",
+          default: null,
+          format: null,
+          minLength: 1,
+          maxLength: 200,
+        },
+      ],
+    });
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.enqueue({
+        messageId: "m_mcp_secret",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "invoke secure MCP form",
+      });
+
+      expect(codex.response).toEqual({ action: "cancel" });
+      expect(sender.mcpElicitationCards).toHaveLength(0);
+      expect(sender.messages.some((message) => message.text.includes("secret/password-like"))).toBe(
+        true,
+      );
+      expect(sender.messages.every((message) => !message.text.includes(secretPrompt))).toBe(true);
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(JSON.stringify(persisted)).not.toContain(secretPrompt);
+    });
+  });
+
+  test("binds URL MCP acceptance to the original sender", async () => {
+    const request: CodexMcpElicitationRequest = {
+      id: "mcp_url_1",
+      serverName: "oauth-provider",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Authorize access in the browser.",
+      mode: "url",
+      elicitationId: "elicit_1",
+      url: "https://auth.example.test/authorize?flow=release",
+    };
+    const codex = new McpElicitationCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router }) => {
+        const running = router.enqueue({
+          messageId: "m_mcp_url",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "authorize release provider",
+        });
+        await waitFor(() => sender.mcpElicitationCards.length === 1);
+        const handle = sender.mcpElicitationCards[0]!.handle;
+
+        const rejected = await router.handleCardAction({
+          action: "resolve_mcp_elicitation",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "accept",
+          sender: { openId: "ou_other" },
+        });
+        expect(expectToast(rejected).toast.type).toBe("error");
+        expect(codex.response).toBeUndefined();
+
+        const accepted = await router.handleCardAction({
+          action: "resolve_mcp_elicitation",
+          chatId: "oc_chat",
+          messageId: handle.messageId,
+          requestId: request.id,
+          decision: "accept",
+          sender: { openId: "ou_user" },
+        });
+        expect(accepted).toHaveProperty("card");
+        await running;
+
+        expect(codex.response).toEqual({ action: "accept", content: null });
+        expect(sender.mcpElicitationCardUpdates.at(-1)).toMatchObject({
+          handle,
+          input: { status: "resolved", request },
+        });
+      },
+    );
+  });
+
+  test("expires MCP elicitation on abort and rejects late card actions", async () => {
+    const request: CodexMcpElicitationRequest = {
+      id: "mcp_expired",
+      serverName: "release-manager",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Confirm the release.",
+      mode: "form",
+      fields: [
+        {
+          name: "confirmed",
+          title: "Confirmed",
+          description: null,
+          required: true,
+          type: "boolean",
+          default: null,
+        },
+      ],
+    };
+    const codex = new McpElicitationCodex(request);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_mcp_expired",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "confirm release",
+      });
+      await waitFor(() => sender.mcpElicitationCards.length === 1);
+      const handle = sender.mcpElicitationCards[0]!.handle;
+
+      codex.abortRequest();
+      await running;
+      expect(codex.response).toEqual({ action: "cancel" });
+      expect(sender.mcpElicitationCardUpdates.at(-1)?.input.status).toBe("expired");
+
+      const late = await router.handleCardAction({
+        action: "answer_mcp_elicitation",
+        chatId: "oc_chat",
+        messageId: handle.messageId,
+        requestId: request.id,
+        fieldId: "confirmed",
+        optionIndex: 0,
         sender: { openId: "ou_user" },
       });
       expect(expectToast(late).toast.type).toBe("warning");

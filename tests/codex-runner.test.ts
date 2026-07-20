@@ -819,7 +819,7 @@ if (message.method === "turn/start") {
   setTimeout(() => {
     send({ method: "serverRequest/resolved", params: { threadId: "thread_fake", requestId: "resolved_input_1" } });
     setTimeout(() => completeTurn("done"), 30);
-  }, 10);
+  }, 75);
   return;
 }
 `,
@@ -976,7 +976,7 @@ if (message.method === "turn/start") {
 
       const started = await Promise.race([
         callbackStarted.then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), 750)),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 1_500)),
       ]);
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
       controller.abort();
@@ -1118,6 +1118,8 @@ if (message.id === "permissions_1") completeTurn("done");
         CODEX_WORKDIR: tempDir,
       });
       let approvalCalls = 0;
+      let elicitationCalls = 0;
+      let permissionCalls = 0;
       await new CodexRunner(config, new ConsoleLogger("error")).run({
         prompt: "exercise safe interactive defaults",
         cwd: tempDir,
@@ -1125,9 +1127,19 @@ if (message.id === "permissions_1") completeTurn("done");
           approvalCalls += 1;
           return "accept";
         },
+        onMcpElicitationRequest: async () => {
+          elicitationCalls += 1;
+          return { action: "accept", content: {} };
+        },
+        onPermissionApprovalRequest: async () => {
+          permissionCalls += 1;
+          return "grantSession";
+        },
       });
 
       expect(approvalCalls).toBe(0);
+      expect(elicitationCalls).toBe(0);
+      expect(permissionCalls).toBe(1);
       const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
       expect(received.find((message) => message.id === "elicitation_1")).toEqual({
         id: "elicitation_1",
@@ -1135,8 +1147,500 @@ if (message.id === "permissions_1") completeTurn("done");
       });
       expect(received.find((message) => message.id === "permissions_1")).toEqual({
         id: "permissions_1",
+        result: { permissions: {}, scope: "session" },
+      });
+      const initialize = received.find((message) => message.method === "initialize") as
+        | { params?: { capabilities?: Record<string, unknown> } }
+        | undefined;
+      expect(initialize?.params?.capabilities).not.toHaveProperty(
+        "mcpServerOpenaiFormElicitation",
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails standard MCP and permission requests closed when callbacks are missing", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({ id: "missing_mcp_callback", method: "mcpServer/elicitation/request", params: { serverName: "mcp", threadId: "thread_fake", turnId: "turn_fake", message: "Name", mode: "form", requestedSchema: { type: "object", properties: { name: { type: "string" } } } } });
+  return;
+}
+if (message.id === "missing_mcp_callback") {
+  send({ id: "missing_permission_callback", method: "item/permissions/requestApproval", params: { cwd: "/tmp/repo", itemId: "p1", permissions: { network: { enabled: true } }, startedAtMs: 1, threadId: "thread_fake", turnId: "turn_fake" } });
+  return;
+}
+if (message.id === "missing_permission_callback") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise missing callbacks",
+        cwd: tempDir,
+      });
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.find((message) => message.id === "missing_mcp_callback")).toEqual({
+        id: "missing_mcp_callback",
+        result: { action: "cancel", content: null },
+      });
+      expect(received.find((message) => message.id === "missing_permission_callback")).toEqual({
+        id: "missing_permission_callback",
         result: { permissions: {}, scope: "turn" },
       });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("normalizes standard MCP form and URL elicitations and validates accepted content", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({
+    id: "form_1",
+    method: "mcpServer/elicitation/request",
+    params: {
+      serverName: "test-mcp",
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      message: "Configure deployment",
+      mode: "form",
+      requestedSchema: {
+        type: "object",
+        required: ["name", "age", "color", "tags"],
+        properties: {
+          name: { type: "string", title: "Name", description: "Display name", default: "Ada", minLength: 2, maxLength: 10 },
+          age: { type: "integer", minimum: 1, maximum: 120, default: 20 },
+          ratio: { type: "number", minimum: 0, maximum: 1 },
+          enabled: { type: "boolean", default: true },
+          color: { type: "string", enum: ["red", "blue"], enumNames: ["Red", "Blue"], default: "red" },
+          region: { type: "string", oneOf: [{ const: "us", title: "US" }, { const: "eu", title: "EU" }] },
+          tags: { type: "array", items: { type: "string", enum: ["a", "b", "c"] }, minItems: 1, maxItems: 2, default: ["a"] },
+          modes: { type: "array", items: { anyOf: [{ const: "safe", title: "Safe" }, { const: "fast", title: "Fast" }] } }
+        }
+      }
+    }
+  });
+  return;
+}
+if (message.id === "form_1") {
+  send({
+    id: "url_1",
+    method: "mcpServer/elicitation/request",
+    params: {
+      serverName: "test-mcp",
+      threadId: "thread_fake",
+      turnId: null,
+      message: "Authorize",
+      mode: "url",
+      elicitationId: "auth-1",
+      url: "https://example.com/authorize?state=1"
+    }
+  });
+  return;
+}
+if (message.id === "url_1") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const requests: unknown[] = [];
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise MCP elicitation",
+        cwd: tempDir,
+        onMcpElicitationRequest: async (request) => {
+          requests.push(request);
+          if (request.mode === "url") {
+            return { action: "accept" };
+          }
+          return {
+            action: "accept",
+            content: {
+              name: "Alice",
+              age: 30,
+              ratio: 0.5,
+              enabled: false,
+              color: "blue",
+              region: "eu",
+              tags: ["a", "c"],
+              modes: ["safe"],
+            },
+          };
+        },
+      });
+
+      expect(requests).toHaveLength(2);
+      expect(requests[0]).toMatchObject({
+        id: expect.any(String),
+        serverName: "test-mcp",
+        threadId: "thread_fake",
+        turnId: "turn_fake",
+        message: "Configure deployment",
+        mode: "form",
+        fields: [
+          {
+            name: "name",
+            type: "string",
+            required: true,
+            default: "Ada",
+            minLength: 2,
+            maxLength: 10,
+          },
+          {
+            name: "age",
+            type: "integer",
+            required: true,
+            minimum: 1,
+            maximum: 120,
+          },
+          { name: "ratio", type: "number", required: false },
+          { name: "enabled", type: "boolean", default: true },
+          {
+            name: "color",
+            type: "enum",
+            options: [
+              { value: "red", title: "Red" },
+              { value: "blue", title: "Blue" },
+            ],
+          },
+          {
+            name: "region",
+            type: "enum",
+            options: [
+              { value: "us", title: "US" },
+              { value: "eu", title: "EU" },
+            ],
+          },
+          { name: "tags", type: "multi_select", minItems: 1, maxItems: 2 },
+          { name: "modes", type: "multi_select" },
+        ],
+      });
+      expect(requests[1]).toMatchObject({
+        id: expect.any(String),
+        mode: "url",
+        elicitationId: "auth-1",
+        url: "https://example.com/authorize?state=1",
+      });
+      expect((requests[0] as { id: string }).id).not.toBe((requests[1] as { id: string }).id);
+      expect((requests[0] as { id: string }).id).not.toBe("form_1");
+      expect((requests[1] as { id: string }).id).not.toBe("url_1");
+
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.find((message) => message.id === "form_1")).toEqual({
+        id: "form_1",
+        result: {
+          action: "accept",
+          content: {
+            name: "Alice",
+            age: 30,
+            ratio: 0.5,
+            enabled: false,
+            color: "blue",
+            region: "eu",
+            tags: ["a", "c"],
+            modes: ["safe"],
+          },
+        },
+      });
+      expect(received.find((message) => message.id === "url_1")).toEqual({
+        id: "url_1",
+        result: { action: "accept", content: null },
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("validates MCP responses against a private snapshot when callbacks weaken the schema", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({
+    id: "weaken_required",
+    method: "mcpServer/elicitation/request",
+    params: {
+      serverName: "mcp",
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      message: "Required field",
+      mode: "form",
+      requestedSchema: {
+        type: "object",
+        required: ["name"],
+        properties: { name: { type: "string" } }
+      }
+    }
+  });
+  return;
+}
+if (message.id === "weaken_required") {
+  send({
+    id: "expand_enum",
+    method: "mcpServer/elicitation/request",
+    params: {
+      serverName: "mcp",
+      threadId: "thread_fake",
+      turnId: "turn_fake",
+      message: "Enum field",
+      mode: "form",
+      requestedSchema: {
+        type: "object",
+        required: ["role"],
+        properties: { role: { type: "string", enum: ["reader"] } }
+      }
+    }
+  });
+  return;
+}
+if (message.id === "expand_enum") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let completedMutations = 0;
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise callback schema mutation",
+        cwd: tempDir,
+        onMcpElicitationRequest: async (request) => {
+          if (request.mode !== "form") return { action: "cancel" };
+          const field = request.fields[0];
+          if (field?.name === "name") {
+            field.required = false;
+            completedMutations += 1;
+            return { action: "accept", content: {} };
+          }
+          if (field?.type === "enum") {
+            field.options.push({ value: "admin", title: "Admin" });
+            completedMutations += 1;
+            return { action: "accept", content: { role: "admin" } };
+          }
+          return { action: "cancel" };
+        },
+      });
+
+      expect(completedMutations).toBe(2);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      for (const id of ["weaken_required", "expand_enum"]) {
+        expect(received.find((message) => message.id === id)).toEqual({
+          id,
+          result: { action: "cancel", content: null },
+        });
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("grants only the normalized permission request and never accepts a permission object from UI", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({
+    id: "permission_grant_1",
+    method: "item/permissions/requestApproval",
+    params: {
+      cwd: "/tmp/repo",
+      environmentId: "env-1",
+      itemId: "permission_item_1",
+      permissions: {
+        fileSystem: {
+          entries: [
+            { access: "read", path: { type: "path", path: "/tmp/repo/input" } },
+            { access: "write", path: { type: "special", value: { kind: "project_roots", subpath: "out" } } }
+          ],
+          globScanMaxDepth: 4,
+          read: ["/legacy/read"]
+        },
+        network: { enabled: true }
+      },
+      reason: "Run integration tests",
+      startedAtMs: 100,
+      threadId: "thread_fake",
+      turnId: "turn_fake"
+    }
+  });
+  return;
+}
+if (message.id === "permission_grant_1") {
+  send({
+    id: "permission_grant_turn_1",
+    method: "item/permissions/requestApproval",
+    params: { cwd: "/tmp/repo", itemId: "permission_item_2", permissions: { network: { enabled: false } }, startedAtMs: 101, threadId: "thread_fake", turnId: "turn_fake" }
+  });
+  return;
+}
+if (message.id === "permission_grant_turn_1") {
+  send({
+    id: "permission_deny_1",
+    method: "item/permissions/requestApproval",
+    params: { cwd: "/tmp/repo", itemId: "permission_item_3", permissions: { network: { enabled: true } }, startedAtMs: 102, threadId: "thread_fake", turnId: "turn_fake" }
+  });
+  return;
+}
+if (message.id === "permission_deny_1") {
+  send({
+    id: "permission_invalid_ui_1",
+    method: "item/permissions/requestApproval",
+    params: { cwd: "/tmp/repo", itemId: "permission_item_4", permissions: { network: { enabled: true } }, startedAtMs: 103, threadId: "thread_fake", turnId: "turn_fake" }
+  });
+  return;
+}
+if (message.id === "permission_invalid_ui_1") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const requests: unknown[] = [];
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise permission approval",
+        cwd: tempDir,
+        onPermissionApprovalRequest: async (request) => {
+          requests.push(structuredClone(request));
+          if (request.itemId === "permission_item_1") {
+            request.permissions.network = { enabled: false };
+            return "grantSession";
+          }
+          if (request.itemId === "permission_item_2") return "grantTurn";
+          if (request.itemId === "permission_item_3") return "deny";
+          return {
+            permissions: { network: { enabled: true } },
+            scope: "session",
+            strictAutoReview: true,
+          } as never;
+        },
+      });
+
+      expect(requests[0]).toMatchObject({
+        id: expect.any(String),
+        cwd: "/tmp/repo",
+        itemId: "permission_item_1",
+        environmentId: "env-1",
+        reason: "Run integration tests",
+        permissions: {
+          fileSystem: {
+            entries: [
+              { access: "read", path: { type: "path", path: "/tmp/repo/input" } },
+              {
+                access: "write",
+                path: {
+                  type: "special",
+                  value: { kind: "project_roots", subpath: "out" },
+                },
+              },
+            ],
+            globScanMaxDepth: 4,
+            read: ["/legacy/read"],
+          },
+          network: { enabled: true },
+        },
+      });
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.find((message) => message.id === "permission_grant_1")).toEqual({
+        id: "permission_grant_1",
+        result: {
+          permissions: {
+            fileSystem: {
+              entries: [
+                { access: "read", path: { type: "path", path: "/tmp/repo/input" } },
+                {
+                  access: "write",
+                  path: {
+                    type: "special",
+                    value: { kind: "project_roots", subpath: "out" },
+                  },
+                },
+              ],
+              globScanMaxDepth: 4,
+              read: ["/legacy/read"],
+            },
+            network: { enabled: true },
+          },
+          scope: "session",
+        },
+      });
+      expect(received.find((message) => message.id === "permission_invalid_ui_1")).toEqual({
+        id: "permission_invalid_ui_1",
+        result: { permissions: {}, scope: "turn" },
+      });
+      expect(received.find((message) => message.id === "permission_grant_turn_1")).toEqual({
+        id: "permission_grant_turn_1",
+        result: { permissions: { network: { enabled: false } }, scope: "turn" },
+      });
+      expect(received.find((message) => message.id === "permission_deny_1")).toEqual({
+        id: "permission_deny_1",
+        result: { permissions: {}, scope: "turn" },
+      });
+      expect(JSON.stringify(received)).not.toContain("strictAutoReview");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -1215,6 +1719,414 @@ if (message.id === "invalid_elicitation_identity_1") completeTurn("done");
         expect(response).toMatchObject({ id, error: { code: -32602 } });
         expect(response && "result" in response).toBe(false);
       }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects malformed, over-limit, and unsafe MCP and permission requests", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+const invalidRequests = [
+  {
+    id: "invalid_form_required",
+    method: "mcpServer/elicitation/request",
+    params: { serverName: "mcp", threadId: "thread_fake", message: "Bad form", mode: "form", requestedSchema: { type: "object", properties: {}, required: ["missing"] } }
+  },
+  {
+    id: "invalid_form_range",
+    method: "mcpServer/elicitation/request",
+    params: { serverName: "mcp", threadId: "thread_fake", message: "Bad range", mode: "form", requestedSchema: { type: "object", properties: { count: { type: "integer", minimum: 10, maximum: 1 } } } }
+  },
+  {
+    id: "invalid_url_scheme",
+    method: "mcpServer/elicitation/request",
+    params: { serverName: "mcp", threadId: "thread_fake", message: "Open", mode: "url", elicitationId: "e1", url: "javascript:alert(1)" }
+  },
+  {
+    id: "invalid_form_fields_limit",
+    method: "mcpServer/elicitation/request",
+    params: { serverName: "mcp", threadId: "thread_fake", message: "Too many", mode: "form", requestedSchema: { type: "object", properties: Object.fromEntries(Array.from({ length: 33 }, (_, index) => ["f" + index, { type: "boolean" }])) } }
+  },
+  {
+    id: "invalid_permission_entries_limit",
+    method: "item/permissions/requestApproval",
+    params: { cwd: "/tmp/repo", itemId: "p1", permissions: { fileSystem: { entries: Array.from({ length: 65 }, () => ({ access: "read", path: { type: "path", path: "/tmp/a" } })) } }, startedAtMs: 1, threadId: "thread_fake", turnId: "turn_fake" }
+  },
+  {
+    id: "invalid_permission_nested_extra",
+    method: "item/permissions/requestApproval",
+    params: { cwd: "/tmp/repo", itemId: "p2", permissions: { network: { enabled: true, strictAutoReview: true } }, startedAtMs: 2, threadId: "thread_fake", turnId: "turn_fake" }
+  }
+];
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  state.invalidIndex = 0;
+  send(invalidRequests[0]);
+  return;
+}
+if (String(message.id).startsWith("invalid_")) {
+  state.invalidIndex += 1;
+  if (invalidRequests[state.invalidIndex]) send(invalidRequests[state.invalidIndex]);
+  else completeTurn("done");
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let elicitationCalls = 0;
+      let permissionCalls = 0;
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise malformed interactive requests",
+        cwd: tempDir,
+        onMcpElicitationRequest: async () => {
+          elicitationCalls += 1;
+          return { action: "cancel" };
+        },
+        onPermissionApprovalRequest: async () => {
+          permissionCalls += 1;
+          return "deny";
+        },
+      });
+
+      expect(elicitationCalls).toBe(0);
+      expect(permissionCalls).toBe(0);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      for (const id of [
+        "invalid_form_required",
+        "invalid_form_range",
+        "invalid_url_scheme",
+        "invalid_form_fields_limit",
+        "invalid_permission_entries_limit",
+        "invalid_permission_nested_extra",
+      ]) {
+        expect(received.find((message) => message.id === id)).toMatchObject({
+          id,
+          error: { code: -32602 },
+        });
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails MCP and permission callbacks closed without leaking values or errors", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+function formRequest(id) {
+  send({ id, method: "mcpServer/elicitation/request", params: { serverName: "mcp", threadId: "thread_fake", turnId: "turn_fake", message: "Count", mode: "form", requestedSchema: { type: "object", required: ["count"], properties: { count: { type: "integer", minimum: 1, maximum: 3 } } } } });
+}
+function permissionRequest(id) {
+  send({ id, method: "item/permissions/requestApproval", params: { cwd: "/tmp/repo", itemId: id, permissions: { network: { enabled: true } }, startedAtMs: 1, threadId: "thread_fake", turnId: "turn_fake" } });
+}
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  formRequest("invalid_mcp_callback_1");
+  return;
+}
+if (message.id === "invalid_mcp_callback_1") {
+  formRequest("invalid_mcp_callback_2");
+  return;
+}
+if (message.id === "invalid_mcp_callback_2") {
+  permissionRequest("invalid_permission_callback_1");
+  return;
+}
+if (message.id === "invalid_permission_callback_1") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let elicitationCalls = 0;
+      const logged: unknown[] = [];
+      const logger = {
+        debug: () => undefined,
+        info: () => undefined,
+        warn: (message: string, data?: unknown) => logged.push([message, data]),
+        error: (message: string, data?: unknown) => logged.push([message, data]),
+      };
+      await new CodexRunner(config, logger).run({
+        prompt: "exercise failing callbacks",
+        cwd: tempDir,
+        onMcpElicitationRequest: async (request) => {
+          elicitationCalls += 1;
+          if (elicitationCalls === 1) {
+            (request as { mode: string }).mode = "url";
+            return { action: "accept", content: { count: 4, secret: "DO_NOT_LEAK" } };
+          }
+          throw new Error("DO_NOT_LEAK");
+        },
+        onPermissionApprovalRequest: async () =>
+          ({ permissions: { network: { enabled: true } }, strictAutoReview: true }) as never,
+      });
+
+      const receivedText = await readFile(receivedPath, "utf8");
+      expect(receivedText).not.toContain("DO_NOT_LEAK");
+      expect(JSON.stringify(logged)).not.toContain("DO_NOT_LEAK");
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      for (const id of ["invalid_mcp_callback_1", "invalid_mcp_callback_2"]) {
+        expect(received.find((message) => message.id === id)).toEqual({
+          id,
+          result: { action: "cancel", content: null },
+        });
+      }
+      expect(received.find((message) => message.id === "invalid_permission_callback_1")).toEqual({
+        id: "invalid_permission_callback_1",
+        result: { permissions: {}, scope: "turn" },
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("aborts MCP and permission callbacks on server resolution and skips same-batch callbacks", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+function formRequest(id) {
+  send({ id, method: "mcpServer/elicitation/request", params: { serverName: "mcp", threadId: "thread_fake", turnId: "turn_fake", message: "Name", mode: "form", requestedSchema: { type: "object", properties: { name: { type: "string" } } } } });
+}
+function permissionRequest(id) {
+  send({ id, method: "item/permissions/requestApproval", params: { cwd: "/tmp/repo", itemId: id, permissions: {}, startedAtMs: 1, threadId: "thread_fake", turnId: "turn_fake" } });
+}
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  formRequest("resolved_mcp_late");
+  setTimeout(() => {
+    send({ method: "serverRequest/resolved", params: { threadId: "thread_fake", requestId: "resolved_mcp_late" } });
+    permissionRequest("resolved_permission_late");
+    setTimeout(() => {
+      send({ method: "serverRequest/resolved", params: { threadId: "thread_fake", requestId: "resolved_permission_late" } });
+      formRequest("resolved_mcp_same_batch");
+      send({ method: "serverRequest/resolved", params: { threadId: "thread_fake", requestId: "resolved_mcp_same_batch" } });
+      permissionRequest("resolved_permission_same_batch");
+      send({ method: "serverRequest/resolved", params: { threadId: "thread_fake", requestId: "resolved_permission_same_batch" } });
+      setTimeout(() => completeTurn("done"), 30);
+    }, 75);
+  }, 75);
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const signals: AbortSignal[] = [];
+      let elicitationCalls = 0;
+      let permissionCalls = 0;
+      const waitForAbort = async (signal: AbortSignal) => {
+        signals.push(signal);
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      };
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise resolved callbacks",
+        cwd: tempDir,
+        onMcpElicitationRequest: async (_request, context) => {
+          elicitationCalls += 1;
+          await waitForAbort(context.signal);
+          return { action: "cancel" };
+        },
+        onPermissionApprovalRequest: async (_request, context) => {
+          permissionCalls += 1;
+          await waitForAbort(context.signal);
+          return "deny";
+        },
+      });
+
+      expect(elicitationCalls).toBe(1);
+      expect(permissionCalls).toBe(1);
+      expect(signals).toHaveLength(2);
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      for (const id of [
+        "resolved_mcp_late",
+        "resolved_permission_late",
+        "resolved_mcp_same_batch",
+        "resolved_permission_same_batch",
+      ]) {
+        expect(received.some((message) => message.id === id)).toBe(false);
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("aborts pending MCP and permission callbacks when the run is cancelled", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({ id: "aborted_mcp", method: "mcpServer/elicitation/request", params: { serverName: "mcp", threadId: "thread_fake", turnId: "turn_fake", message: "Name", mode: "form", requestedSchema: { type: "object", properties: { name: { type: "string" } } } } });
+  send({ id: "aborted_permission", method: "item/permissions/requestApproval", params: { cwd: "/tmp/repo", itemId: "p1", permissions: {}, startedAtMs: 1, threadId: "thread_fake", turnId: "turn_fake" } });
+  setTimeout(() => completeTurn("fallback"), 1000);
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const controller = new AbortController();
+      const signals: AbortSignal[] = [];
+      let markStarted: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const callback = async (signal: AbortSignal) => {
+        signals.push(signal);
+        if (signals.length === 2) markStarted?.();
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      };
+      const run = new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise run cancellation",
+        cwd: tempDir,
+        signal: controller.signal,
+        onMcpElicitationRequest: async (_request, context) => {
+          await callback(context.signal);
+          return { action: "cancel" };
+        },
+        onPermissionApprovalRequest: async (_request, context) => {
+          await callback(context.signal);
+          return "deny";
+        },
+      });
+      await Promise.race([started, new Promise<void>((resolve) => setTimeout(resolve, 1_500))]);
+      controller.abort();
+      const result = await run;
+
+      expect(signals).toHaveLength(2);
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+      expect(result.cancelled).toBe(true);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.some((message) => message.id === "aborted_mcp")).toBe(false);
+      expect(received.some((message) => message.id === "aborted_permission")).toBe(false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails a duplicate pending raw JSON-RPC id and aborts the original callback", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/start") {
+  send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+  return;
+}
+if (message.method === "turn/start") {
+  send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+  send({ id: "duplicate_raw_id", method: "mcpServer/elicitation/request", params: { serverName: "mcp", threadId: "thread_fake", turnId: "turn_fake", message: "Name", mode: "form", requestedSchema: { type: "object", properties: { name: { type: "string" } } } } });
+  setTimeout(() => send({ id: "duplicate_raw_id", method: "item/permissions/requestApproval", params: { cwd: "/tmp/repo", itemId: "p1", permissions: {}, startedAtMs: 1, threadId: "thread_fake", turnId: "turn_fake" } }), 75);
+  return;
+}
+if (message.id === "duplicate_raw_id") completeTurn("done");
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      let originalSignal: AbortSignal | undefined;
+      let permissionCalls = 0;
+      await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "exercise duplicate ids",
+        cwd: tempDir,
+        onMcpElicitationRequest: async (_request, context) => {
+          originalSignal = context.signal;
+          await new Promise<void>((resolve) =>
+            context.signal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          return { action: "cancel" };
+        },
+        onPermissionApprovalRequest: async () => {
+          permissionCalls += 1;
+          return "grantSession";
+        },
+      });
+
+      expect(originalSignal?.aborted).toBe(true);
+      expect(permissionCalls).toBe(0);
+      const received = (await readJsonl(receivedPath)) as Array<Record<string, unknown>>;
+      expect(received.find((message) => message.id === "duplicate_raw_id")).toEqual({
+        id: "duplicate_raw_id",
+        error: { code: -32600, message: "Invalid Request" },
+      });
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

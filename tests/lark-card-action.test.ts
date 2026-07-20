@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { adaptLarkCardActionEvent } from "../src/bot/lark-card-action.js";
+import {
+  adaptLarkCardActionEvent,
+  answerMcpElicitationCardAction,
+  resolveMcpElicitationCardAction,
+  resolvePermissionApprovalCardAction,
+} from "../src/bot/lark-card-action.js";
 
 describe("Lark card action adaptation", () => {
   test("adapts SDK-normalized stop button callbacks", () => {
@@ -227,6 +232,102 @@ describe("Lark card action adaptation", () => {
       chatId: "oc_chat",
       messageId: "om_user_input",
     });
+  });
+
+  test("adapts bounded additional-permission decisions", () => {
+    const action = adaptLarkCardActionEvent({
+      context: {
+        open_chat_id: "oc_chat",
+        open_message_id: "om_permission",
+      },
+      operator: { open_id: "ou_sender" },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: resolvePermissionApprovalCardAction,
+          requestId: "permission_local_1",
+          decision: "grantSession",
+          permissions: { network: { enabled: true } },
+        },
+      },
+    });
+
+    expect(action).toMatchObject({
+      action: resolvePermissionApprovalCardAction,
+      chatId: "oc_chat",
+      messageId: "om_permission",
+      requestId: "permission_local_1",
+      decision: "grantSession",
+      sender: { openId: "ou_sender" },
+    });
+    expect(action).not.toHaveProperty("permissions");
+  });
+
+  test("adapts MCP option and terminal decisions without typed values", () => {
+    const option = adaptLarkCardActionEvent({
+      context: { open_chat_id: "oc_chat", open_message_id: "om_mcp" },
+      operator: { open_id: "ou_sender" },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: answerMcpElicitationCardAction,
+          requestId: "mcp_local_1",
+          fieldId: "environment",
+          optionIndex: 1,
+          answer: "production",
+        },
+      },
+    });
+    const resolution = adaptLarkCardActionEvent({
+      context: { open_chat_id: "oc_chat", open_message_id: "om_mcp" },
+      operator: { open_id: "ou_sender" },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: resolveMcpElicitationCardAction,
+          requestId: "mcp_local_1",
+          decision: "decline",
+          url: "https://must-not-be-forwarded.example",
+        },
+      },
+    });
+
+    expect(option).toMatchObject({
+      action: answerMcpElicitationCardAction,
+      requestId: "mcp_local_1",
+      fieldId: "environment",
+      optionIndex: 1,
+    });
+    expect(option).not.toHaveProperty("answer");
+    expect(resolution).toMatchObject({
+      action: resolveMcpElicitationCardAction,
+      requestId: "mcp_local_1",
+      decision: "decline",
+    });
+    expect(resolution).not.toHaveProperty("url");
+  });
+
+  test("drops oversized identifiers and invalid interactive decisions", () => {
+    const action = adaptLarkCardActionEvent({
+      context: { open_chat_id: "oc_chat", open_message_id: "om_mcp" },
+      operator: { open_id: "ou_sender" },
+      action: {
+        value: {
+          app: "chat2codex",
+          action: resolvePermissionApprovalCardAction,
+          requestId: "r".repeat(129),
+          fieldId: "f".repeat(129),
+          optionIndex: 999,
+          decision: "grant_forever",
+        },
+      },
+    });
+
+    expect(action).toMatchObject({ action: resolvePermissionApprovalCardAction });
+    expect(action?.requestId).toBeUndefined();
+    expect(action?.fieldId).toBeUndefined();
+    expect(action?.optionIndex).toBeUndefined();
+    expect(action?.decision).toBeUndefined();
   });
 
   test("adapts project selection button callbacks", () => {

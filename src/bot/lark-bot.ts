@@ -16,10 +16,14 @@ import {
 import { adaptLarkCardActionEvent, cardActionToast } from "./lark-card-action.js";
 import {
   buildApprovalCard,
-  buildUserInputCard,
-  type LarkInteractiveCard,
+  buildMcpElicitationCard,
+  buildPermissionApprovalCard,
   buildRunStatusCard,
+  buildUserInputCard,
   type ApprovalCardInput,
+  type LarkInteractiveCard,
+  type McpElicitationCardInput,
+  type PermissionApprovalCardInput,
   type RunStatusCardInput,
   type UserInputCardInput,
 } from "./lark-card.js";
@@ -238,6 +242,74 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<v
         },
         data: {
           content: JSON.stringify(buildUserInputCard(input)),
+        },
+      });
+    },
+    async createPermissionApprovalCard(
+      chatId: string,
+      input: PermissionApprovalCardInput,
+    ): Promise<StatusCardHandle> {
+      const response = await client.im.v1.message.create({
+        params: {
+          receive_id_type: "chat_id",
+        },
+        data: {
+          receive_id: chatId,
+          msg_type: "interactive",
+          content: JSON.stringify(buildPermissionApprovalCard(input)),
+        },
+      });
+      const messageId = response.data?.message_id;
+      if (!messageId) {
+        throw new Error(
+          "Feishu/Lark did not return a message_id for the permission-approval card.",
+        );
+      }
+      return { messageId };
+    },
+    async updatePermissionApprovalCard(
+      handle: StatusCardHandle,
+      input: PermissionApprovalCardInput,
+    ): Promise<void> {
+      await client.im.v1.message.patch({
+        path: {
+          message_id: handle.messageId,
+        },
+        data: {
+          content: JSON.stringify(buildPermissionApprovalCard(input)),
+        },
+      });
+    },
+    async createMcpElicitationCard(
+      chatId: string,
+      input: McpElicitationCardInput,
+    ): Promise<StatusCardHandle> {
+      const response = await client.im.v1.message.create({
+        params: {
+          receive_id_type: "chat_id",
+        },
+        data: {
+          receive_id: chatId,
+          msg_type: "interactive",
+          content: JSON.stringify(buildMcpElicitationCard(input)),
+        },
+      });
+      const messageId = response.data?.message_id;
+      if (!messageId) {
+        throw new Error("Feishu/Lark did not return a message_id for the MCP-elicitation card.");
+      }
+      return { messageId };
+    },
+    async updateMcpElicitationCard(
+      handle: StatusCardHandle,
+      input: McpElicitationCardInput,
+    ): Promise<void> {
+      await client.im.v1.message.patch({
+        path: {
+          message_id: handle.messageId,
+        },
+        data: {
+          content: JSON.stringify(buildMcpElicitationCard(input)),
         },
       });
     },

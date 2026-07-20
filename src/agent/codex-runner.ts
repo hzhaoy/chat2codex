@@ -16,6 +16,19 @@ const maxUserInputHeaderLength = 64;
 const maxUserInputQuestionLength = 1_024;
 const maxUserInputOptionLabelLength = 128;
 const maxUserInputOptionDescriptionLength = 512;
+const maxInteractiveIdentityLength = 256;
+const maxInteractiveMessageLength = 4_096;
+const maxMcpFormFields = 32;
+const maxMcpFieldNameLength = 128;
+const maxMcpFieldTextLength = 1_024;
+const maxMcpStringValueLength = 4_096;
+const maxMcpEnumOptions = 50;
+const maxMcpEnumValueLength = 256;
+const maxMcpUrlLength = 2_048;
+const maxPermissionEntries = 64;
+const maxPermissionPathLength = 4_096;
+const maxPermissionGlobDepth = 128;
+const serverRequestCallbackGraceMs = 25;
 
 export interface CodexRunInput {
   prompt: string;
@@ -28,6 +41,14 @@ export interface CodexRunInput {
     request: CodexUserInputRequest,
     context: CodexUserInputRequestContext,
   ) => Promise<CodexUserInputResponse>;
+  onMcpElicitationRequest?: (
+    request: CodexMcpElicitationRequest,
+    context: CodexServerRequestContext,
+  ) => Promise<CodexMcpElicitationResponse>;
+  onPermissionApprovalRequest?: (
+    request: CodexPermissionApprovalRequest,
+    context: CodexServerRequestContext,
+  ) => Promise<CodexPermissionApprovalDecision>;
   onRunControl?: (control: CodexRunControl) => void;
 }
 
@@ -146,6 +167,127 @@ export interface CodexUserInputResponse {
 export interface CodexUserInputRequestContext {
   signal: AbortSignal;
 }
+
+export interface CodexServerRequestContext {
+  signal: AbortSignal;
+}
+
+export interface CodexMcpElicitationOption {
+  value: string;
+  title: string;
+}
+
+interface CodexMcpElicitationFieldBase {
+  name: string;
+  title: string | null;
+  description: string | null;
+  required: boolean;
+}
+
+export type CodexMcpElicitationField =
+  | (CodexMcpElicitationFieldBase & {
+      type: "string";
+      default: string | null;
+      format: "email" | "uri" | "date" | "date-time" | null;
+      minLength: number | null;
+      maxLength: number | null;
+    })
+  | (CodexMcpElicitationFieldBase & {
+      type: "number";
+      default: number | null;
+      minimum: number | null;
+      maximum: number | null;
+    })
+  | (CodexMcpElicitationFieldBase & {
+      type: "integer";
+      default: number | null;
+      minimum: number | null;
+      maximum: number | null;
+    })
+  | (CodexMcpElicitationFieldBase & {
+      type: "boolean";
+      default: boolean | null;
+    })
+  | (CodexMcpElicitationFieldBase & {
+      type: "enum";
+      default: string | null;
+      options: CodexMcpElicitationOption[];
+    })
+  | (CodexMcpElicitationFieldBase & {
+      type: "multi_select";
+      default: string[] | null;
+      options: CodexMcpElicitationOption[];
+      minItems: number | null;
+      maxItems: number | null;
+    });
+
+interface CodexMcpElicitationRequestBase {
+  id: string;
+  serverName: string;
+  threadId: string;
+  turnId: string | null;
+  message: string;
+}
+
+export type CodexMcpElicitationRequest =
+  | (CodexMcpElicitationRequestBase & {
+      mode: "form";
+      fields: CodexMcpElicitationField[];
+    })
+  | (CodexMcpElicitationRequestBase & {
+      mode: "url";
+      elicitationId: string;
+      url: string;
+    });
+
+export type CodexMcpElicitationValue = string | number | boolean | string[];
+export type CodexMcpElicitationResponse =
+  | {
+      action: "accept";
+      content?: Record<string, CodexMcpElicitationValue> | null;
+    }
+  | { action: "decline" | "cancel" };
+
+export type CodexFileSystemSpecialPath =
+  | { kind: "root" | "minimal" | "tmpdir" | "slash_tmp" }
+  | { kind: "project_roots"; subpath?: string | null }
+  | { kind: "unknown"; path: string; subpath?: string | null };
+
+export type CodexFileSystemPath =
+  | { type: "path"; path: string }
+  | { type: "glob_pattern"; pattern: string }
+  | { type: "special"; value: CodexFileSystemSpecialPath };
+
+export interface CodexFileSystemPermissionEntry {
+  access: "read" | "write" | "deny";
+  path: CodexFileSystemPath;
+}
+
+export interface CodexAdditionalFileSystemPermissions {
+  entries?: CodexFileSystemPermissionEntry[] | null;
+  globScanMaxDepth?: number | null;
+  read?: string[] | null;
+  write?: string[] | null;
+}
+
+export interface CodexPermissionProfile {
+  fileSystem?: CodexAdditionalFileSystemPermissions | null;
+  network?: { enabled?: boolean | null } | null;
+}
+
+export interface CodexPermissionApprovalRequest {
+  id: string;
+  cwd: string;
+  itemId: string;
+  permissions: CodexPermissionProfile;
+  startedAtMs: number;
+  threadId: string;
+  turnId: string;
+  environmentId: string | null;
+  reason: string | null;
+}
+
+export type CodexPermissionApprovalDecision = "deny" | "grantTurn" | "grantSession";
 
 export interface CodexThread {
   id: string;
@@ -286,15 +428,21 @@ type UserInputParseResult =
   | { status: "malformed"; message: string }
   | { status: "not-applicable" };
 
-interface PendingUserInputRequest {
+type McpElicitationParseResult =
+  | { status: "supported"; request: CodexMcpElicitationRequest }
+  | { status: "safe-cancel" }
+  | { status: "malformed"; message: string }
+  | { status: "not-applicable" };
+
+type PermissionApprovalParseResult =
+  | { status: "supported"; request: CodexPermissionApprovalRequest }
+  | { status: "malformed"; message: string }
+  | { status: "not-applicable" };
+
+interface PendingInteractiveRequest {
   controller: AbortController;
   threadId: string;
 }
-
-type SafeServerRequestResult =
-  | { status: "handled"; result: Record<string, unknown> }
-  | { status: "malformed"; message: string }
-  | { status: "not-applicable" };
 
 type JsonRpcServerResponse =
   | { id: string | number | null; result: unknown }
@@ -468,16 +616,16 @@ export class CodexRunner {
       env: buildCodexChildEnv(),
     });
 
-    const pendingUserInputRequests = new Map<string | number, PendingUserInputRequest>();
-    const abortPendingUserInputRequests = () => {
-      for (const pending of pendingUserInputRequests.values()) {
+    const pendingInteractiveRequests = new Map<string | number, PendingInteractiveRequest>();
+    const abortPendingInteractiveRequests = () => {
+      for (const pending of pendingInteractiveRequests.values()) {
         pending.controller.abort();
       }
-      pendingUserInputRequests.clear();
+      pendingInteractiveRequests.clear();
     };
     let forceKillTimer: NodeJS.Timeout | null = null;
     const abortChild = () => {
-      abortPendingUserInputRequests();
+      abortPendingInteractiveRequests();
       if (child.exitCode !== null || child.signalCode !== null) {
         return;
       }
@@ -564,7 +712,9 @@ export class CodexRunner {
           message,
           input.onApprovalRequest,
           input.onUserInputRequest,
-          pendingUserInputRequests,
+          input.onMcpElicitationRequest,
+          input.onPermissionApprovalRequest,
+          pendingInteractiveRequests,
           input.signal,
           respondToServerRequest,
           (decision) => {
@@ -588,7 +738,7 @@ export class CodexRunner {
       }
 
       if (message.method === "serverRequest/resolved") {
-        abortResolvedUserInputRequest(message, pendingUserInputRequests);
+        abortResolvedInteractiveRequest(message, pendingInteractiveRequests);
       }
 
       if (message.method === "thread/started") {
@@ -670,12 +820,12 @@ export class CodexRunner {
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolve, reject) => {
         child.on("error", (error) => {
-          abortPendingUserInputRequests();
+          abortPendingInteractiveRequests();
           rejectPendingRequests(error);
           reject(error);
         });
         child.on("close", (code, signal) => {
-          abortPendingUserInputRequests();
+          abortPendingInteractiveRequests();
           rejectPendingRequests(new Error("Codex app-server exited before responding."));
           resolve({ code, signal });
         });
@@ -775,7 +925,9 @@ export class CodexRunner {
     message: JsonRpcRequest,
     onApprovalRequest: CodexRunInput["onApprovalRequest"],
     onUserInputRequest: CodexRunInput["onUserInputRequest"],
-    pendingUserInputRequests: Map<string | number, PendingUserInputRequest>,
+    onMcpElicitationRequest: CodexRunInput["onMcpElicitationRequest"],
+    onPermissionApprovalRequest: CodexRunInput["onPermissionApprovalRequest"],
+    pendingInteractiveRequests: Map<string | number, PendingInteractiveRequest>,
     runSignal: AbortSignal | undefined,
     respond: (response: JsonRpcServerResponse) => void,
     onApprovalDecision: (decision: CodexApprovalDecision) => void,
@@ -785,6 +937,9 @@ export class CodexRunner {
       return;
     }
     const requestId = message.id;
+    if (rejectDuplicatePendingRequest(requestId, pendingInteractiveRequests, respond)) {
+      return;
+    }
 
     const userInput = parseUserInputRequest(message);
     if (userInput.status === "malformed") {
@@ -800,17 +955,19 @@ export class CodexRunner {
         return;
       }
 
-      const pending: PendingUserInputRequest = {
+      const pending: PendingInteractiveRequest = {
         controller: new AbortController(),
         threadId: userInput.request.threadId,
       };
-      pendingUserInputRequests.get(requestId)?.controller.abort();
-      pendingUserInputRequests.set(requestId, pending);
-      Promise.resolve()
+      if (rejectDuplicatePendingRequest(requestId, pendingInteractiveRequests, respond)) {
+        return;
+      }
+      pendingInteractiveRequests.set(requestId, pending);
+      deferServerRequestCallback()
         .then(() => {
           if (
             pending.controller.signal.aborted ||
-            pendingUserInputRequests.get(requestId) !== pending
+            pendingInteractiveRequests.get(requestId) !== pending
           ) {
             return undefined;
           }
@@ -821,11 +978,11 @@ export class CodexRunner {
         .then((response) => {
           if (
             pending.controller.signal.aborted ||
-            pendingUserInputRequests.get(requestId) !== pending
+            pendingInteractiveRequests.get(requestId) !== pending
           ) {
             return;
           }
-          pendingUserInputRequests.delete(requestId);
+          pendingInteractiveRequests.delete(requestId);
           const validated = parseUserInputResponse(response, userInput.request);
           if (!validated) {
             this.logger.warn("Codex user input callback returned an invalid response");
@@ -837,24 +994,52 @@ export class CodexRunner {
         .catch(() => {
           if (
             pending.controller.signal.aborted ||
-            pendingUserInputRequests.get(requestId) !== pending
+            pendingInteractiveRequests.get(requestId) !== pending
           ) {
             return;
           }
-          pendingUserInputRequests.delete(requestId);
+          pendingInteractiveRequests.delete(requestId);
           this.logger.warn("Codex user input callback failed");
           respondUserInputFailure(requestId, respond);
         });
       return;
     }
 
-    const safeRequest = parseSafeServerRequest(message);
-    if (safeRequest.status === "handled") {
-      respond({ id: requestId, result: safeRequest.result });
+    const elicitation = parseMcpElicitationRequest(message);
+    if (elicitation.status === "malformed") {
+      respond({ id: requestId, error: { code: -32602, message: elicitation.message } });
       return;
     }
-    if (safeRequest.status === "malformed") {
-      respond({ id: requestId, error: { code: -32602, message: safeRequest.message } });
+    if (elicitation.status === "safe-cancel") {
+      respond({ id: requestId, result: cancelledMcpElicitationResponse() });
+      return;
+    }
+    if (elicitation.status === "supported") {
+      this.handleMcpElicitationRequest(
+        requestId,
+        elicitation.request,
+        onMcpElicitationRequest,
+        pendingInteractiveRequests,
+        runSignal,
+        respond,
+      );
+      return;
+    }
+
+    const permissionApproval = parsePermissionApprovalRequest(message);
+    if (permissionApproval.status === "malformed") {
+      respond({ id: requestId, error: { code: -32602, message: permissionApproval.message } });
+      return;
+    }
+    if (permissionApproval.status === "supported") {
+      this.handlePermissionApprovalRequest(
+        requestId,
+        permissionApproval.request,
+        onPermissionApprovalRequest,
+        pendingInteractiveRequests,
+        runSignal,
+        respond,
+      );
       return;
     }
 
@@ -911,6 +1096,128 @@ export class CodexRunner {
       });
   }
 
+  private handleMcpElicitationRequest(
+    requestId: string | number,
+    request: CodexMcpElicitationRequest,
+    callback: CodexRunInput["onMcpElicitationRequest"],
+    pendingRequests: Map<string | number, PendingInteractiveRequest>,
+    runSignal: AbortSignal | undefined,
+    respond: (response: JsonRpcServerResponse) => void,
+  ): void {
+    if (runSignal?.aborted) {
+      return;
+    }
+    if (!callback) {
+      respond({ id: requestId, result: cancelledMcpElicitationResponse() });
+      return;
+    }
+    if (rejectDuplicatePendingRequest(requestId, pendingRequests, respond)) {
+      return;
+    }
+
+    // Validation always uses a private snapshot. The callback receives a separate clone so
+    // UI code cannot weaken `required`, add enum options, or change modes before validation.
+    const validationRequest = cloneMcpElicitationRequest(request);
+    const callbackRequest = cloneMcpElicitationRequest(validationRequest);
+    const pending: PendingInteractiveRequest = {
+      controller: new AbortController(),
+      threadId: request.threadId,
+    };
+    pendingRequests.set(requestId, pending);
+    deferServerRequestCallback()
+      .then(() => {
+        if (pending.controller.signal.aborted || pendingRequests.get(requestId) !== pending) {
+          return undefined;
+        }
+        return callback(callbackRequest, { signal: pending.controller.signal });
+      })
+      .then((response) => {
+        if (pending.controller.signal.aborted || pendingRequests.get(requestId) !== pending) {
+          return;
+        }
+        pendingRequests.delete(requestId);
+        const validated = parseMcpElicitationResponse(response, validationRequest);
+        if (!validated) {
+          this.logger.warn("Codex MCP elicitation callback returned an invalid response; cancelling");
+          respond({ id: requestId, result: cancelledMcpElicitationResponse() });
+          return;
+        }
+        respond({ id: requestId, result: validated });
+      })
+      .catch(() => {
+        if (pending.controller.signal.aborted || pendingRequests.get(requestId) !== pending) {
+          return;
+        }
+        pendingRequests.delete(requestId);
+        this.logger.warn("Codex MCP elicitation callback failed; cancelling");
+        respond({ id: requestId, result: cancelledMcpElicitationResponse() });
+      });
+  }
+
+  private handlePermissionApprovalRequest(
+    requestId: string | number,
+    request: CodexPermissionApprovalRequest,
+    callback: CodexRunInput["onPermissionApprovalRequest"],
+    pendingRequests: Map<string | number, PendingInteractiveRequest>,
+    runSignal: AbortSignal | undefined,
+    respond: (response: JsonRpcServerResponse) => void,
+  ): void {
+    if (runSignal?.aborted) {
+      return;
+    }
+    if (!callback) {
+      respond({ id: requestId, result: deniedPermissionApprovalResponse() });
+      return;
+    }
+    if (rejectDuplicatePendingRequest(requestId, pendingRequests, respond)) {
+      return;
+    }
+
+    // Keep a private snapshot: the UI may display the request but cannot mutate the grant.
+    const responsePermissions = clonePermissionProfile(request.permissions);
+    const pending: PendingInteractiveRequest = {
+      controller: new AbortController(),
+      threadId: request.threadId,
+    };
+    pendingRequests.set(requestId, pending);
+    deferServerRequestCallback()
+      .then(() => {
+        if (pending.controller.signal.aborted || pendingRequests.get(requestId) !== pending) {
+          return undefined;
+        }
+        return callback(request, { signal: pending.controller.signal });
+      })
+      .then((decision) => {
+        if (pending.controller.signal.aborted || pendingRequests.get(requestId) !== pending) {
+          return;
+        }
+        pendingRequests.delete(requestId);
+        if (!isPermissionApprovalDecision(decision)) {
+          this.logger.warn("Codex permission approval callback returned an invalid decision; denying");
+          respond({ id: requestId, result: deniedPermissionApprovalResponse() });
+          return;
+        }
+        respond({
+          id: requestId,
+          result:
+            decision === "deny"
+              ? deniedPermissionApprovalResponse()
+              : {
+                  permissions: responsePermissions,
+                  scope: decision === "grantSession" ? "session" : "turn",
+                },
+        });
+      })
+      .catch(() => {
+        if (pending.controller.signal.aborted || pendingRequests.get(requestId) !== pending) {
+          return;
+        }
+        pendingRequests.delete(requestId);
+        this.logger.warn("Codex permission approval callback failed; denying");
+        respond({ id: requestId, result: deniedPermissionApprovalResponse() });
+      });
+  }
+
   private async requestAppServer(method: string, params: Record<string, unknown>): Promise<unknown> {
     const child = spawn(this.config.codexBin, buildCodexAppServerArgs(), {
       cwd: this.config.codexWorkdir,
@@ -924,7 +1231,7 @@ export class CodexRunner {
       string,
       { resolve: (value: unknown) => void; reject: (error: Error) => void }
     >();
-    const pendingUserInputRequests = new Map<string | number, PendingUserInputRequest>();
+    const pendingInteractiveRequests = new Map<string | number, PendingInteractiveRequest>();
 
     let forceKillTimer: NodeJS.Timeout | null = null;
     const abortChild = () => {
@@ -986,7 +1293,9 @@ export class CodexRunner {
           message,
           undefined,
           undefined,
-          pendingUserInputRequests,
+          undefined,
+          undefined,
+          pendingInteractiveRequests,
           undefined,
           (response) => {
             try {
@@ -1008,7 +1317,7 @@ export class CodexRunner {
         return;
       }
       if (isJsonRpcNotification(message) && message.method === "serverRequest/resolved") {
-        abortResolvedUserInputRequest(message, pendingUserInputRequests);
+        abortResolvedInteractiveRequest(message, pendingInteractiveRequests);
       }
     });
 
@@ -1519,9 +1828,9 @@ function respondUserInputFailure(
   });
 }
 
-function abortResolvedUserInputRequest(
+function abortResolvedInteractiveRequest(
   notification: JsonRpcNotification,
-  pendingUserInputRequests: Map<string | number, PendingUserInputRequest>,
+  pendingRequests: Map<string | number, PendingInteractiveRequest>,
 ): void {
   const params = asObjectRecord(notification.params);
   const requestId = params?.requestId;
@@ -1529,66 +1838,997 @@ function abortResolvedUserInputRequest(
   if (!isRequestId(requestId) || threadId === undefined) {
     return;
   }
-  const pending = pendingUserInputRequests.get(requestId);
+  const pending = pendingRequests.get(requestId);
   if (!pending || pending.threadId !== threadId) {
     return;
   }
-  pendingUserInputRequests.delete(requestId);
+  pendingRequests.delete(requestId);
   pending.controller.abort();
 }
 
-function parseSafeServerRequest(message: JsonRpcRequest): SafeServerRequestResult {
-  if (message.method === "mcpServer/elicitation/request") {
-    const params = asObjectRecord(message.params);
-    if (!params || !isValidMcpElicitationParams(params)) {
-      return { status: "malformed", message: "Invalid params: malformed MCP elicitation" };
-    }
-    return { status: "handled", result: { action: "cancel", content: null } };
+function rejectDuplicatePendingRequest(
+  requestId: string | number,
+  pendingRequests: Map<string | number, PendingInteractiveRequest>,
+  respond: (response: JsonRpcServerResponse) => void,
+): boolean {
+  const existing = pendingRequests.get(requestId);
+  if (!existing) {
+    return false;
   }
-
-  if (message.method === "item/permissions/requestApproval") {
-    const params = asObjectRecord(message.params);
-    if (!params || !isValidPermissionsApprovalParams(params)) {
-      return { status: "malformed", message: "Invalid params: malformed permission approval" };
-    }
-    return { status: "handled", result: { permissions: {}, scope: "turn" } };
-  }
-
-  return { status: "not-applicable" };
+  pendingRequests.delete(requestId);
+  existing.controller.abort();
+  respond({ id: requestId, error: { code: -32600, message: "Invalid Request" } });
+  return true;
 }
 
-function isValidMcpElicitationParams(params: Record<string, unknown>): boolean {
+function parseMcpElicitationRequest(message: JsonRpcRequest): McpElicitationParseResult {
+  if (message.method !== "mcpServer/elicitation/request") {
+    return { status: "not-applicable" };
+  }
+
+  const params = asPlainObjectRecord(message.params);
   if (
-    typeof params.serverName !== "string" ||
-    typeof params.threadId !== "string" ||
-    !isOptionalNullableString(params.turnId) ||
-    typeof params.message !== "string" ||
-    typeof params.mode !== "string"
+    !params ||
+    !isBoundedNonEmptyString(params.serverName, maxInteractiveIdentityLength) ||
+    !isBoundedNonEmptyString(params.threadId, maxInteractiveIdentityLength) ||
+    !isNullableBoundedString(params.turnId, maxInteractiveIdentityLength) ||
+    !isBoundedString(params.message, maxInteractiveMessageLength) ||
+    !isBoundedOpaqueJson(params._meta, maxInteractiveMessageLength)
+  ) {
+    return { status: "malformed", message: "Invalid params: malformed MCP elicitation" };
+  }
+
+  if (params.mode === "openai/form") {
+    if (
+      !hasOnlyKeys(params, [
+        "_meta",
+        "serverName",
+        "threadId",
+        "turnId",
+        "message",
+        "mode",
+        "requestedSchema",
+      ]) ||
+      !Object.hasOwn(params, "requestedSchema") ||
+      !isBoundedOpaqueJson(params.requestedSchema, maxInteractiveMessageLength)
+    ) {
+      return { status: "malformed", message: "Invalid params: malformed MCP elicitation" };
+    }
+    // This client deliberately does not negotiate mcpServerOpenaiFormElicitation.
+    return { status: "safe-cancel" };
+  }
+
+  const common = {
+    id: randomUUID(),
+    serverName: params.serverName,
+    threadId: params.threadId,
+    turnId: (params.turnId as string | null | undefined) ?? null,
+    message: params.message,
+  };
+  if (params.mode === "form") {
+    if (
+      !hasOnlyKeys(params, [
+        "_meta",
+        "serverName",
+        "threadId",
+        "turnId",
+        "message",
+        "mode",
+        "requestedSchema",
+      ])
+    ) {
+      return { status: "malformed", message: "Invalid params: malformed MCP elicitation" };
+    }
+    const fields = parseMcpFormSchema(params.requestedSchema);
+    if (!fields) {
+      return { status: "malformed", message: "Invalid params: malformed MCP elicitation" };
+    }
+    return { status: "supported", request: { ...common, mode: "form", fields } };
+  }
+
+  if (
+    params.mode === "url" &&
+    hasOnlyKeys(params, [
+      "_meta",
+      "serverName",
+      "threadId",
+      "turnId",
+      "message",
+      "mode",
+      "elicitationId",
+      "url",
+    ]) &&
+    isBoundedNonEmptyString(params.elicitationId, maxInteractiveIdentityLength) &&
+    isAllowedMcpUrl(params.url)
+  ) {
+    return {
+      status: "supported",
+      request: {
+        ...common,
+        mode: "url",
+        elicitationId: params.elicitationId,
+        url: params.url,
+      },
+    };
+  }
+
+  return { status: "malformed", message: "Invalid params: malformed MCP elicitation" };
+}
+
+function parseMcpFormSchema(value: unknown): CodexMcpElicitationField[] | null {
+  const schema = asPlainObjectRecord(value);
+  if (
+    !schema ||
+    !hasOnlyKeys(schema, ["$schema", "properties", "required", "type"]) ||
+    schema.type !== "object" ||
+    !isNullableBoundedString(schema.$schema, maxMcpUrlLength)
+  ) {
+    return null;
+  }
+  const properties = asPlainObjectRecord(schema.properties);
+  if (!properties || Object.keys(properties).length > maxMcpFormFields) {
+    return null;
+  }
+
+  let required: string[] = [];
+  if (schema.required !== undefined && schema.required !== null) {
+    if (
+      !Array.isArray(schema.required) ||
+      schema.required.length > maxMcpFormFields ||
+      !schema.required.every((item) => isBoundedNonEmptyString(item, maxMcpFieldNameLength)) ||
+      new Set(schema.required).size !== schema.required.length
+    ) {
+      return null;
+    }
+    required = schema.required;
+  }
+  const requiredNames = new Set(required);
+  if (required.some((name) => !Object.hasOwn(properties, name))) {
+    return null;
+  }
+
+  const fields: CodexMcpElicitationField[] = [];
+  for (const [name, fieldSchema] of Object.entries(properties)) {
+    if (!isBoundedNonEmptyString(name, maxMcpFieldNameLength) || !isSafeObjectKey(name)) {
+      return null;
+    }
+    const field = parseMcpFormField(name, fieldSchema, requiredNames.has(name));
+    if (!field) {
+      return null;
+    }
+    fields.push(field);
+  }
+  return fields;
+}
+
+function parseMcpFormField(
+  name: string,
+  value: unknown,
+  required: boolean,
+): CodexMcpElicitationField | null {
+  const schema = asPlainObjectRecord(value);
+  if (!schema) {
+    return null;
+  }
+  const title = readNullableText(schema, "title", maxMcpFieldTextLength);
+  const description = readNullableText(schema, "description", maxMcpFieldTextLength);
+  if (!title.ok || !description.ok) {
+    return null;
+  }
+  const base = { name, title: title.value, description: description.value, required };
+
+  if (schema.type === "array") {
+    if (
+      !hasOnlyKeys(schema, [
+        "type",
+        "title",
+        "description",
+        "default",
+        "items",
+        "minItems",
+        "maxItems",
+      ])
+    ) {
+      return null;
+    }
+    const options = parseMcpMultiSelectOptions(schema.items);
+    const minItems = readNullableBoundedInteger(schema, "minItems", 0, maxMcpEnumOptions);
+    const maxItems = readNullableBoundedInteger(schema, "maxItems", 0, maxMcpEnumOptions);
+    if (
+      !options ||
+      !minItems.ok ||
+      !maxItems.ok ||
+      (minItems.value !== null && maxItems.value !== null && minItems.value > maxItems.value) ||
+      (minItems.value !== null && minItems.value > options.length)
+    ) {
+      return null;
+    }
+    const defaultValue = readNullableStringArray(schema, "default", options);
+    if (!defaultValue.ok) {
+      return null;
+    }
+    if (
+      defaultValue.value !== null &&
+      ((minItems.value !== null && defaultValue.value.length < minItems.value) ||
+        (maxItems.value !== null && defaultValue.value.length > maxItems.value))
+    ) {
+      return null;
+    }
+    return {
+      ...base,
+      type: "multi_select",
+      default: defaultValue.value,
+      options,
+      minItems: minItems.value,
+      maxItems: maxItems.value,
+    };
+  }
+
+  if (schema.type === "boolean") {
+    if (!hasOnlyKeys(schema, ["type", "title", "description", "default"])) {
+      return null;
+    }
+    const defaultValue = readNullableBoolean(schema, "default");
+    return defaultValue.ok
+      ? { ...base, type: "boolean", default: defaultValue.value }
+      : null;
+  }
+
+  if (schema.type === "number" || schema.type === "integer") {
+    if (
+      !hasOnlyKeys(schema, [
+        "type",
+        "title",
+        "description",
+        "default",
+        "minimum",
+        "maximum",
+      ])
+    ) {
+      return null;
+    }
+    const minimum = readNullableFiniteNumber(schema, "minimum");
+    const maximum = readNullableFiniteNumber(schema, "maximum");
+    const defaultValue = readNullableFiniteNumber(schema, "default");
+    if (
+      !minimum.ok ||
+      !maximum.ok ||
+      !defaultValue.ok ||
+      (minimum.value !== null && maximum.value !== null && minimum.value > maximum.value) ||
+      (schema.type === "integer" &&
+        defaultValue.value !== null &&
+        !Number.isSafeInteger(defaultValue.value)) ||
+      (defaultValue.value !== null &&
+        ((minimum.value !== null && defaultValue.value < minimum.value) ||
+          (maximum.value !== null && defaultValue.value > maximum.value)))
+    ) {
+      return null;
+    }
+    return {
+      ...base,
+      type: schema.type,
+      default: defaultValue.value,
+      minimum: minimum.value,
+      maximum: maximum.value,
+    };
+  }
+
+  if (schema.type !== "string") {
+    return null;
+  }
+  if (Object.hasOwn(schema, "oneOf") || Object.hasOwn(schema, "enum")) {
+    const options = parseMcpSingleSelectOptions(schema);
+    if (!options) {
+      return null;
+    }
+    const defaultValue = readNullableString(schema, "default", maxMcpEnumValueLength);
+    if (
+      !defaultValue.ok ||
+      (defaultValue.value !== null &&
+        !options.some((option) => option.value === defaultValue.value))
+    ) {
+      return null;
+    }
+    return { ...base, type: "enum", default: defaultValue.value, options };
+  }
+
+  if (
+    !hasOnlyKeys(schema, [
+      "type",
+      "title",
+      "description",
+      "default",
+      "format",
+      "minLength",
+      "maxLength",
+    ])
+  ) {
+    return null;
+  }
+  const format = readNullableStringFormat(schema.format);
+  const minLength = readNullableBoundedInteger(
+    schema,
+    "minLength",
+    0,
+    maxMcpStringValueLength,
+  );
+  const maxLength = readNullableBoundedInteger(
+    schema,
+    "maxLength",
+    0,
+    maxMcpStringValueLength,
+  );
+  const defaultValue = readNullableString(schema, "default", maxMcpStringValueLength);
+  if (
+    !format.ok ||
+    !minLength.ok ||
+    !maxLength.ok ||
+    !defaultValue.ok ||
+    (minLength.value !== null && maxLength.value !== null && minLength.value > maxLength.value) ||
+    (defaultValue.value !== null &&
+      !isValidMcpStringValue(defaultValue.value, {
+        ...base,
+        type: "string",
+        default: null,
+        format: format.value,
+        minLength: minLength.value,
+        maxLength: maxLength.value,
+      }))
+  ) {
+    return null;
+  }
+  return {
+    ...base,
+    type: "string",
+    default: defaultValue.value,
+    format: format.value,
+    minLength: minLength.value,
+    maxLength: maxLength.value,
+  };
+}
+
+function parseMcpSingleSelectOptions(
+  schema: Record<string, unknown>,
+): CodexMcpElicitationOption[] | null {
+  if (Object.hasOwn(schema, "oneOf")) {
+    if (!hasOnlyKeys(schema, ["type", "title", "description", "default", "oneOf"])) {
+      return null;
+    }
+    return parseMcpTitledOptions(schema.oneOf);
+  }
+  if (
+    !hasOnlyKeys(schema, [
+      "type",
+      "title",
+      "description",
+      "default",
+      "enum",
+      "enumNames",
+    ]) ||
+    !Array.isArray(schema.enum)
+  ) {
+    return null;
+  }
+  const values = parseBoundedUniqueStrings(schema.enum, maxMcpEnumOptions, maxMcpEnumValueLength);
+  if (!values) {
+    return null;
+  }
+  if (schema.enumNames === undefined || schema.enumNames === null) {
+    return values.map((value) => ({ value, title: value }));
+  }
+  const titles = parseBoundedStrings(
+    schema.enumNames,
+    maxMcpEnumOptions,
+    maxMcpFieldTextLength,
+  );
+  return titles && titles.length === values.length
+    ? values.map((value, index) => ({ value, title: titles[index] ?? value }))
+    : null;
+}
+
+function parseMcpMultiSelectOptions(value: unknown): CodexMcpElicitationOption[] | null {
+  const items = asPlainObjectRecord(value);
+  if (!items) {
+    return null;
+  }
+  if (Object.hasOwn(items, "enum")) {
+    if (!hasOnlyKeys(items, ["type", "enum"]) || items.type !== "string") {
+      return null;
+    }
+    const values = parseBoundedUniqueStrings(items.enum, maxMcpEnumOptions, maxMcpEnumValueLength);
+    return values?.map((option) => ({ value: option, title: option })) ?? null;
+  }
+  if (!hasOnlyKeys(items, ["anyOf"])) {
+    return null;
+  }
+  return parseMcpTitledOptions(items.anyOf);
+}
+
+function parseMcpTitledOptions(value: unknown): CodexMcpElicitationOption[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxMcpEnumOptions) {
+    return null;
+  }
+  const options: CodexMcpElicitationOption[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    const option = asPlainObjectRecord(raw);
+    if (
+      !option ||
+      !hasOnlyKeys(option, ["const", "title"]) ||
+      !isBoundedString(option.const, maxMcpEnumValueLength) ||
+      !isBoundedString(option.title, maxMcpFieldTextLength) ||
+      seen.has(option.const)
+    ) {
+      return null;
+    }
+    seen.add(option.const);
+    options.push({ value: option.const, title: option.title });
+  }
+  return options;
+}
+
+function parseMcpElicitationResponse(
+  value: unknown,
+  request: CodexMcpElicitationRequest,
+): Record<string, unknown> | null {
+  const response = asPlainObjectRecord(value);
+  if (!response || !hasOnlyKeys(response, ["action", "content"])) {
+    return null;
+  }
+  if (response.action === "decline" || response.action === "cancel") {
+    return response.content === undefined || response.content === null
+      ? { action: response.action, content: null }
+      : null;
+  }
+  if (response.action !== "accept") {
+    return null;
+  }
+  if (request.mode === "url") {
+    return response.content === undefined || response.content === null
+      ? { action: "accept", content: null }
+      : null;
+  }
+
+  const content = asPlainObjectRecord(response.content);
+  if (!content) {
+    return null;
+  }
+  const fields = new Map(request.fields.map((field) => [field.name, field]));
+  if (Object.keys(content).some((name) => !fields.has(name))) {
+    return null;
+  }
+  const normalized: Record<string, CodexMcpElicitationValue> = {};
+  for (const field of request.fields) {
+    if (!Object.hasOwn(content, field.name)) {
+      if (field.required) {
+        return null;
+      }
+      continue;
+    }
+    const fieldValue = content[field.name];
+    if (!isValidMcpFieldValue(fieldValue, field)) {
+      return null;
+    }
+    normalized[field.name] = Array.isArray(fieldValue) ? [...fieldValue] : fieldValue;
+  }
+  return { action: "accept", content: normalized };
+}
+
+function cloneMcpElicitationRequest(
+  request: CodexMcpElicitationRequest,
+): CodexMcpElicitationRequest {
+  if (request.mode === "url") {
+    return { ...request };
+  }
+  return {
+    ...request,
+    fields: request.fields.map((field) => {
+      if (field.type === "enum") {
+        return {
+          ...field,
+          options: field.options.map((option) => ({ ...option })),
+        };
+      }
+      if (field.type === "multi_select") {
+        return {
+          ...field,
+          default: field.default ? [...field.default] : null,
+          options: field.options.map((option) => ({ ...option })),
+        };
+      }
+      return { ...field };
+    }),
+  };
+}
+
+function isValidMcpFieldValue(value: unknown, field: CodexMcpElicitationField): value is CodexMcpElicitationValue {
+  if (field.type === "string") {
+    return typeof value === "string" && isValidMcpStringValue(value, field);
+  }
+  if (field.type === "number" || field.type === "integer") {
+    return (
+      typeof value === "number" &&
+      Number.isFinite(value) &&
+      (field.type !== "integer" || Number.isSafeInteger(value)) &&
+      (field.minimum === null || value >= field.minimum) &&
+      (field.maximum === null || value <= field.maximum)
+    );
+  }
+  if (field.type === "boolean") {
+    return typeof value === "boolean";
+  }
+  if (field.type === "enum") {
+    return typeof value === "string" && field.options.some((option) => option.value === value);
+  }
+  return (
+    Array.isArray(value) &&
+    value.every((item) => typeof item === "string") &&
+    new Set(value).size === value.length &&
+    (field.minItems === null || value.length >= field.minItems) &&
+    (field.maxItems === null || value.length <= field.maxItems) &&
+    value.every((item) => field.options.some((option) => option.value === item))
+  );
+}
+
+function isValidMcpStringValue(
+  value: string,
+  field: Extract<CodexMcpElicitationField, { type: "string" }>,
+): boolean {
+  if (
+    value.length > maxMcpStringValueLength ||
+    (field.minLength !== null && value.length < field.minLength) ||
+    (field.maxLength !== null && value.length > field.maxLength)
   ) {
     return false;
   }
-  if (params.mode === "form" || params.mode === "openai/form") {
-    return Object.hasOwn(params, "requestedSchema");
+  if (field.format === "email") {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value);
   }
-  return (
-    params.mode === "url" &&
-    typeof params.elicitationId === "string" &&
-    typeof params.url === "string"
-  );
+  if (field.format === "uri") {
+    try {
+      return new URL(value).protocol.length > 1;
+    } catch {
+      return false;
+    }
+  }
+  if (field.format === "date") {
+    return /^\d{4}-\d{2}-\d{2}$/u.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+  }
+  if (field.format === "date-time") {
+    return /^\d{4}-\d{2}-\d{2}T/u.test(value) && !Number.isNaN(Date.parse(value));
+  }
+  return true;
 }
 
-function isValidPermissionsApprovalParams(params: Record<string, unknown>): boolean {
-  return (
-    typeof params.cwd === "string" &&
-    typeof params.itemId === "string" &&
-    isRequestPermissionProfile(params.permissions) &&
-    typeof params.startedAtMs === "number" &&
-    Number.isInteger(params.startedAtMs) &&
-    typeof params.threadId === "string" &&
-    typeof params.turnId === "string" &&
-    isOptionalNullableString(params.environmentId) &&
-    isOptionalNullableString(params.reason)
-  );
+function cancelledMcpElicitationResponse(): Record<string, unknown> {
+  return { action: "cancel", content: null };
+}
+
+function isAllowedMcpUrl(value: unknown): value is string {
+  if (!isBoundedNonEmptyString(value, maxMcpUrlLength) || value.trim() !== value) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      parsed.hostname.length > 0 &&
+      parsed.username === "" &&
+      parsed.password === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+function parsePermissionApprovalRequest(message: JsonRpcRequest): PermissionApprovalParseResult {
+  if (message.method !== "item/permissions/requestApproval") {
+    return { status: "not-applicable" };
+  }
+  const params = asPlainObjectRecord(message.params);
+  if (
+    !params ||
+    !hasOnlyKeys(params, [
+      "cwd",
+      "environmentId",
+      "itemId",
+      "permissions",
+      "reason",
+      "startedAtMs",
+      "threadId",
+      "turnId",
+    ]) ||
+    !isBoundedNonEmptyString(params.cwd, maxPermissionPathLength) ||
+    !isBoundedNonEmptyString(params.itemId, maxInteractiveIdentityLength) ||
+    !Number.isSafeInteger(params.startedAtMs) ||
+    !isBoundedNonEmptyString(params.threadId, maxInteractiveIdentityLength) ||
+    !isBoundedNonEmptyString(params.turnId, maxInteractiveIdentityLength) ||
+    !isNullableBoundedString(params.environmentId, maxInteractiveIdentityLength) ||
+    !isNullableBoundedString(params.reason, maxInteractiveMessageLength)
+  ) {
+    return { status: "malformed", message: "Invalid params: malformed permission approval" };
+  }
+  const permissions = parsePermissionProfile(params.permissions);
+  if (!permissions) {
+    return { status: "malformed", message: "Invalid params: malformed permission approval" };
+  }
+  return {
+    status: "supported",
+    request: {
+      id: randomUUID(),
+      cwd: params.cwd,
+      itemId: params.itemId,
+      permissions,
+      startedAtMs: params.startedAtMs as number,
+      threadId: params.threadId,
+      turnId: params.turnId,
+      environmentId: (params.environmentId as string | null | undefined) ?? null,
+      reason: (params.reason as string | null | undefined) ?? null,
+    },
+  };
+}
+
+function parsePermissionProfile(value: unknown): CodexPermissionProfile | null {
+  const profile = asPlainObjectRecord(value);
+  if (!profile || !hasOnlyKeys(profile, ["fileSystem", "network"])) {
+    return null;
+  }
+  const result: CodexPermissionProfile = {};
+  if (Object.hasOwn(profile, "fileSystem")) {
+    if (profile.fileSystem === null) {
+      result.fileSystem = null;
+    } else {
+      const fileSystem = parseAdditionalFileSystemPermissions(profile.fileSystem);
+      if (!fileSystem) {
+        return null;
+      }
+      result.fileSystem = fileSystem;
+    }
+  }
+  if (Object.hasOwn(profile, "network")) {
+    if (profile.network === null) {
+      result.network = null;
+    } else {
+      const network = asPlainObjectRecord(profile.network);
+      if (!network || !hasOnlyKeys(network, ["enabled"])) {
+        return null;
+      }
+      const normalized: { enabled?: boolean | null } = {};
+      if (Object.hasOwn(network, "enabled")) {
+        if (network.enabled !== null && typeof network.enabled !== "boolean") {
+          return null;
+        }
+        normalized.enabled = network.enabled as boolean | null;
+      }
+      result.network = normalized;
+    }
+  }
+  return result;
+}
+
+function parseAdditionalFileSystemPermissions(
+  value: unknown,
+): CodexAdditionalFileSystemPermissions | null {
+  const permissions = asPlainObjectRecord(value);
+  if (!permissions || !hasOnlyKeys(permissions, ["entries", "globScanMaxDepth", "read", "write"])) {
+    return null;
+  }
+  const result: CodexAdditionalFileSystemPermissions = {};
+  if (Object.hasOwn(permissions, "entries")) {
+    if (permissions.entries === null) {
+      result.entries = null;
+    } else if (Array.isArray(permissions.entries) && permissions.entries.length <= maxPermissionEntries) {
+      const entries = permissions.entries.map(parseFileSystemPermissionEntry);
+      if (entries.some((entry) => entry === null)) {
+        return null;
+      }
+      result.entries = entries as CodexFileSystemPermissionEntry[];
+    } else {
+      return null;
+    }
+  }
+  if (Object.hasOwn(permissions, "globScanMaxDepth")) {
+    if (permissions.globScanMaxDepth === null) {
+      result.globScanMaxDepth = null;
+    } else if (
+      Number.isSafeInteger(permissions.globScanMaxDepth) &&
+      (permissions.globScanMaxDepth as number) >= 1 &&
+      (permissions.globScanMaxDepth as number) <= maxPermissionGlobDepth
+    ) {
+      result.globScanMaxDepth = permissions.globScanMaxDepth as number;
+    } else {
+      return null;
+    }
+  }
+  for (const key of ["read", "write"] as const) {
+    if (!Object.hasOwn(permissions, key)) {
+      continue;
+    }
+    if (permissions[key] === null) {
+      result[key] = null;
+      continue;
+    }
+    const paths = parseBoundedStrings(permissions[key], maxPermissionEntries, maxPermissionPathLength);
+    if (!paths) {
+      return null;
+    }
+    result[key] = paths;
+  }
+  return result;
+}
+
+function parseFileSystemPermissionEntry(value: unknown): CodexFileSystemPermissionEntry | null {
+  const entry = asPlainObjectRecord(value);
+  if (
+    !entry ||
+    !hasOnlyKeys(entry, ["access", "path"]) ||
+    (entry.access !== "read" && entry.access !== "write" && entry.access !== "deny")
+  ) {
+    return null;
+  }
+  const filePath = parsePermissionFileSystemPath(entry.path);
+  return filePath ? { access: entry.access, path: filePath } : null;
+}
+
+function parsePermissionFileSystemPath(value: unknown): CodexFileSystemPath | null {
+  const filePath = asPlainObjectRecord(value);
+  if (!filePath) {
+    return null;
+  }
+  if (
+    filePath.type === "path" &&
+    hasOnlyKeys(filePath, ["type", "path"]) &&
+    isBoundedString(filePath.path, maxPermissionPathLength)
+  ) {
+    return { type: "path", path: filePath.path };
+  }
+  if (
+    filePath.type === "glob_pattern" &&
+    hasOnlyKeys(filePath, ["type", "pattern"]) &&
+    isBoundedString(filePath.pattern, maxPermissionPathLength)
+  ) {
+    return { type: "glob_pattern", pattern: filePath.pattern };
+  }
+  if (filePath.type !== "special" || !hasOnlyKeys(filePath, ["type", "value"])) {
+    return null;
+  }
+  const special = parsePermissionSpecialPath(filePath.value);
+  return special ? { type: "special", value: special } : null;
+}
+
+function parsePermissionSpecialPath(value: unknown): CodexFileSystemSpecialPath | null {
+  const special = asPlainObjectRecord(value);
+  if (!special) {
+    return null;
+  }
+  if (
+    special.kind === "root" ||
+    special.kind === "minimal" ||
+    special.kind === "tmpdir" ||
+    special.kind === "slash_tmp"
+  ) {
+    return hasOnlyKeys(special, ["kind"]) ? { kind: special.kind } : null;
+  }
+  if (special.kind === "project_roots") {
+    if (
+      !hasOnlyKeys(special, ["kind", "subpath"]) ||
+      !isNullableBoundedString(special.subpath, maxPermissionPathLength)
+    ) {
+      return null;
+    }
+    return Object.hasOwn(special, "subpath")
+      ? { kind: "project_roots", subpath: special.subpath as string | null }
+      : { kind: "project_roots" };
+  }
+  if (
+    special.kind === "unknown" &&
+    hasOnlyKeys(special, ["kind", "path", "subpath"]) &&
+    isBoundedString(special.path, maxPermissionPathLength) &&
+    isNullableBoundedString(special.subpath, maxPermissionPathLength)
+  ) {
+    return Object.hasOwn(special, "subpath")
+      ? { kind: "unknown", path: special.path, subpath: special.subpath as string | null }
+      : { kind: "unknown", path: special.path };
+  }
+  return null;
+}
+
+function clonePermissionProfile(profile: CodexPermissionProfile): CodexPermissionProfile {
+  return {
+    ...(Object.hasOwn(profile, "fileSystem")
+      ? {
+          fileSystem:
+            profile.fileSystem === null
+              ? null
+              : {
+                  ...profile.fileSystem,
+                  ...(Array.isArray(profile.fileSystem?.entries)
+                    ? {
+                        entries: profile.fileSystem.entries.map((entry) => ({
+                          access: entry.access,
+                          path: clonePermissionPath(entry.path),
+                        })),
+                      }
+                    : {}),
+                  ...(Array.isArray(profile.fileSystem?.read)
+                    ? { read: [...profile.fileSystem.read] }
+                    : {}),
+                  ...(Array.isArray(profile.fileSystem?.write)
+                    ? { write: [...profile.fileSystem.write] }
+                    : {}),
+                },
+        }
+      : {}),
+    ...(Object.hasOwn(profile, "network")
+      ? { network: profile.network === null ? null : { ...profile.network } }
+      : {}),
+  };
+}
+
+function clonePermissionPath(filePath: CodexFileSystemPath): CodexFileSystemPath {
+  if (filePath.type === "path") {
+    return { ...filePath };
+  }
+  if (filePath.type === "glob_pattern") {
+    return { ...filePath };
+  }
+  return { type: "special", value: { ...filePath.value } };
+}
+
+function isPermissionApprovalDecision(value: unknown): value is CodexPermissionApprovalDecision {
+  return value === "deny" || value === "grantTurn" || value === "grantSession";
+}
+
+function deniedPermissionApprovalResponse(): Record<string, unknown> {
+  return { permissions: {}, scope: "turn" };
+}
+
+type NullableReadResult<T> = { ok: true; value: T | null } | { ok: false; value: null };
+
+function readNullableText(
+  record: Record<string, unknown>,
+  key: string,
+  maxLength: number,
+): NullableReadResult<string> {
+  return readNullableString(record, key, maxLength);
+}
+
+function readNullableString(
+  record: Record<string, unknown>,
+  key: string,
+  maxLength: number,
+): NullableReadResult<string> {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return { ok: true, value: null };
+  }
+  return isBoundedString(value, maxLength)
+    ? { ok: true, value }
+    : { ok: false, value: null };
+}
+
+function readNullableBoolean(
+  record: Record<string, unknown>,
+  key: string,
+): NullableReadResult<boolean> {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return { ok: true, value: null };
+  }
+  return typeof value === "boolean"
+    ? { ok: true, value }
+    : { ok: false, value: null };
+}
+
+function readNullableFiniteNumber(
+  record: Record<string, unknown>,
+  key: string,
+): NullableReadResult<number> {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return { ok: true, value: null };
+  }
+  return typeof value === "number" && Number.isFinite(value)
+    ? { ok: true, value }
+    : { ok: false, value: null };
+}
+
+function readNullableBoundedInteger(
+  record: Record<string, unknown>,
+  key: string,
+  minimum: number,
+  maximum: number,
+): NullableReadResult<number> {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return { ok: true, value: null };
+  }
+  return Number.isSafeInteger(value) && (value as number) >= minimum && (value as number) <= maximum
+    ? { ok: true, value: value as number }
+    : { ok: false, value: null };
+}
+
+function readNullableStringArray(
+  record: Record<string, unknown>,
+  key: string,
+  options: CodexMcpElicitationOption[],
+): NullableReadResult<string[]> {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return { ok: true, value: null };
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length > maxMcpEnumOptions ||
+    !value.every((item) => typeof item === "string") ||
+    new Set(value).size !== value.length ||
+    !value.every((item) => options.some((option) => option.value === item))
+  ) {
+    return { ok: false, value: null };
+  }
+  return { ok: true, value: [...value] };
+}
+
+function readNullableStringFormat(value: unknown): NullableReadResult<"email" | "uri" | "date" | "date-time"> {
+  if (value === undefined || value === null) {
+    return { ok: true, value: null };
+  }
+  return value === "email" || value === "uri" || value === "date" || value === "date-time"
+    ? { ok: true, value }
+    : { ok: false, value: null };
+}
+
+function parseBoundedStrings(value: unknown, maxItems: number, maxLength: number): string[] | null {
+  if (
+    !Array.isArray(value) ||
+    value.length > maxItems ||
+    !value.every((item) => isBoundedString(item, maxLength))
+  ) {
+    return null;
+  }
+  return [...value];
+}
+
+function parseBoundedUniqueStrings(
+  value: unknown,
+  maxItems: number,
+  maxLength: number,
+): string[] | null {
+  const strings = parseBoundedStrings(value, maxItems, maxLength);
+  return strings && strings.length > 0 && new Set(strings).size === strings.length ? strings : null;
+}
+
+function hasOnlyKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(record).every((key) => allowed.has(key));
+}
+
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length <= maxLength;
+}
+
+function isBoundedNonEmptyString(value: unknown, maxLength: number): value is string {
+  return isBoundedString(value, maxLength) && value.length > 0;
+}
+
+function isSafeObjectKey(value: string): boolean {
+  return value !== "__proto__" && value !== "prototype" && value !== "constructor";
+}
+
+function isNullableBoundedString(value: unknown, maxLength: number): boolean {
+  return value === undefined || value === null || isBoundedString(value, maxLength);
+}
+
+function isBoundedOpaqueJson(value: unknown, maxLength: number): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === "string" && encoded.length <= maxLength;
+  } catch {
+    return false;
+  }
 }
 
 function parseApprovalRequest(message: JsonRpcRequest): ApprovalParseResult {
@@ -1757,16 +2997,6 @@ function isAdditionalPermissionProfile(value: unknown): boolean {
   const profile = asObjectRecord(value);
   return Boolean(
     profile &&
-      isOptionalNullableFileSystemPermissions(profile.fileSystem) &&
-      isOptionalNullableNetworkPermissions(profile.network),
-  );
-}
-
-function isRequestPermissionProfile(value: unknown): boolean {
-  const profile = asObjectRecord(value);
-  return Boolean(
-    profile &&
-      Object.keys(profile).every((key) => key === "fileSystem" || key === "network") &&
       isOptionalNullableFileSystemPermissions(profile.fileSystem) &&
       isOptionalNullableNetworkPermissions(profile.network),
   );
@@ -2219,8 +3449,15 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function deferServerRequestCallback(): Promise<void> {
+  return delay(serverRequestCallbackGraceMs);
+}
+
 function isRequestId(value: unknown): value is string | number {
-  return typeof value === "string" || (typeof value === "number" && Number.isInteger(value));
+  return (
+    (typeof value === "string" && value.length <= maxInteractiveIdentityLength) ||
+    (typeof value === "number" && Number.isSafeInteger(value))
+  );
 }
 
 function formatTurnError(error: unknown): string {
