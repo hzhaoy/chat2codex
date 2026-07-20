@@ -1,0 +1,21 @@
+bun.lock
+  s_bc0331dd4e9203::t_573767a9effcd7 18,54-93,184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "09c79e515b722cea1a71be456919d52f79df481b",
+  "prompts": {},
+  "sessions": {
+    "s_bc0331dd4e9203": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f75e7-bd43-7c31-8b80-dd93c5df1dbf",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
