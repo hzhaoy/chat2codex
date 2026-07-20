@@ -13,10 +13,34 @@ numbers once releases are published.
   sender-bound Feishu/Lark card answers or an explicit
   `/answer <reply-code> <value>` text reply. Multi-question requests support
   option selection, free-form answers, skip, cancel, and server-side validation.
+- Standard MCP form and URL elicitations now use sender-bound Feishu/Lark cards.
+  Typed form fields support
+  `/mcp-answer <reply-code> <JSON-quoted-field-id> <value>` and are revalidated
+  against the original schema before submission.
+- Codex `item/permissions/requestApproval` requests now use complete-profile
+  approval cards with deny, turn-scoped grant, and session-scoped grant
+  decisions.
 - Codex runs now persist a durable job and terminal-reply outbox. A reply-send
   failure retries the stored delivery with a stable idempotency key instead of
   executing the Codex turn again; runs interrupted by a bridge restart are
   reported for manual inspection rather than replayed automatically.
+
+### Changed
+
+- Added configurable global Codex concurrency and global/per-chat durable queue
+  limits. Admission counts active jobs, undelivered replies, and pending control
+  messages; tasks that exceed a limit are rejected before Codex runs, while
+  in-turn approval/input waits share the same pending-count ceilings.
+- Restart recovery replays read-only control commands, but does not replay
+  mutating or run-targeted controls such as `/new`, `/stop`, or `/steer` onto a
+  different task. Previously non-Codex messages cannot be promoted into a Codex
+  run solely because access or routing configuration changed during restart.
+- Added attachment count, per-file, per-message, and store quotas with streamed
+  downloads, atomic finalization, and lazy retention cleanup.
+- Bounded chat replies, Codex stderr, captured command count/output, run diffs,
+  and structured log entries. File logs now rotate by configured size/count.
+- Terminal jobs and delivered outbox records now use configurable count-based
+  retention while active jobs and undelivered replies remain protected.
 
 ### Security
 
@@ -24,6 +48,13 @@ numbers once releases are published.
   messages cannot provide a non-persistent masked-input channel. User-input
   request fields are bounded, withdrawn requests suppress late callbacks, and
   answers are neither echoed in terminal cards nor retained in bridge state.
+- `requestUserInput` and MCP text answers bypass durable message/job storage and
+  are not echoed by the bridge. Secret or sensitive fields fail closed.
+- Additional-permission grants accept only `grantTurn` or `grantSession` and
+  always clone the runner's original requested profile; card payloads cannot
+  substitute permissions or enable `strictAutoReview`. Permission and MCP card
+  callbacks are bound to the original sender and card message, and late or
+  malformed actions fail closed.
 
 ## 0.4.1 - 2026-07-19
 

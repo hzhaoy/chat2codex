@@ -104,8 +104,8 @@ when you need a separate bot instance.
 - One Codex session per chat.
 - `/status`, `/host`, `/projects`, `/project <index|path>`, `/threads`,
   `/history`, `/search`, `/resume`, `/fork`, `/compact`, `/new`, `/cd <path>`,
-  `/stop`, `/steer`, `/summary`, `/files`, `/diff`, `/logs`, and `/whoami`
-  commands.
+  `/stop`, `/steer`, `/answer`, `/mcp-answer`, `/summary`, `/files`, `/diff`,
+  `/logs`, and `/whoami` commands.
 - Local state in JSON.
 - Codex app-server JSON-RPC for machine-readable progress, final output, and
   approval callbacks.
@@ -119,6 +119,14 @@ when you need a separate bot instance.
   with an explicit `/answer <reply-code> <value>` fallback for free-form input.
   Options are validated against the original request; secret questions fail
   closed instead of collecting credentials through chat history.
+- Standard MCP form and URL elicitations rendered as sender-bound cards. Typed
+  form fields can also use
+  `/mcp-answer <reply-code> <JSON-quoted-field-id> <value>`; values are validated
+  against the original schema, while sensitive fields fail closed.
+- Additional-permission requests from `item/permissions/requestApproval`
+  rendered as complete-profile approval cards. Chat2Codex exposes only deny,
+  turn-scoped grant, and session-scoped grant; a grant always returns the
+  original profile requested by Codex.
 - Feishu/Lark image and file messages downloaded to local paths and passed to
   Codex with the prompt.
 - Event diagnostics in logs and `/status` for recent routed/dropped messages.
@@ -197,9 +205,18 @@ invalid-params error without exposing or inventing an approval option.
 `item/tool/requestUserInput` is supported through cards and explicit `/answer`
 replies; request fields and callback answers are revalidated, withdrawn
 requests reject late replies, and `isSecret` questions fail closed because chat
-cannot guarantee masked, non-persistent input. MCP elicitations are still
-cancelled and additional-permission requests still receive an empty grant until
-their dedicated interaction contracts are implemented.
+cannot guarantee masked input. Standard `mcpServer/elicitation/request` form and
+URL requests are supported through cards, with `/mcp-answer` for typed form
+values. The bridge does not persist or echo `requestUserInput` or MCP answer
+values, and sensitive form fields fail closed. The OpenAI-specific MCP form
+extension is not negotiated.
+
+`item/permissions/requestApproval` is also supported through a sender-bound
+card that discloses the complete requested permission profile. The only bridge
+decisions are `deny`, `grantTurn`, and `grantSession`. A grant clones the exact
+original profile held by the runner; card payloads cannot replace permissions
+or enable `strictAutoReview`. Malformed, incomplete, withdrawn, or undisplayable
+requests fail closed.
 
 When `CODEX_APPROVAL_POLICY` allows interactive approvals, Codex app-server
 emits approval requests while a turn is running. Chat2Codex posts a separate
@@ -300,8 +317,9 @@ chat2codex service uninstall
 
 The default launchd log directory is `~/.chat2codex/.data/logs` for both npm
 installs and source checkouts. Foreground development with `bun run dev` logs to
-the terminal instead. A source checkout that intentionally wants project-local
-service logs can override them explicitly:
+the terminal instead. File logging uses bounded entries and rotates according
+to `LOG_FILE_MAX_BYTES` and `LOG_FILE_MAX_FILES`. A source checkout that
+intentionally wants project-local service logs can override them explicitly:
 
 ```bash
 bun src/index.ts service install --env .env --project-dir . \
@@ -327,7 +345,8 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/cd <path>` | Change the current chat cwd and start a fresh Codex thread. |
 | `/stop` | Stop the active Codex run for the current chat. The running status card also has a stop button. |
 | `/steer <instruction>` | Send extra guidance to the active Codex run immediately, bypassing queued chat work. |
-| `/answer <reply-code> <value>` | Answer the current non-secret Codex `requestUserInput` question. The reply code is shown on the question card; answers bypass queued chat work and are not echoed. |
+| `/answer <reply-code> <value>` | Answer the current non-secret Codex `requestUserInput` question. The reply code is shown on the question card; answers bypass queued chat work and are neither persisted nor echoed by the bridge. |
+| `/mcp-answer <reply-code> <JSON-quoted-field-id> <value>` | Answer the current non-sensitive MCP form field using the exact command shown on its card. `/skip` skips an optional field; quote the value as `"/skip"` when that literal string is intended. Typed values are checked against the original schema; answers bypass queued chat work and are neither persisted nor echoed by the bridge. |
 | `/summary` | Show the most recent run summary for this chat. |
 | `/files` | Show changed files from the most recent run. |
 | `/diff` | Show the latest captured diff from the most recent run. |
@@ -347,6 +366,20 @@ only be handled by users listed in `ALLOWED_USER_IDS`.
 timeouts. For long-running background bots, set positive millisecond values so a
 stuck Codex turn or unattended approval request is cancelled and recorded in
 `/status` as a recent failure with a recovery hint.
+
+Key production resource paths are bounded by default and can be tuned with the
+positive-integer settings in [`.env.example`](.env.example):
+`CODEX_MAX_CONCURRENT_RUNS`, the global and per-chat
+`BRIDGE_MAX_PENDING_MESSAGES` / `BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT` limits,
+which bound active jobs, undelivered durable replies, pending control messages,
+and in-turn approval/input waits,
+attachment count/file/message/store quotas plus `ATTACHMENT_RETENTION_HOURS`,
+chat/stderr/run-log/diff output limits, log entry/file rotation limits, and
+terminal job/delivered-outbox retention counts.
+Active jobs and undelivered outbox entries are never removed by retention
+pruning. Attachments are streamed into private temporary files, checked against
+the configured quotas, atomically finalized, and lazily expired without
+following symlinks.
 
 `chat2codex doctor` and `/host` both surface mobile/team-bot safety warnings,
 including relative `CODEX_BIN`, group chats without `ALLOWED_USER_IDS`,
@@ -372,9 +405,16 @@ queued job can resume after restart; a job that had reached `running` is marked
 interrupted and is not automatically executed again because its side effects
 cannot be inferred safely. Terminal replies are delivered from a durable outbox
 with stable idempotency keys, so a chat-delivery failure does not rerun Codex.
+After restart, read-only control messages such as `/status` may be replayed;
+mutating or run-targeted controls such as `/new`, `/stop`, and `/steer` are not
+replayed onto another task. A message previously classified as non-Codex cannot
+be promoted into a Codex run solely because access or routing configuration
+changed during restart.
 Codex runs targeting the same workspace are serialized across chats, while
-different workspaces can run in parallel; `/status` and `/stop` also cover runs
-waiting for a workspace lock. Only one bridge process may use a given
+different workspaces can run in parallel up to `CODEX_MAX_CONCURRENT_RUNS`;
+global and per-chat queue admission is rejected before Codex starts when its
+configured limit is reached. `/status` and `/stop` also cover runs waiting for a
+workspace or global permit. Only one bridge process may use a given
 `BRIDGE_STATE_PATH`. Keep approvals and Git review enabled for sensitive work,
 and inspect the thread/worktree before manually retrying an interrupted job.
 
@@ -416,11 +456,12 @@ chat or reporting a security issue.
 
 ## Version Roadmap
 
-1. **v0.5:** finish the interaction and production-hardening line: MCP
-   elicitation, additional-permission approval, bounded concurrency and queues,
-   attachment quotas, output limits, durable-delivery retention, and log
-   rotation. `requestUserInput` plus the first durable job/outbox slice are in
-   the current Unreleased work.
+1. **v0.5 (current Unreleased development):** the planned interaction and
+   production-hardening scope is implemented: `requestUserInput`, standard MCP
+   form/URL elicitation, additional-permission approval, durable job/outbox
+   delivery, bounded concurrency and queues, attachment quotas and expiry,
+   output limits, state retention, and log rotation. This does not indicate a
+   published v0.5 release.
 2. **v0.6:** fork from a selected historical turn with
    `thread/fork.lastTurnId`, leaving the source thread unchanged. This is not a
    filesystem rollback and does not restore local file changes.
