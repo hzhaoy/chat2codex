@@ -44,6 +44,8 @@ describe("attachment store", () => {
       skippedSymlinks: 0,
     });
     expect(await exists(expired)).toBe(false);
+    expect(await exists(path.dirname(expired))).toBe(false);
+    expect(await exists(root)).toBe(true);
     expect(await fs.readFile(fresh, "utf8")).toBe("xxxx");
   });
 
@@ -72,6 +74,9 @@ describe("attachment store", () => {
     expect(usage.storeBytes).toBe(3);
     expect(usage.removedExpiredFiles).toBe(0);
     expect(usage.skippedSymlinks).toBe(2);
+    expect(await exists(path.join(root, "linked-directory"))).toBe(true);
+    expect(await exists(path.join(root, "linked-file"))).toBe(true);
+    expect(await exists(root)).toBe(true);
     expect(await fs.readFile(outsideFile, "utf8")).toHaveLength(50);
   });
 
@@ -153,6 +158,46 @@ describe("attachment store", () => {
     expect(await exists(inside)).toBe(false);
   });
 
+  test("prunes emptied message directories bottom-up without removing the store root", async () => {
+    const { root } = await storeFixture();
+    const attachment = path.join(root, "chat", "message", "attachment.txt");
+    await writeSizedFile(attachment, 2);
+
+    await expect(removeAttachmentFiles(root, [attachment])).resolves.toBe(1);
+
+    expect(await exists(path.join(root, "chat", "message"))).toBe(false);
+    expect(await exists(path.join(root, "chat"))).toBe(false);
+    expect(await exists(root)).toBe(true);
+  });
+
+  test("keeps non-empty message directories when removing one attachment", async () => {
+    const { root } = await storeFixture();
+    const removed = path.join(root, "message", "removed.txt");
+    const retained = path.join(root, "message", "retained.txt");
+    await writeSizedFile(removed, 2);
+    await writeSizedFile(retained, 3);
+
+    await expect(removeAttachmentFiles(root, [removed])).resolves.toBe(1);
+
+    expect(await exists(path.dirname(removed))).toBe(true);
+    expect(await fs.readFile(retained, "utf8")).toBe("xxx");
+  });
+
+  test("treats concurrent cleanup of the same attachment as an idempotent no-op", async () => {
+    const { root } = await storeFixture();
+    const attachment = path.join(root, "message", "attachment.txt");
+    await writeSizedFile(attachment, 2);
+
+    const removed = await Promise.all([
+      removeAttachmentFiles(root, [attachment]),
+      removeAttachmentFiles(root, [attachment]),
+    ]);
+
+    expect(removed.toSorted()).toEqual([0, 1]);
+    expect(await exists(path.dirname(attachment))).toBe(false);
+    expect(await exists(root)).toBe(true);
+  });
+
   test("unlinks an in-root symlink without touching its outside target", async () => {
     const { container, root } = await storeFixture();
     const outside = path.join(container, "outside.txt");
@@ -163,7 +208,29 @@ describe("attachment store", () => {
 
     await expect(removeAttachmentFiles(root, [linked])).resolves.toBe(1);
     expect(await exists(linked)).toBe(false);
+    expect(await exists(path.dirname(linked))).toBe(false);
+    expect(await exists(root)).toBe(true);
     expect(await fs.readFile(outside, "utf8")).toBe("xxx");
+  });
+
+  test("refuses root and directory-symlink paths without touching outside directories", async () => {
+    const { container, root } = await storeFixture();
+    const outsideDirectory = path.join(container, "outside");
+    const outsideFile = path.join(outsideDirectory, "outside.txt");
+    const linkedDirectory = path.join(root, "linked-directory");
+    await writeSizedFile(outsideFile, 4);
+    await fs.symlink(outsideDirectory, linkedDirectory);
+
+    await expect(removeAttachmentFiles(root, [root])).rejects.toMatchObject({
+      code: "attachment_path_outside_root",
+    });
+    await expect(
+      removeAttachmentFiles(root, [path.join(linkedDirectory, "outside.txt")]),
+    ).rejects.toMatchObject({ code: "attachment_path_outside_root" });
+
+    expect(await exists(root)).toBe(true);
+    expect(await exists(linkedDirectory)).toBe(true);
+    expect(await fs.readFile(outsideFile, "utf8")).toBe("xxxx");
   });
 });
 

@@ -101,7 +101,8 @@ export async function enforceAttachmentStoreLimits(
 /**
  * Removes files created for the current message. Every parent directory is
  * canonicalized and checked before any unlink occurs, so an invalid group is
- * rejected without partially deleting its valid entries.
+ * rejected without partially deleting its valid entries. Empty in-root parent
+ * directories are then pruned without ever removing the attachment root.
  */
 export async function removeAttachmentFiles(
   rootDir: string,
@@ -110,6 +111,7 @@ export async function removeAttachmentFiles(
   return withAttachmentStoreLock(rootDir, async () => {
     const root = await ensureAttachmentRoot(rootDir);
     const candidates = new Set<string>();
+    const parentDirectories = new Set<string>();
     for (const filePath of filePaths) {
       const candidate = await resolveContainedEntry(root, filePath, true);
       if (!candidate) {
@@ -126,6 +128,7 @@ export async function removeAttachmentFiles(
         );
       }
       candidates.add(candidate);
+      parentDirectories.add(path.dirname(candidate));
     }
 
     let removed = 0;
@@ -139,6 +142,7 @@ export async function removeAttachmentFiles(
         }
       }
     }
+    await pruneEmptyDirectories(root, parentDirectories);
     return removed;
   });
 }
@@ -194,7 +198,11 @@ async function scanDirectory(
   cutoffMs: number,
   result: StoreScanResult,
 ): Promise<void> {
-  for (const entry of await fs.readdir(directory)) {
+  const entries = await readdirIfPresent(directory);
+  if (!entries) {
+    return;
+  }
+  for (const entry of entries) {
     const entryPath = path.join(directory, entry);
     const stats = await lstatIfPresent(entryPath);
     if (!stats) {
@@ -229,6 +237,57 @@ async function scanDirectory(
       continue;
     }
     result.storeBytes = safeAddBytes(result.storeBytes, stats.size);
+  }
+  await removeEmptyDirectory(root, directory);
+}
+
+async function pruneEmptyDirectories(
+  root: string,
+  startingDirectories: Iterable<string>,
+): Promise<void> {
+  const directories = new Set<string>();
+  for (const startingDirectory of startingDirectories) {
+    let directory = path.resolve(startingDirectory);
+    while (isPathInside(root, directory)) {
+      directories.add(directory);
+      const parent = path.dirname(directory);
+      if (parent === directory) {
+        break;
+      }
+      directory = parent;
+    }
+  }
+
+  const deepestFirst = [...directories].sort(
+    (left, right) =>
+      path.relative(root, right).split(path.sep).length -
+      path.relative(root, left).split(path.sep).length,
+  );
+  for (const directory of deepestFirst) {
+    await removeEmptyDirectory(root, directory);
+  }
+}
+
+async function removeEmptyDirectory(root: string, directory: string): Promise<void> {
+  if (!isPathInside(root, directory)) {
+    return;
+  }
+
+  const stats = await lstatIfPresent(directory);
+  if (!stats || stats.isSymbolicLink() || !stats.isDirectory()) {
+    return;
+  }
+  const resolvedDirectory = await realpathIfPresent(directory);
+  if (resolvedDirectory !== directory || !isPathInside(root, resolvedDirectory)) {
+    return;
+  }
+
+  try {
+    await fs.rmdir(directory);
+  } catch (error) {
+    if (!isEmptyDirectoryCleanupNoop(error)) {
+      throw error;
+    }
   }
 }
 
@@ -340,6 +399,24 @@ async function realpathIfPresent(filePath: string): Promise<string | null> {
     }
     throw error;
   }
+}
+
+async function readdirIfPresent(directory: string): Promise<string[] | null> {
+  try {
+    return await fs.readdir(directory);
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function isEmptyDirectoryCleanupNoop(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return (
+    code === "ENOENT" || code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOTDIR"
+  );
 }
 
 function isMissingFileError(error: unknown): boolean {
