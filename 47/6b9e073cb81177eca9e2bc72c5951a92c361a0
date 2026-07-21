@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_ab0df3be43c3ef::t_5ffcd6588f7176 10-11
+SECURITY.md
+  s_ab0df3be43c3ef::t_dd29ebae2303d2 14-15
+package.json
+  s_ab0df3be43c3ef::t_306a5d07dde265 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "476b9e073cb81177eca9e2bc72c5951a92c361a0",
+  "prompts": {},
+  "sessions": {
+    "s_ab0df3be43c3ef": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f835b-def1-7f21-ad95-a21b4f1eed53",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
