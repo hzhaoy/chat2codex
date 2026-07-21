@@ -11,8 +11,8 @@ upgrade before reporting or validating a suspected vulnerability.
 
 | Version | Supported |
 | --- | --- |
-| `0.5.x` | Yes |
-| `<= 0.4.x` | No |
+| `0.6.x` | Yes |
+| `<= 0.5.x` | No |
 
 ## Reporting a Vulnerability
 

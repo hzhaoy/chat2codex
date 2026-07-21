@@ -7,6 +7,8 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.6.0 - 2026-07-21
+
 ### Added
 
 - `/fork --turn <history-index|turn_id>` now creates a non-destructive fork at a
