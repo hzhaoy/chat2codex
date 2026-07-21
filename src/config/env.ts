@@ -109,6 +109,8 @@ const configSchema = z.object({
   JOB_RETENTION_COUNT: positiveIntegerEnv(500, 1_000_000),
   OUTBOX_RETENTION_COUNT: positiveIntegerEnv(500, 1_000_000),
   BRIDGE_STATE_PATH: z.string().min(1).default(".data/state.json"),
+  CHAT2CODEX_LOG_FILE: z.string().optional(),
+  CHAT2CODEX_SERVICE_RESTART_ENABLED: booleanEnv(false),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 }).superRefine((config, context) => {
   if (config.BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT > config.BRIDGE_MAX_PENDING_MESSAGES) {
@@ -201,6 +203,10 @@ export function loadConfig(env: NodeJS.ProcessEnv) {
     jobRetentionCount: parsed.JOB_RETENTION_COUNT,
     outboxRetentionCount: parsed.OUTBOX_RETENTION_COUNT,
     bridgeStatePath: path.resolve(env.BRIDGE_STATE_PATH || path.join(home, "state.json")),
+    logFilePath: parsed.CHAT2CODEX_LOG_FILE?.trim()
+      ? path.resolve(parsed.CHAT2CODEX_LOG_FILE)
+      : undefined,
+    serviceRestartEnabled: parsed.CHAT2CODEX_SERVICE_RESTART_ENABLED,
     logLevel: parsed.LOG_LEVEL,
   };
 }

@@ -176,6 +176,18 @@ class ToggleControlDeliverySender extends CollectingSender {
   }
 }
 
+class FailingNextMarkdownSender extends CollectingSender {
+  failNextMarkdown = false;
+
+  override async sendMarkdown(chatId: string, markdown: string): Promise<void> {
+    if (this.failNextMarkdown) {
+      this.failNextMarkdown = false;
+      throw new Error("simulated fork result delivery failure");
+    }
+    await super.sendMarkdown(chatId, markdown);
+  }
+}
+
 class IdempotencyCollectingSender extends CollectingSender {
   readonly idempotencyKeys: string[] = [];
 
@@ -503,8 +515,11 @@ class ListingCodex extends FakeCodex {
   readonly searchInputs: CodexThreadSearchInput[] = [];
   readonly turnListInputs: CodexThreadTurnListInput[] = [];
   readonly turnItemInputs: CodexThreadTurnItemListInput[] = [];
-  readonly forkInputs: Array<{ threadId: string; cwd?: string }> = [];
+  readonly forkInputs: Array<{ threadId: string; cwd?: string; lastTurnId?: string }> = [];
   readonly compactIds: string[] = [];
+  readonly archiveIds: string[] = [];
+  readonly unarchiveIds: string[] = [];
+  private readonly archivedThreadIds: Set<string>;
 
   constructor(
     private readonly threads: CodexThread[],
@@ -513,14 +528,25 @@ class ListingCodex extends FakeCodex {
       turns?: CodexThreadTurn[];
       itemsByTurn?: Record<string, CodexThreadItem[]>;
       forkedThread?: CodexThread;
+      archivedThreads?: CodexThread[];
     } = {},
   ) {
     super();
+    this.archivedThreadIds = new Set(extra.archivedThreads?.map((thread) => thread.id));
+    for (const thread of extra.archivedThreads ?? []) {
+      if (!this.threads.some((candidate) => candidate.id === thread.id)) {
+        this.threads.push(thread);
+      }
+    }
   }
 
   async listThreads(input: CodexThreadListInput = {}): Promise<CodexThreadListResult> {
     this.listInputs.push(input);
-    let threads = this.threads;
+    let threads = this.threads.filter((thread) =>
+      input.archived === true
+        ? this.archivedThreadIds.has(thread.id)
+        : !this.archivedThreadIds.has(thread.id),
+    );
     if (typeof input.cwd === "string") {
       threads = threads.filter((thread) => thread.cwd === input.cwd);
     } else if (Array.isArray(input.cwd)) {
@@ -574,7 +600,11 @@ class ListingCodex extends FakeCodex {
     };
   }
 
-  async forkThread(input: { threadId: string; cwd?: string }): Promise<CodexThread> {
+  async forkThread(input: {
+    threadId: string;
+    cwd?: string;
+    lastTurnId?: string;
+  }): Promise<CodexThread> {
     this.forkInputs.push(input);
     const source = this.threads.find((thread) => thread.id === input.threadId);
     return (
@@ -589,6 +619,21 @@ class ListingCodex extends FakeCodex {
 
   async compactThread(threadId: string): Promise<void> {
     this.compactIds.push(threadId);
+  }
+
+  async archiveThread(threadId: string): Promise<void> {
+    this.archiveIds.push(threadId);
+    this.archivedThreadIds.add(threadId);
+  }
+
+  async unarchiveThread(threadId: string): Promise<CodexThread> {
+    this.unarchiveIds.push(threadId);
+    const thread = this.threads.find((candidate) => candidate.id === threadId);
+    if (!thread) {
+      throw new Error("missing archived thread");
+    }
+    this.archivedThreadIds.delete(threadId);
+    return thread;
   }
 }
 
@@ -927,6 +972,23 @@ class RichResultCodex implements CodexClient {
       exitCode: 0,
       summary: {
         durationMs: 1234,
+        tokenUsage: {
+          last: {
+            cachedInputTokens: 200,
+            inputTokens: 1_000,
+            outputTokens: 300,
+            reasoningOutputTokens: 100,
+            totalTokens: 1_300,
+          },
+          total: {
+            cachedInputTokens: 2_000,
+            inputTokens: 10_000,
+            outputTokens: 2_000,
+            reasoningOutputTokens: 500,
+            totalTokens: 12_000,
+          },
+          modelContextWindow: 120_000,
+        },
         diff: "diff --git a/src/app.ts b/src/app.ts\n+++ b/src/app.ts\n@@\n+hello\n",
         diffStat: "1 file(s), +1 -0",
         changedFiles: [path.join(input.cwd, "src/app.ts"), "src/app.ts"],
@@ -3126,6 +3188,213 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("forks from a selected historical turn without modifying the source thread", async () => {
+    const codex = new ListingCodex(
+      [{ id: "thread_a1", cwd: "/repo/a", name: "A recent", updatedAt: 4_000 }],
+      {
+        turns: [
+          {
+            id: "turn_2",
+            status: "completed",
+            startedAt: 4_000,
+            completedAt: 4_001,
+            durationMs: 1_000,
+            items: [{ id: "item_user", type: "userMessage", text: "checkpoint" }],
+          },
+        ],
+      },
+    );
+
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m_resume_turn_fork",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume thread_a1",
+      });
+      await router.enqueue({
+        messageId: "m_history_turn_fork",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/history",
+      });
+      await router.enqueue({
+        messageId: "m_fork_turn",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/fork --turn 1",
+      });
+      await router.enqueue({
+        messageId: "m_run_turn_fork",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "continue forked checkpoint",
+      });
+
+      expect(codex.forkInputs).toEqual([
+        { threadId: "thread_a1", cwd: "/repo/a", lastTurnId: "turn_2" },
+      ]);
+      expect(sender.messages[2]?.text).toContain("截止 turn：`turn_2`");
+      expect(sender.messages[2]?.text).toContain("不会恢复或回滚本地文件");
+      expect(codex.runs[0]?.threadId).toBe("fork_thread_a1");
+    });
+  });
+
+  test("validates historical turn boundaries and rejects an in-progress turn", async () => {
+    const codex = new ListingCodex(
+      [{ id: "thread_a1", cwd: "/repo/a", name: "A recent", updatedAt: 4_000 }],
+      {
+        turns: [{ id: "turn_running", status: "inProgress", items: [] }],
+      },
+    );
+
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      const command = (messageId: string, text: string): IncomingTextMessage => ({
+        messageId,
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text,
+      });
+      await router.enqueue(command("m_resume_turn_guard", "/resume thread_a1"));
+      await router.enqueue(command("m_missing_history_turn", "/fork --turn 1"));
+      await router.enqueue(command("m_history_turn_guard", "/history"));
+      await router.enqueue(command("m_running_turn_guard", "/fork --turn 1"));
+
+      expect(codex.forkInputs).toHaveLength(0);
+      expect(sender.messages[1]?.text).toContain("请先发送 /history");
+      expect(sender.messages[3]?.text).toContain("仍在进行中");
+    });
+  });
+
+  test("replays a failed fork result in-process without creating another thread", async () => {
+    const codex = new ListingCodex(
+      [{ id: "thread_a1", cwd: "/repo/a", name: "A recent", updatedAt: 4_000 }],
+      {
+        turns: [{ id: "turn_2", status: "completed", items: [] }],
+      },
+    );
+    const sender = new FailingNextMarkdownSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.enqueue({
+        messageId: "m_resume_fork_retry",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume thread_a1",
+      });
+      await router.enqueue({
+        messageId: "m_history_fork_retry",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/history",
+      });
+      sender.failNextMarkdown = true;
+      const forkMessage: IncomingTextMessage = {
+        messageId: "m_fork_retry",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/fork --turn 1",
+      };
+      await router.accept(forkMessage);
+
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await waitForState(
+        store,
+        (state) => state.pendingMessages.m_fork_retry?.attempts === 1,
+      );
+      expect(codex.forkInputs).toHaveLength(1);
+      expect((await store.load()).pendingMessages.m_fork_retry?.forkAttempt?.result).toMatchObject({
+        threadId: "fork_thread_a1",
+      });
+
+      await router.accept(forkMessage);
+      await waitForState(
+        store,
+        (state) => state.processedMessageIds.includes("m_fork_retry"),
+      );
+
+      expect(codex.forkInputs).toHaveLength(1);
+      expect(sender.messages.at(-1)?.text).toContain("fork_thread_a1");
+    });
+  });
+
+  test("recovers a persisted fork result after restart without rerunning the fork", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-fork-recovery-"));
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: "/repo/a",
+            threadId: "fork_thread_a1",
+            sessionEpoch: "epoch_forked",
+            chatType: "direct",
+            updatedAt: "2026-07-21T00:00:00.000Z",
+          },
+        },
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_fork_restart: {
+            messageId: "m_fork_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/fork --turn turn_2",
+            acceptedAt: "2026-07-21T00:00:00.000Z",
+            attempts: 1,
+            route: "control_no_replay",
+            forkAttempt: {
+              sourceThreadId: "thread_a1",
+              lastTurnId: "turn_2",
+              startedAt: "2026-07-21T00:00:00.000Z",
+              selectionPersisted: true,
+              result: { threadId: "fork_thread_a1", cwd: "/repo/a" },
+            },
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new ListingCodex([]);
+      const sender = new IdempotencyCollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitForState(
+        store,
+        (state) =>
+          state.processedMessageIds.includes("m_fork_restart") &&
+          Object.values(state.outbox).some(
+            (delivery) => delivery.jobId === "m_fork_restart" && delivery.status === "delivered",
+          ),
+      );
+
+      expect(codex.forkInputs).toHaveLength(0);
+      expect(sender.messages[0]?.text).toContain("**已分叉 Codex 会话**");
+      expect(sender.messages[0]?.text).toContain("fork_thread_a1");
+    } finally {
+      await router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("forks the current conversation and continues the forked thread", async () => {
     const codex = new ListingCodex([
       {
@@ -3197,6 +3466,174 @@ describe("MessageRouter access control", () => {
       expect(sender.messages[1]?.text).toContain("**已请求压缩当前 Codex 会话**");
       expect(sender.messages[1]?.text).toContain("thread_a1");
     });
+  });
+
+  test("archives the current conversation and restores it from the archived list", async () => {
+    const codex = new ListingCodex([
+      {
+        id: "thread_a1",
+        cwd: "/repo/a",
+        name: "A recent",
+        updatedAt: 4_000,
+      },
+    ]);
+
+    await withRouterAndCodex({}, codex, async ({ router, sender, config }) => {
+      await router.enqueue({
+        messageId: "m_resume_archive",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume thread_a1",
+      });
+      await router.enqueue({
+        messageId: "m_archive",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/archive",
+      });
+      await router.enqueue({
+        messageId: "m_archived",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/archived",
+      });
+      await router.enqueue({
+        messageId: "m_unarchive",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/unarchive 1",
+      });
+
+      expect(codex.archiveIds).toEqual(["thread_a1"]);
+      expect(codex.unarchiveIds).toEqual(["thread_a1"]);
+      expect(codex.listInputs.at(-1)).toMatchObject({
+        cwd: "/repo/a",
+        archived: true,
+      });
+      expect(sender.messages[1]?.text).toContain("**已归档当前 Codex 会话**");
+      expect(sender.messages[2]?.text).toContain("**已归档会话**");
+      expect(sender.messages[3]?.text).toContain("**已恢复已归档的 Codex 会话**");
+      const persisted = await new JsonStateStore(config.bridgeStatePath).load();
+      expect(persisted.chats.oc_chat?.threadId).toBeUndefined();
+      expect(persisted.chats.oc_chat?.lastArchivedThreads).toEqual([]);
+    });
+  });
+
+  test("replays a failed archive result without archiving the thread twice", async () => {
+    const codex = new ListingCodex([
+      { id: "thread_a1", cwd: "/repo/a", name: "A recent", updatedAt: 4_000 },
+    ]);
+    const sender = new FailingNextMarkdownSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router, config }) => {
+      await router.enqueue({
+        messageId: "m_resume_before_archive_retry",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/resume thread_a1",
+      });
+      sender.failNextMarkdown = true;
+      const message: IncomingTextMessage = {
+        messageId: "m_archive_retry",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/archive",
+      };
+      await router.accept(message);
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await waitForState(
+        store,
+        (state) => state.pendingMessages.m_archive_retry?.attempts === 1,
+      );
+      expect(codex.archiveIds).toEqual(["thread_a1"]);
+      expect((await store.load()).pendingMessages.m_archive_retry?.threadArchiveAttempt).toMatchObject({
+        action: "archive",
+        threadId: "thread_a1",
+        completed: true,
+      });
+
+      await router.accept(message);
+      await waitForState(store, (state) => state.processedMessageIds.includes("m_archive_retry"));
+      expect(codex.archiveIds).toEqual(["thread_a1"]);
+      expect(sender.messages.at(-1)?.text).toContain("**已归档当前 Codex 会话**");
+    });
+  });
+
+  test("recovers a completed archive after restart without replaying the external action", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-archive-recovery-"));
+    let router: MessageRouter | undefined;
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOWED_USER_IDS: "ou_user",
+      });
+      const store = new JsonStateStore(config.bridgeStatePath);
+      await store.save({
+        chats: {
+          oc_chat: {
+            cwd: "/repo/a",
+            threadId: "thread_a1",
+            sessionEpoch: "epoch_before_archive",
+            chatType: "direct",
+            updatedAt: "2026-07-21T00:00:00.000Z",
+          },
+        },
+        jobs: {},
+        outbox: {},
+        pendingMessages: {
+          m_archive_restart: {
+            messageId: "m_archive_restart",
+            chatId: "oc_chat",
+            chatType: "direct",
+            sender: { openId: "ou_user" },
+            text: "/archive",
+            acceptedAt: "2026-07-21T00:00:00.000Z",
+            attempts: 1,
+            route: "control_no_replay",
+            threadArchiveAttempt: {
+              action: "archive",
+              threadId: "thread_a1",
+              startedAt: "2026-07-21T00:00:00.000Z",
+              completed: true,
+            },
+          },
+        },
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+
+      const codex = new ListingCodex([]);
+      const sender = new IdempotencyCollectingSender();
+      router = new MessageRouter(config, store, sender, silentLogger, codex);
+      await router.start();
+      await waitForState(
+        store,
+        (state) =>
+          state.processedMessageIds.includes("m_archive_restart") &&
+          Object.values(state.outbox).some(
+            (delivery) =>
+              delivery.jobId === "m_archive_restart" && delivery.status === "delivered",
+          ),
+      );
+
+      const recovered = await store.load();
+      expect(codex.archiveIds).toHaveLength(0);
+      expect(recovered.chats.oc_chat?.threadId).toBeUndefined();
+      expect(recovered.chats.oc_chat?.sessionEpoch).not.toBe("epoch_before_archive");
+      expect(sender.messages[0]?.text).toContain("**已归档当前 Codex 会话**");
+    } finally {
+      await router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   test("refuses to resume an unavailable listed conversation", async () => {
@@ -3738,6 +4175,7 @@ describe("MessageRouter access control", () => {
         ["/files", "src/app.ts"],
         ["/diff", "diff --git a/src/app.ts b/src/app.ts"],
         ["/logs", "bun test"],
+        ["/usage", "累计占 context：10.0%"],
       ] as const) {
         await router.enqueue({
           messageId: `m_${command.slice(1)}`,
@@ -6089,6 +6527,183 @@ describe("MessageRouter access control", () => {
         text: "retried done",
       });
     });
+  });
+
+  test("help lists the mobile conversation workbench commands", async () => {
+    await withRouter({}, async ({ router, sender, codex }) => {
+      await router.enqueue({
+        messageId: "m_help",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/help",
+      });
+
+      expect(codex.runs).toHaveLength(0);
+      expect(sender.messages[0]?.text).toContain("**Chat2Codex 常用命令**");
+      expect(sender.messages[0]?.text).toContain("/fork --turn");
+      expect(sender.messages[0]?.text).toContain("/retry");
+      expect(sender.messages[0]?.text).toContain("/usage");
+    });
+  });
+
+  test("usage reports when the provider did not emit token usage", async () => {
+    await withRouter({}, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m_usage_source",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "run without usage",
+      });
+      await router.enqueue({
+        messageId: "m_usage_missing",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/usage",
+      });
+
+      expect(sender.messages.at(-1)?.text).toContain("没有收到 Codex 的 token usage 通知");
+    });
+  });
+
+  test("service controls expose status and bounded logs and restart only from an admin direct chat", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-service-control-"));
+    let router: MessageRouter | undefined;
+    try {
+      const logPath = path.join(tempDir, "chat2codex.log");
+      await writeFile(logPath, ["old line", "latest line"].join("\n"));
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_WORKDIR: tempDir,
+        BRIDGE_STATE_PATH: path.join(tempDir, "state.json"),
+        ALLOW_GROUPS: "true",
+        ALLOWED_CHAT_IDS: "oc_group",
+        ALLOWED_USER_IDS: "ou_admin",
+        CHAT2CODEX_LOG_FILE: logPath,
+        CHAT2CODEX_SERVICE_RESTART_ENABLED: "true",
+      });
+      const sender = new CollectingSender();
+      let restartRequests = 0;
+      router = new MessageRouter(
+        config,
+        new JsonStateStore(config.bridgeStatePath),
+        sender,
+        silentLogger,
+        new FakeCodex(),
+        { requestRestart: () => restartRequests += 1 },
+      );
+      await router.start();
+
+      const direct = (messageId: string, text: string): IncomingTextMessage => ({
+        messageId,
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_admin" },
+        text,
+      });
+      await router.enqueue(direct("m_service_status", "/service status"));
+      await router.enqueue(direct("m_service_logs", "/service logs"));
+      await router.enqueue({
+        messageId: "m_service_group_restart",
+        chatId: "oc_group",
+        chatType: "group",
+        sender: { openId: "ou_admin" },
+        text: "/service restart",
+      });
+      await router.enqueue(direct("m_service_restart", "/service restart"));
+      await waitFor(() => restartRequests === 1);
+
+      expect(sender.messages[0]?.text).toContain("**Chat2Codex 服务状态**");
+      expect(sender.messages[0]?.text).toContain(`\`${logPath}\``);
+      expect(sender.messages[1]?.text).toContain("latest line");
+      expect(sender.messages[2]?.text).toContain("只允许在私聊中");
+      expect(sender.messages[3]?.text).toContain("优雅退出");
+    } finally {
+      await router?.dispose();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("text retry reruns the latest in-memory prompt for the original sender", async () => {
+    const codex = new SequencedCodex([
+      {
+        threadId: "thread_test",
+        finalText: "first done",
+        stderr: "",
+        exitCode: 0,
+      },
+      {
+        threadId: "thread_test",
+        finalText: "retry done",
+        stderr: "",
+        exitCode: 0,
+      },
+    ]);
+
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m_retry_source",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "full prompt to retry exactly",
+      });
+      await router.enqueue({
+        messageId: "m_retry_text",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "/retry",
+      });
+
+      expect(codex.runs.map((run) => run.prompt)).toEqual([
+        "full prompt to retry exactly",
+        "full prompt to retry exactly",
+      ]);
+      expect(sender.messages.at(-1)?.text).toBe("retry done");
+    });
+  });
+
+  test("text and card retry reject a different allowed sender", async () => {
+    const codex = new SequencedCodex([
+      { threadId: "thread_test", finalText: "done", stderr: "", exitCode: 0 },
+    ]);
+    const sender = new CardCollectingSender();
+
+    await withRouterAndSender(
+      { ALLOWED_USER_IDS: "ou_user,ou_other" },
+      codex,
+      sender,
+      async ({ router }) => {
+        await router.enqueue({
+          messageId: "m_retry_owner",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_user" },
+          text: "owner task",
+        });
+        await router.enqueue({
+          messageId: "m_retry_other",
+          chatId: "oc_chat",
+          chatType: "direct",
+          sender: { openId: "ou_other" },
+          text: "/retry",
+        });
+        const cardResponse = await router.handleCardAction({
+          action: "retry_run",
+          chatId: "oc_chat",
+          messageId: sender.cards[0]?.handle.messageId,
+          sender: { openId: "ou_other" },
+        });
+
+        expect(codex.runs).toHaveLength(1);
+        expect(sender.messages.at(-1)?.text).toContain("只有发起最近一轮任务的用户");
+        expect(expectToast(cardResponse).toast.type).toBe("error");
+      },
+    );
   });
 
   test("card retry action reports missing status card context", async () => {

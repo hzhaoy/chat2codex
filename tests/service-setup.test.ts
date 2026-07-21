@@ -30,6 +30,7 @@ describe("service setup", () => {
     expect(plist).toContain("<key>CHAT2CODEX_ENV</key>");
     expect(plist).toContain("<string>/tmp/chat&amp;codex/.env</string>");
     expect(plist).toContain("<key>CHAT2CODEX_LOG_FILE</key>");
+    expect(plist).toContain("<key>CHAT2CODEX_SERVICE_RESTART_ENABLED</key>");
     expect(plist).toContain("<string>/tmp/chat&amp;codex/runtime.log</string>");
     expect(plist).toContain("<key>PATH</key>");
     expect(plist).toContain("<string>/opt/node/bin:/usr/bin</string>");
@@ -53,6 +54,7 @@ describe("service setup", () => {
 
     expect(unit).toContain('WorkingDirectory="/tmp/chat 2 codex"');
     expect(unit).toContain('Environment="NODE_ENV=production"');
+    expect(unit).toContain('Environment="CHAT2CODEX_SERVICE_RESTART_ENABLED=true"');
     expect(unit).toContain('Environment="PATH=/usr/local/bin:/usr/bin"');
     expect(unit).toContain('EnvironmentFile=-"/tmp/chat 2 codex/.env"');
     expect(unit).toContain('ExecStart="/usr/local/bin/node" "/tmp/chat 2 codex/dist/index.js"');

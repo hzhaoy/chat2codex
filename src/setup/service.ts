@@ -124,6 +124,8 @@ export function renderLaunchdPlist(options: ServiceOptions): string {
     <string>${escapeXml(options.envFile)}</string>
     <key>CHAT2CODEX_LOG_FILE</key>
     <string>${escapeXml(options.stderrPath)}</string>
+    <key>CHAT2CODEX_SERVICE_RESTART_ENABLED</key>
+    <string>true</string>
     <key>NODE_ENV</key>
     <string>production</string>
     <key>PATH</key>
@@ -152,6 +154,7 @@ After=network-online.target
 Type=simple
 WorkingDirectory=${quoteSystemd(options.projectDir)}
 Environment=${quoteSystemd("NODE_ENV=production")}
+Environment=${quoteSystemd("CHAT2CODEX_SERVICE_RESTART_ENABLED=true")}
 Environment=${quoteSystemd(`PATH=${options.pathEnv}`)}
 EnvironmentFile=-${quoteSystemd(options.envFile)}
 ExecStart=${quoteSystemd(options.nodeBin)} ${quoteSystemd(options.entrypoint)}

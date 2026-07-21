@@ -43,6 +43,7 @@ import { JsonStateStore } from "../state/store.js";
 import {
   BridgeState,
   createSessionEpoch,
+  type ChatSession,
   type DurableCodexJob,
   type DurableCodexJobStatus,
   type DurableOutboxMessage,
@@ -56,6 +57,8 @@ import {
   type LastRunSummary,
   type PendingMessageDelivery,
   type PendingMessageRoute,
+  type PendingForkAttempt,
+  type PendingThreadArchiveAttempt,
   type ProjectSelection,
   type RecentFailureDiagnostic,
   type ThreadSelection,
@@ -213,6 +216,12 @@ export interface CodexClient {
   listTurnItems?(input: CodexThreadTurnItemListInput): Promise<CodexThreadTurnItemListResult>;
   forkThread?(input: CodexForkThreadInput): Promise<CodexThread>;
   compactThread?(threadId: string): Promise<void>;
+  archiveThread?(threadId: string): Promise<void>;
+  unarchiveThread?(threadId: string): Promise<CodexThread>;
+}
+
+export interface MessageRouterRuntimeControl {
+  requestRestart?: () => void;
 }
 
 interface PendingApproval {
@@ -340,8 +349,24 @@ export class MessageRouter {
   private readonly activeMcpElicitations = new Map<string, PendingMcpElicitation>();
   private readonly statusCardRuns = new Map<
     string,
-    { chatId: string; prompt: string; collaborationMode: CodexCollaborationMode }
+    {
+      chatId: string;
+      prompt: string;
+      collaborationMode: CodexCollaborationMode;
+      originSender?: SenderIdentity;
+    }
   >();
+  private readonly retryableRunsByChat = new Map<
+    string,
+    {
+      prompt: string;
+      collaborationMode: CodexCollaborationMode;
+      originSender?: SenderIdentity;
+    }
+  >();
+  private readonly forkRecoveries = new Map<string, PendingForkAttempt>();
+  private readonly threadArchiveRecoveries = new Map<string, PendingThreadArchiveAttempt>();
+  private readonly restartAfterMessageIds = new Set<string>();
   private readonly globalRunWaiters: GlobalRunWaiter[] = [];
   private readonly activeCodexRunTasks = new Set<Promise<CodexRunResult>>();
   private activeGlobalRuns = 0;
@@ -355,6 +380,7 @@ export class MessageRouter {
     private readonly sender: ChatSender,
     private readonly logger: Logger,
     codex?: CodexClient,
+    private readonly runtimeControl: MessageRouterRuntimeControl = {},
   ) {
     this.codex = codex ?? new CodexRunner(config, logger);
   }
@@ -480,6 +506,14 @@ export class MessageRouter {
       }
       const existingPending = state.pendingMessages[message.messageId];
       if (existingPending) {
+        const forkRecovery = this.forkRecoveries.get(message.messageId);
+        if (forkRecovery) {
+          existingPending.forkAttempt = structuredClone(forkRecovery);
+        }
+        const archiveRecovery = this.threadArchiveRecoveries.get(message.messageId);
+        if (archiveRecovery) {
+          existingPending.threadArchiveAttempt = structuredClone(archiveRecovery);
+        }
         retryPending = fromPendingMessage(existingPending);
         return "retry_pending" as const;
       }
@@ -681,14 +715,22 @@ export class MessageRouter {
   private scheduleAcceptedMessage(message: IncomingTextMessage): void {
     void this.enqueue(message).catch(async (error: unknown) => {
       this.logger.error("Accepted chat message processing failed; leaving it pending", error);
-      const state = this.requireState();
-      const pending = state.pendingMessages[message.messageId];
-      if (!pending) {
-        return;
-      }
-      pending.attempts += 1;
-      pending.lastError = truncateInline(formatError(error), 240);
-      await this.store.save(state).catch((saveError: unknown) => {
+      await this.mutateState((state) => {
+        const pending = state.pendingMessages[message.messageId];
+        if (!pending) {
+          return;
+        }
+        const forkRecovery = this.forkRecoveries.get(message.messageId);
+        if (forkRecovery) {
+          pending.forkAttempt = structuredClone(forkRecovery);
+        }
+        const archiveRecovery = this.threadArchiveRecoveries.get(message.messageId);
+        if (archiveRecovery) {
+          pending.threadArchiveAttempt = structuredClone(archiveRecovery);
+        }
+        pending.attempts += 1;
+        pending.lastError = truncateInline(formatError(error), 240);
+      }).catch((saveError: unknown) => {
         this.logger.error("Failed to persist pending message failure", saveError);
       });
     });
@@ -856,6 +898,11 @@ export class MessageRouter {
       }
       markMessageProcessed(currentState, message.messageId);
     });
+    this.forkRecoveries.delete(message.messageId);
+    this.threadArchiveRecoveries.delete(message.messageId);
+    if (this.restartAfterMessageIds.delete(message.messageId)) {
+      this.runtimeControl.requestRestart?.();
+    }
   }
 
   private incrementQueueDepth(chatId: string): void {
@@ -893,6 +940,23 @@ export class MessageRouter {
       return;
     }
 
+    if (!hasAttachments && text === "/help") {
+      await this.sendHelp(message.chatId);
+      return;
+    }
+    if (!hasAttachments && text === "/retry") {
+      await this.retryLastRun(message);
+      return;
+    }
+    if (!hasAttachments && text === "/usage") {
+      await this.sendTokenUsage(message.chatId);
+      return;
+    }
+    if (!hasAttachments && (text === "/service" || text.startsWith("/service "))) {
+      await this.handleServiceCommand(message, text.slice("/service".length).trim());
+      return;
+    }
+
     if (!hasAttachments && text === "/status") {
       await this.sendStatus(message.chatId);
       return;
@@ -925,6 +989,10 @@ export class MessageRouter {
       await this.sendThreads(message.chatId, message.chatType);
       return;
     }
+    if (!hasAttachments && text === "/archived") {
+      await this.sendArchivedThreads(message.chatId, message.chatType);
+      return;
+    }
     if (!hasAttachments && (text === "/history" || text.startsWith("/history "))) {
       await this.sendHistory(message.chatId, message.chatType, text.slice("/history".length).trim());
       return;
@@ -938,11 +1006,29 @@ export class MessageRouter {
       return;
     }
     if (!hasAttachments && (text === "/fork" || text.startsWith("/fork "))) {
-      await this.forkThread(message.chatId, message.chatType, text.slice("/fork".length).trim());
+      await this.forkThread(
+        message.chatId,
+        message.chatType,
+        text.slice("/fork".length).trim(),
+        message.messageId,
+      );
       return;
     }
     if (!hasAttachments && text === "/compact") {
       await this.compactThread(message.chatId, message.chatType);
+      return;
+    }
+    if (!hasAttachments && text === "/archive") {
+      await this.archiveCurrentThread(message.chatId, message.messageId);
+      return;
+    }
+    if (!hasAttachments && (text === "/unarchive" || text.startsWith("/unarchive "))) {
+      await this.unarchiveThread(
+        message.chatId,
+        message.chatType,
+        text.slice("/unarchive".length).trim(),
+        message.messageId,
+      );
       return;
     }
     if (!hasAttachments && text === "/plan") {
@@ -1145,7 +1231,13 @@ export class MessageRouter {
       startedAt,
       updatedAt: startedAt,
     });
-    this.rememberStatusCardRun(statusCard, chatId, prompt, queuedRun.collaborationMode);
+    this.rememberStatusCardRun(
+      statusCard,
+      chatId,
+      prompt,
+      queuedRun.collaborationMode,
+      queuedRun.originSender,
+    );
 
     const controller = queuedRun.controller;
     if (controller.signal.aborted) {
@@ -1758,10 +1850,18 @@ export class MessageRouter {
               interruptionReason: "control_command_not_replayed",
             };
             state.jobs[job.id] = job;
+            const recoveryText = pending.forkAttempt
+              ? this.recoveredForkMessage(state, pending, pending.forkAttempt)
+              : pending.threadArchiveAttempt
+                ? recoveredThreadArchiveMessage(state, pending, pending.threadArchiveAttempt)
+              : interruptedControlMessage(job.prompt);
             appendOutboxDeliveries(
               state,
               job,
-              [{ kind: "text", text: interruptedControlMessage(job.prompt) }],
+              [{
+                kind: pending.forkAttempt || pending.threadArchiveAttempt ? "markdown" : "text",
+                text: recoveryText,
+              }],
               now,
             );
           }
@@ -2189,6 +2289,155 @@ export class MessageRouter {
         ...this.formatRuntimeStatusLines(chatId, state),
         ...this.formatDiagnosticStatusLines(chatId, state),
       ].join("\n"),
+    );
+  }
+
+  private async sendHelp(chatId: string): Promise<void> {
+    await this.sendMarkdown(
+      chatId,
+      [
+        "**Chat2Codex 常用命令**",
+        "",
+        "- `/status` / `/host`：查看当前 chat 与主机健康状态",
+        "- `/projects` / `/threads` / `/history`：浏览项目、会话和历史 turn",
+        "- `/archive` / `/archived` / `/unarchive <编号|thread_id>`：归档与恢复会话",
+        "- `/resume <编号|thread_id>`：继续已有会话",
+        "- `/fork [编号|thread_id]`：分叉整个会话",
+        "- `/fork --turn <历史编号|turn_id>`：从历史 turn 非破坏性分叉",
+        "- `/retry`：重试当前进程中这个 chat 最近一轮任务",
+        "- `/usage`：查看最近一轮与当前 thread 的 token/context 用量",
+        "- `/service status|logs|restart`：查看或管理 bridge 服务（logs/restart 仅限管理员私聊）",
+        "- `/plan <任务>`：执行一次 Plan 模式任务",
+        "- `/stop` / `/steer <补充指令>`：停止或补充当前任务",
+        "- `/summary` / `/files` / `/diff` / `/logs`：查看最近运行结果",
+        "- `/new` / `/cd <path>`：新建会话或切换工作目录",
+        "",
+        "历史 turn 分叉不会恢复或回滚本地文件。",
+      ].join("\n"),
+    );
+  }
+
+  private async retryLastRun(message: IncomingTextMessage): Promise<void> {
+    const run = this.retryableRunsByChat.get(message.chatId);
+    if (!run) {
+      await this.sender.sendText(
+        message.chatId,
+        "当前服务没有这个 chat 可重试的任务上下文；服务重启后请重新发送原任务。",
+      );
+      return;
+    }
+    if (
+      !run.originSender ||
+      !hasStableSenderIdentity(run.originSender) ||
+      !sameStableSenderIdentity(run.originSender, message.sender)
+    ) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起最近一轮任务的用户可以重试；无法稳定识别发送者时不会执行重试。",
+      );
+      return;
+    }
+    if (this.activeRuns.has(message.chatId) || this.queuedRuns.has(message.chatId)) {
+      await this.sender.sendText(message.chatId, "当前 chat 已有任务排队或运行中。");
+      return;
+    }
+
+    await this.runCodex(
+      message.chatId,
+      run.prompt,
+      message.chatType,
+      undefined,
+      message.sender,
+      run.collaborationMode,
+    );
+  }
+
+  private async sendTokenUsage(chatId: string): Promise<void> {
+    const lastRun = this.requireState().chats[chatId]?.lastRun;
+    if (!lastRun) {
+      await this.sender.sendText(chatId, "当前 chat 还没有可查看的最近运行结果。");
+      return;
+    }
+    if (!lastRun.tokenUsage) {
+      await this.sender.sendText(
+        chatId,
+        "最近一轮没有收到 Codex 的 token usage 通知；这通常表示该 provider 或协议版本未提供用量。",
+      );
+      return;
+    }
+    await this.sendMarkdown(chatId, formatTokenUsage(lastRun));
+  }
+
+  private async handleServiceCommand(
+    message: IncomingTextMessage,
+    argument: string,
+  ): Promise<void> {
+    const command = argument.toLowerCase();
+    if (!command) {
+      await this.sender.sendText(message.chatId, "用法：/service <status|logs|restart>");
+      return;
+    }
+    if (command === "status") {
+      const state = this.requireState();
+      await this.sendMarkdown(
+        message.chatId,
+        [
+          "**Chat2Codex 服务状态**",
+          `pid：${process.pid}`,
+          `uptime：${formatDuration(Date.now() - this.bridgeStartedAtMs)}`,
+          `restart：${this.config.serviceRestartEnabled ? "supervisor enabled" : "disabled"}`,
+          `log：${this.config.logFilePath ? `\`${this.config.logFilePath}\`` : process.platform === "linux" ? "systemd journal" : "(foreground / unavailable)"}`,
+          ...this.formatRuntimeStatusLines(message.chatId, state),
+        ].join("\n"),
+      );
+      return;
+    }
+    if (!this.serviceAdminAllowed(message)) {
+      await this.sender.sendText(
+        message.chatId,
+        "`/service logs` 和 `/service restart` 只允许在私聊中由 ALLOWED_USER_IDS 明确列出的用户执行。",
+      );
+      return;
+    }
+    if (command === "logs") {
+      try {
+        const logText = await readServiceLogTail(this.config.logFilePath);
+        await this.sender.sendText(message.chatId, `Chat2Codex 最近服务日志：\n${logText}`);
+      } catch (error) {
+        await this.sender.sendText(message.chatId, `读取服务日志失败：${formatError(error)}`);
+      }
+      return;
+    }
+    if (command === "restart") {
+      if (!this.config.serviceRestartEnabled || !this.runtimeControl.requestRestart) {
+        await this.sender.sendText(
+          message.chatId,
+          "当前 bridge 不是由支持自动拉起的服务配置启动，已拒绝远程重启。",
+        );
+        return;
+      }
+      if (this.activeRuns.size > 0 || this.queuedRuns.size > 0) {
+        await this.sender.sendText(
+          message.chatId,
+          "当前还有运行中或排队任务；请先完成或 `/stop`，再重启服务。",
+        );
+        return;
+      }
+      await this.sender.sendText(
+        message.chatId,
+        "已接受服务重启请求；bridge 将优雅退出并由 launchd/systemd 自动拉起。",
+      );
+      this.restartAfterMessageIds.add(message.messageId);
+      return;
+    }
+    await this.sender.sendText(message.chatId, "用法：/service <status|logs|restart>");
+  }
+
+  private serviceAdminAllowed(message: IncomingTextMessage): boolean {
+    return (
+      message.chatType === "direct" &&
+      this.config.access.allowedUserIds.length > 0 &&
+      senderMatchesAllowedUser(message.sender, this.config.access.allowedUserIds)
     );
   }
 
@@ -2652,6 +2901,193 @@ export class MessageRouter {
     );
   }
 
+  private async sendArchivedThreads(chatId: string, chatType: ChatType): Promise<void> {
+    if (!this.codex.listThreads) {
+      await this.sender.sendText(chatId, "当前 Codex 客户端暂不支持读取已归档会话。");
+      return;
+    }
+    const session = this.ensureSession(chatId, this.requireState(), chatType);
+    if (!this.directoryAllowedForChat(session.cwd, chatType)) {
+      await this.sender.sendText(chatId, this.formatDirectoryDenied(session.cwd));
+      return;
+    }
+    let result: CodexThreadListResult;
+    try {
+      result = await this.codex.listThreads({
+        cwd: session.cwd,
+        archived: true,
+        limit: 50,
+        sortKey: "updated_at",
+        sortDirection: "desc",
+      });
+    } catch (error) {
+      await this.sender.sendText(chatId, `读取已归档会话失败：${formatError(error)}`);
+      return;
+    }
+    const archived = result.threads
+      .filter((thread) => thread.cwd === session.cwd)
+      .map((thread) => toThreadSelection(thread));
+    await this.mutateState((state) => {
+      const current = this.ensureSession(chatId, state, chatType);
+      current.lastArchivedThreads = archived;
+      current.updatedAt = new Date().toISOString();
+    });
+    if (!archived.length) {
+      await this.sender.sendText(chatId, "当前项目没有已归档的 Codex 会话。");
+      return;
+    }
+    await this.sendMarkdown(
+      chatId,
+      [
+        "**已归档会话**",
+        `项目：\`${session.cwd}\``,
+        "",
+        ...archived.flatMap((thread, index) => [
+          `**${index + 1}. ${truncateInline(thread.title ?? thread.preview ?? thread.threadId, 90)}**`,
+          `id \`${thread.threadId}\`${thread.updatedAt ? ` · 最近 ${thread.updatedAt}` : ""}`,
+          "",
+        ]),
+        "发送 `/unarchive <编号>` 或 `/unarchive <thread_id>` 恢复；恢复后可用 `/resume` 继续。",
+      ].join("\n"),
+    );
+  }
+
+  private async archiveCurrentThread(chatId: string, messageId: string): Promise<void> {
+    if (!this.codex.archiveThread) {
+      await this.sender.sendText(chatId, "当前 Codex 客户端暂不支持归档会话。");
+      return;
+    }
+    const pending = this.requireState().pendingMessages[messageId];
+    const recovered = this.threadArchiveRecoveries.get(messageId) ?? pending?.threadArchiveAttempt;
+    if (recovered) {
+      await this.finishRecoveredThreadArchive(chatId, recovered);
+      return;
+    }
+    const session = this.ensureSession(chatId);
+    if (!session.threadId) {
+      await this.sender.sendText(chatId, "当前 chat 还没有已选择的 Codex 会话。");
+      return;
+    }
+    const attempt: PendingThreadArchiveAttempt = {
+      action: "archive",
+      threadId: session.threadId,
+      startedAt: new Date().toISOString(),
+    };
+    if (pending) {
+      await this.persistThreadArchiveAttempt(messageId, attempt);
+    }
+    await this.invalidateCodexSession(chatId, "thread_archived");
+    try {
+      await this.codex.archiveThread(attempt.threadId);
+    } catch (error) {
+      await this.sender.sendText(chatId, `归档会话失败：${formatError(error)}`);
+      return;
+    }
+    attempt.completed = true;
+    if (pending) {
+      this.threadArchiveRecoveries.set(messageId, structuredClone(attempt));
+      await this.persistThreadArchiveAttempt(messageId, attempt);
+    }
+    await this.applyCompletedThreadArchive(chatId, attempt);
+    await this.sendMarkdown(chatId, threadArchiveResultMessage(attempt));
+  }
+
+  private async unarchiveThread(
+    chatId: string,
+    chatType: ChatType,
+    argument: string,
+    messageId: string,
+  ): Promise<void> {
+    if (!this.codex.unarchiveThread) {
+      await this.sender.sendText(chatId, "当前 Codex 客户端暂不支持恢复已归档会话。");
+      return;
+    }
+    const pending = this.requireState().pendingMessages[messageId];
+    const recovered = this.threadArchiveRecoveries.get(messageId) ?? pending?.threadArchiveAttempt;
+    if (recovered) {
+      await this.finishRecoveredThreadArchive(chatId, recovered);
+      return;
+    }
+    if (!argument) {
+      await this.sender.sendText(chatId, "用法：/unarchive <已归档编号|thread_id>（先发送 /archived）");
+      return;
+    }
+    const session = this.ensureSession(chatId, this.requireState(), chatType);
+    const index = parseSelectionIndex(argument);
+    const threadId = index === null
+      ? argument
+      : session.lastArchivedThreads?.[index - 1]?.threadId;
+    if (!threadId) {
+      await this.sender.sendText(chatId, "没有这个已归档会话编号。请先发送 /archived 刷新列表。");
+      return;
+    }
+    const attempt: PendingThreadArchiveAttempt = {
+      action: "unarchive",
+      threadId,
+      startedAt: new Date().toISOString(),
+    };
+    if (pending) {
+      await this.persistThreadArchiveAttempt(messageId, attempt);
+    }
+    try {
+      await this.codex.unarchiveThread(threadId);
+    } catch (error) {
+      await this.sender.sendText(chatId, `恢复已归档会话失败：${formatError(error)}`);
+      return;
+    }
+    attempt.completed = true;
+    if (pending) {
+      this.threadArchiveRecoveries.set(messageId, structuredClone(attempt));
+      await this.persistThreadArchiveAttempt(messageId, attempt);
+    }
+    await this.applyCompletedThreadArchive(chatId, attempt);
+    await this.sendMarkdown(chatId, threadArchiveResultMessage(attempt));
+  }
+
+  private async persistThreadArchiveAttempt(
+    messageId: string,
+    attempt: PendingThreadArchiveAttempt,
+  ): Promise<void> {
+    await this.mutateState((state) => {
+      const pending = state.pendingMessages[messageId];
+      if (!pending) {
+        throw new Error("Cannot persist archive intent without a pending message.");
+      }
+      pending.threadArchiveAttempt = structuredClone(attempt);
+    });
+  }
+
+  private async applyCompletedThreadArchive(
+    chatId: string,
+    attempt: PendingThreadArchiveAttempt,
+  ): Promise<void> {
+    if (!attempt.completed) {
+      return;
+    }
+    await this.mutateState((state) => {
+      const session = this.ensureSession(chatId, state);
+      if (attempt.action === "archive" && session.threadId === attempt.threadId) {
+        session.threadId = undefined;
+        session.lastTurns = undefined;
+        session.sessionEpoch = createSessionEpoch();
+      }
+      if (attempt.action === "unarchive") {
+        session.lastArchivedThreads = session.lastArchivedThreads?.filter(
+          (thread) => thread.threadId !== attempt.threadId,
+        );
+      }
+      session.updatedAt = new Date().toISOString();
+    });
+  }
+
+  private async finishRecoveredThreadArchive(
+    chatId: string,
+    attempt: PendingThreadArchiveAttempt,
+  ): Promise<void> {
+    await this.applyCompletedThreadArchive(chatId, attempt);
+    await this.sendMarkdown(chatId, threadArchiveResultMessage(attempt));
+  }
+
   private async sendHistory(chatId: string, chatType: ChatType, argument: string): Promise<void> {
     const state = this.requireState();
     const session = this.ensureSession(chatId, state, chatType);
@@ -2845,7 +3281,12 @@ export class MessageRouter {
     );
   }
 
-  private async forkThread(chatId: string, chatType: ChatType, argument: string): Promise<void> {
+  private async forkThread(
+    chatId: string,
+    chatType: ChatType,
+    argument: string,
+    messageId: string,
+  ): Promise<void> {
     if (!this.codex.forkThread) {
       await this.sender.sendText(chatId, "当前 Codex 客户端暂不支持分叉 app-server 对话。");
       return;
@@ -2857,7 +3298,62 @@ export class MessageRouter {
 
     const state = this.requireState();
     const current = this.ensureSession(chatId, state, chatType);
-    const selection = await this.resolveThreadForControl(chatId, chatType, current, argument);
+    const pending = state.pendingMessages[messageId];
+    const pendingContext = pending ?? toPendingMessage({
+      messageId,
+      chatId,
+      chatType,
+      sender: {},
+      text: `/fork ${argument}`,
+    }, "control_no_replay");
+    const replayAttempt = this.forkRecoveries.get(messageId) ?? pending?.forkAttempt;
+    if (replayAttempt) {
+      await this.sendMarkdown(
+        chatId,
+        this.recoveredForkMessage(state, pendingContext, replayAttempt),
+      );
+      return;
+    }
+
+    const turnFork = parseHistoricalTurnForkArgument(argument);
+    let lastTurnId: string | undefined;
+    let selection: ThreadSelection | null;
+    if (turnFork.requested) {
+      if (!current.threadId) {
+        await this.sender.sendText(
+          chatId,
+          "当前 chat 还没有可分叉的 Codex 会话。先发送任务或用 /resume 选择会话。",
+        );
+        return;
+      }
+      if (!turnFork.argument) {
+        await this.sender.sendText(
+          chatId,
+          "用法：/fork --turn <历史编号|turn_id>；请先发送 /history 查看历史。",
+        );
+        return;
+      }
+      const turn = resolveHistoricalTurnBoundary(
+        current.lastTurns,
+        current.threadId,
+        turnFork.argument,
+      );
+      if (!turn) {
+        await this.sender.sendText(
+          chatId,
+          "没有这个当前会话的历史编号或 turn_id。请先发送 /history 查看当前会话历史。",
+        );
+        return;
+      }
+      if (turn.status === "inProgress") {
+        await this.sender.sendText(chatId, "这个历史 turn 仍在进行中，完成或停止后才能从这里分叉。");
+        return;
+      }
+      selection = { threadId: current.threadId, cwd: current.cwd };
+      lastTurnId = turn.turnId;
+    } else {
+      selection = await this.resolveThreadForControl(chatId, chatType, current, argument);
+    }
     if (!selection) {
       return;
     }
@@ -2870,34 +3366,182 @@ export class MessageRouter {
       return;
     }
 
+    const forkAttempt: PendingForkAttempt = {
+      sourceThreadId: selection.threadId,
+      startedAt: new Date().toISOString(),
+      ...(lastTurnId ? { lastTurnId } : {}),
+    };
+    if (pending) {
+      await this.mutateState((currentState) => {
+        const currentPending = currentState.pendingMessages[messageId];
+        if (!currentPending) {
+          throw new Error("Pending fork message disappeared before its intent was persisted.");
+        }
+        currentPending.forkAttempt = { ...forkAttempt };
+      });
+    }
+
     await this.rotateSessionEpoch(chatId, "thread_fork");
     let forked: CodexThread;
     try {
       forked = await this.codex.forkThread({
         threadId: selection.threadId,
         cwd: selection.cwd,
+        ...(lastTurnId ? { lastTurnId } : {}),
       });
     } catch (error) {
       await this.sender.sendText(chatId, `分叉 Codex 会话失败：${formatError(error)}`);
       return;
     }
 
+    const forkSelection = toThreadSelection(forked);
+    const completedAttempt: PendingForkAttempt = {
+      ...forkAttempt,
+      result: forkSelection,
+      selectionPersisted: true,
+    };
+    if (pending) {
+      this.forkRecoveries.set(messageId, completedAttempt);
+    }
     if (!this.directoryAllowedForChat(forked.cwd, chatType)) {
-      await this.sender.sendText(chatId, this.formatDirectoryDenied(forked.cwd));
+      const blockedAttempt: PendingForkAttempt = {
+        ...completedAttempt,
+        selectionPersisted: false,
+      };
+      if (pending) {
+        this.forkRecoveries.set(messageId, blockedAttempt);
+        await this.persistForkRecovery(messageId, blockedAttempt).catch((error: unknown) => {
+          this.logger.error("Failed to persist the policy-blocked fork for recovery", error);
+        });
+      }
+      await this.sendMarkdown(
+        chatId,
+        this.recoveredForkMessage(this.requireState(), pendingContext, blockedAttempt),
+      );
       return;
     }
 
-    const forkSelection = toThreadSelection(forked);
-    await this.applyThreadSelection(chatId, forkSelection);
+    try {
+      if (pending) {
+        await this.persistForkSelection(chatId, messageId, forkSelection, completedAttempt);
+      } else {
+        await this.applyThreadSelection(chatId, forkSelection);
+      }
+    } catch (error) {
+      const recoveryAttempt: PendingForkAttempt = {
+        ...completedAttempt,
+        selectionPersisted: false,
+      };
+      if (pending) {
+        this.forkRecoveries.set(messageId, recoveryAttempt);
+        await this.persistForkRecovery(messageId, recoveryAttempt).catch((recoveryError: unknown) => {
+          this.logger.error("Failed to persist the created fork for recovery", recoveryError);
+        });
+      }
+      await this.sendForkPersistenceWarning(chatId, recoveryAttempt, error);
+      return;
+    }
+    await this.sendMarkdown(
+      chatId,
+      this.recoveredForkMessage(this.requireState(), pendingContext, completedAttempt),
+    );
+  }
+
+  private async persistForkSelection(
+    chatId: string,
+    messageId: string,
+    selection: ThreadSelection,
+    attempt: PendingForkAttempt,
+  ): Promise<void> {
+    await this.mutateState((state) => {
+      const pending = state.pendingMessages[messageId];
+      if (!pending) {
+        throw new Error("Pending fork message disappeared before its result was persisted.");
+      }
+      pending.forkAttempt = structuredClone(attempt);
+      const current = this.ensureSession(chatId, state, pending.chatType);
+      state.chats[chatId] = selectedChatSession(current, selection);
+    });
+    await this.invalidateCodexSession(chatId, "thread_changed");
+  }
+
+  private async persistForkRecovery(
+    messageId: string,
+    attempt: PendingForkAttempt,
+  ): Promise<void> {
+    await this.mutateState((state) => {
+      const pending = state.pendingMessages[messageId];
+      if (!pending) {
+        throw new Error("Pending fork message disappeared before recovery was persisted.");
+      }
+      pending.forkAttempt = structuredClone(attempt);
+    });
+  }
+
+  private recoveredForkMessage(
+    state: BridgeState,
+    pending: PendingMessageDelivery,
+    attempt: PendingForkAttempt,
+  ): string {
+    const result = attempt.result;
+    if (!result) {
+      return [
+        "**没有重复执行分叉**",
+        `来源：\`${attempt.sourceThreadId}\``,
+        ...(attempt.lastTurnId ? [`截止 turn：\`${attempt.lastTurnId}\``] : []),
+        "",
+        "此前的分叉尝试未能完整记录结果。为避免创建重复 thread，本次不会自动重试；请发送 `/threads` 检查已有会话后再决定。",
+      ].join("\n");
+    }
+    if (!this.directoryAllowedForChat(result.cwd, pending.chatType)) {
+      return [
+        "**分叉已创建，但安全策略阻止选择**",
+        `来源：\`${attempt.sourceThreadId}\``,
+        ...(attempt.lastTurnId ? [`截止 turn：\`${attempt.lastTurnId}\``] : []),
+        `新 thread：\`${result.threadId}\``,
+        "",
+        this.formatDirectoryDenied(result.cwd),
+        "",
+        "系统不会自动重试，也不会把当前 chat 切到这个 thread。",
+      ].join("\n");
+    }
+    const selected =
+      attempt.selectionPersisted === true &&
+      state.chats[pending.chatId]?.threadId === result.threadId;
+    return [
+      selected ? "**已分叉 Codex 会话**" : "**分叉已创建，但当前会话未切换**",
+      `来源：\`${attempt.sourceThreadId}\``,
+      ...(attempt.lastTurnId ? [`截止 turn：\`${attempt.lastTurnId}\``] : []),
+      `新 thread：\`${result.threadId}\``,
+      `项目：\`${result.cwd}\``,
+      "",
+      selected
+        ? attempt.lastTurnId
+          ? "下一条消息会继续这个分叉会话；原会话不会被修改，也不会恢复或回滚本地文件。"
+          : "下一条消息会继续这个分叉会话；原会话不会被修改。"
+        : "当前会话可能已在稍后切换，或之前未能保存切换结果；系统不会覆盖它。发送 `/resume <thread_id>` 可选择上面的新 thread。",
+    ].join("\n");
+  }
+
+  private async sendForkPersistenceWarning(
+    chatId: string,
+    attempt: PendingForkAttempt,
+    error: unknown,
+  ): Promise<void> {
+    const result = attempt.result;
+    if (!result) {
+      throw new Error("Fork recovery attempt is missing its result.");
+    }
+    this.logger.error("Fork created but chat selection persistence failed", error);
     await this.sendMarkdown(
       chatId,
       [
-        "**已分叉 Codex 会话**",
-        `来源：\`${selection.threadId}\``,
-        `新 thread：\`${forkSelection.threadId}\``,
-        `项目：\`${forkSelection.cwd}\``,
+        "**分叉已创建，但未切换当前会话**",
+        `来源：\`${attempt.sourceThreadId}\``,
+        ...(attempt.lastTurnId ? [`截止 turn：\`${attempt.lastTurnId}\``] : []),
+        `新 thread：\`${result.threadId}\``,
         "",
-        "下一条消息会继续这个分叉会话；原会话不会被修改。",
+        "保存会话状态失败，当前 chat 仍停留在原 thread。为避免重复分叉，系统不会自动重试；状态恢复后可用 `/resume <thread_id>` 选择上面的新 thread。",
       ].join("\n"),
     );
   }
@@ -3028,6 +3672,7 @@ export class MessageRouter {
         updatedAt: new Date().toISOString(),
         lastProjects: current.lastProjects,
         lastThreads: current.lastThreads,
+        lastArchivedThreads: current.lastArchivedThreads,
         lastTurns: undefined,
       };
     });
@@ -3957,6 +4602,13 @@ export class MessageRouter {
     if (!run || run.chatId !== action.chatId) {
       return cardActionToast("warning", "无法重试：当前服务没有这张状态卡的任务上下文。");
     }
+    if (
+      !run.originSender ||
+      !hasStableSenderIdentity(run.originSender) ||
+      !sameStableSenderIdentity(run.originSender, action.sender)
+    ) {
+      return cardActionToast("error", "只有发起这次 Codex 任务的用户可以重试。");
+    }
 
     if (this.queues.has(action.chatId)) {
       return cardActionToast("warning", "当前 chat 已有任务排队或运行中。");
@@ -4337,12 +4989,27 @@ export class MessageRouter {
     chatId: string,
     prompt: string,
     collaborationMode: CodexCollaborationMode,
+    originSender?: SenderIdentity,
   ): void {
+    const run = {
+      prompt,
+      collaborationMode,
+      originSender: originSender ? { ...originSender } : undefined,
+    };
+    this.retryableRunsByChat.delete(chatId);
+    this.retryableRunsByChat.set(chatId, run);
+    while (this.retryableRunsByChat.size > maxRememberedStatusCards) {
+      const oldestChatId = this.retryableRunsByChat.keys().next().value;
+      if (!oldestChatId) {
+        break;
+      }
+      this.retryableRunsByChat.delete(oldestChatId);
+    }
     if (!handle) {
       return;
     }
 
-    this.statusCardRuns.set(handle.messageId, { chatId, prompt, collaborationMode });
+    this.statusCardRuns.set(handle.messageId, { chatId, ...run });
     while (this.statusCardRuns.size > maxRememberedStatusCards) {
       const oldestKey = this.statusCardRuns.keys().next().value;
       if (!oldestKey) {
@@ -4509,6 +5176,7 @@ export class MessageRouter {
         updatedAt: new Date().toISOString(),
         lastProjects: current.lastProjects,
         lastThreads: current.lastThreads,
+        lastArchivedThreads: current.lastArchivedThreads,
       };
     });
     await this.invalidateCodexSession(chatId, "session_reset");
@@ -4701,8 +5369,32 @@ function buildLastRunSummary(input: LastRunBuildInput): LastRunSummary {
     durationMs,
     finalTextPreview: input.finalText ? truncateDetail(input.finalText, 600) : undefined,
     errorPreview: input.errorText ? truncateDetail(input.errorText, 600) : undefined,
+    tokenUsage: input.summary?.tokenUsage ? structuredClone(input.summary.tokenUsage) : undefined,
     review: toLastRunReviewSummary(input.summary, input.cwd),
   };
+}
+
+function formatTokenUsage(lastRun: LastRunSummary): string {
+  const usage = lastRun.tokenUsage!;
+  const context = usage.modelContextWindow;
+  const contextPercent =
+    typeof context === "number" && context > 0
+      ? `${((usage.total.totalTokens / context) * 100).toFixed(1)}%`
+      : "(unknown)";
+  return [
+    "**最近一轮 Token 用量**",
+    lastRun.threadId ? `thread：\`${lastRun.threadId}\`` : null,
+    `本轮：${formatTokenCount(usage.last.totalTokens)}（输入 ${formatTokenCount(usage.last.inputTokens)}，缓存输入 ${formatTokenCount(usage.last.cachedInputTokens)}，输出 ${formatTokenCount(usage.last.outputTokens)}，推理输出 ${formatTokenCount(usage.last.reasoningOutputTokens)}）`,
+    `累计：${formatTokenCount(usage.total.totalTokens)}（输入 ${formatTokenCount(usage.total.inputTokens)}，缓存输入 ${formatTokenCount(usage.total.cachedInputTokens)}，输出 ${formatTokenCount(usage.total.outputTokens)}，推理输出 ${formatTokenCount(usage.total.reasoningOutputTokens)}）`,
+    `context window：${typeof context === "number" ? formatTokenCount(context) : "(unknown)"}`,
+    `累计占 context：${contextPercent}`,
+  ]
+    .filter((line): line is string => line !== null)
+    .join("\n");
+}
+
+function formatTokenCount(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
 }
 
 function toLastRunReviewSummary(summary: CodexRunSummary | undefined, cwd: string): LastRunReviewSummary {
@@ -5047,6 +5739,63 @@ function resolveTurnId(turns: TurnSelection[] | undefined, argument: string): st
   return argument.trim() || null;
 }
 
+function selectedChatSession(
+  current: {
+    chatType?: ChatType;
+    lastProjects?: ProjectSelection[];
+    lastThreads?: ThreadSelection[];
+    lastArchivedThreads?: ThreadSelection[];
+  },
+  selection: ThreadSelection,
+): ChatSession {
+  return {
+    cwd: selection.cwd,
+    threadId: selection.threadId,
+    sessionEpoch: createSessionEpoch(),
+    chatType: current.chatType,
+    updatedAt: new Date().toISOString(),
+    lastProjects: current.lastProjects,
+    lastThreads: current.lastThreads,
+    lastArchivedThreads: current.lastArchivedThreads,
+    lastTurns: undefined,
+  };
+}
+
+function parseHistoricalTurnForkArgument(argument: string): {
+  requested: boolean;
+  argument: string;
+} {
+  const trimmed = argument.trim();
+  const match = /^--turn(?:\s+(.*))?$/u.exec(trimmed);
+  if (match) {
+    return { requested: true, argument: match[1]?.trim() ?? "" };
+  }
+  return { requested: false, argument: "" };
+}
+
+function resolveHistoricalTurnBoundary(
+  turns: TurnSelection[] | undefined,
+  threadId: string,
+  argument: string,
+): { turnId: string; status?: string } | null {
+  const index = parseSelectionIndex(argument);
+  if (index !== null) {
+    const turn = turns?.[index - 1];
+    return turn?.threadId === threadId
+      ? { turnId: turn.turnId, status: turn.status }
+      : null;
+  }
+
+  const turnId = argument.trim();
+  if (!turnId) {
+    return null;
+  }
+  const cached = turns?.find(
+    (candidate) => candidate.threadId === threadId && candidate.turnId === turnId,
+  );
+  return { turnId, status: cached?.status };
+}
+
 function formatSearchResults(query: string, selections: ThreadSelection[]): string {
   const lines = ["**Codex 搜索结果**", `关键词：${query}`];
   selections.forEach((selection, index) => {
@@ -5085,7 +5834,10 @@ function formatThreadHistory(threadId: string, cwd: string, turns: TurnSelection
       lines.push(truncateInline(turn.summary, 180));
     }
   });
-  lines.push("", "发送 `/history <编号>` 查看某一轮详情。");
+  lines.push(
+    "",
+    "发送 `/history <编号>` 查看详情，或 `/fork --turn <编号>` 从这一轮非破坏性分叉。",
+  );
   return lines.join("\n");
 }
 
@@ -5474,6 +6226,7 @@ function inferLegacyPendingRoute(
 
 function isReplaySafeRouterCommand(text: string): boolean {
   return (
+    text === "/help" ||
     text === "/whoami" ||
     text === "/status" ||
     text === "/host" ||
@@ -5482,10 +6235,15 @@ function isReplaySafeRouterCommand(text: string): boolean {
     text === "/logs" ||
     text === "/files" ||
     text === "/summary" ||
+    text === "/usage" ||
     text === "/plan" ||
     text === "/projects" ||
     text === "/threads" ||
     text === "/sessions" ||
+    text === "/archived" ||
+    text === "/service" ||
+    text === "/service status" ||
+    text === "/service logs" ||
     text === "/history" ||
     text.startsWith("/history ") ||
     text === "/search" ||
@@ -5503,6 +6261,7 @@ function controlCommandName(text: string): string {
 
 function isBuiltInRouterCommand(text: string): boolean {
   return (
+    text === "/help" ||
     text === "/whoami" ||
     text === "/status" ||
     text === "/host" ||
@@ -5511,10 +6270,18 @@ function isBuiltInRouterCommand(text: string): boolean {
     text === "/logs" ||
     text === "/files" ||
     text === "/summary" ||
+    text === "/usage" ||
+    text === "/service" ||
+    text.startsWith("/service ") ||
+    text === "/retry" ||
     text === "/stop" ||
     text === "/projects" ||
     text === "/threads" ||
     text === "/sessions" ||
+    text === "/archived" ||
+    text === "/archive" ||
+    text === "/unarchive" ||
+    text.startsWith("/unarchive ") ||
     text === "/compact" ||
     text === "/plan" ||
     text === "/new" ||
@@ -5537,6 +6304,85 @@ function isBuiltInRouterCommand(text: string): boolean {
     text.startsWith("/fork ") ||
     text.startsWith("/cd ")
   );
+}
+
+async function readServiceLogTail(logFilePath: string | undefined): Promise<string> {
+  if (logFilePath) {
+    const handle = await fs.open(logFilePath, "r");
+    try {
+      const stat = await handle.stat();
+      const maxBytes = 64 * 1024;
+      const length = Math.min(stat.size, maxBytes);
+      const offset = Math.max(0, stat.size - length);
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      let text = buffer.subarray(0, bytesRead).toString("utf8");
+      if (offset > 0) {
+        text = text.slice(Math.max(0, text.indexOf("\n") + 1));
+      }
+      const lines = text.split("\n").filter(Boolean).slice(-80);
+      return truncateDetail(lines.join("\n") || "(日志文件为空)", 12_000);
+    } finally {
+      await handle.close();
+    }
+  }
+  if (process.platform === "linux") {
+    const result = spawnSync(
+      "journalctl",
+      ["--user", "-u", "chat2codex.service", "-n", "80", "--no-pager"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    if (result.status !== 0) {
+      throw new Error(result.stderr.trim() || "journalctl did not return service logs");
+    }
+    return truncateDetail(result.stdout.trim() || "(systemd journal 为空)", 12_000);
+  }
+  throw new Error("当前进程没有配置 CHAT2CODEX_LOG_FILE");
+}
+
+function threadArchiveResultMessage(attempt: PendingThreadArchiveAttempt): string {
+  if (!attempt.completed) {
+    return [
+      "**会话归档操作结果未知**",
+      `操作：${attempt.action}`,
+      `thread：\`${attempt.threadId}\``,
+      "服务不会自动重放这次外部状态变更；请用 `/archived` 核对后再决定下一步。",
+    ].join("\n");
+  }
+  return attempt.action === "archive"
+    ? [
+        "**已归档当前 Codex 会话**",
+        `thread：\`${attempt.threadId}\``,
+        "本地文件没有被删除或回滚；下一条普通任务会创建新会话。",
+      ].join("\n")
+    : [
+        "**已恢复已归档的 Codex 会话**",
+        `thread：\`${attempt.threadId}\``,
+        "发送 `/threads` 后用 `/resume` 继续该会话。",
+      ].join("\n");
+}
+
+function recoveredThreadArchiveMessage(
+  state: BridgeState,
+  pending: PendingMessageDelivery,
+  attempt: PendingThreadArchiveAttempt,
+): string {
+  if (attempt.completed) {
+    const session = state.chats[pending.chatId];
+    if (attempt.action === "archive" && session?.threadId === attempt.threadId) {
+      session.threadId = undefined;
+      session.lastTurns = undefined;
+      session.sessionEpoch = createSessionEpoch();
+      session.updatedAt = new Date().toISOString();
+    }
+    if (attempt.action === "unarchive" && session) {
+      session.lastArchivedThreads = session.lastArchivedThreads?.filter(
+        (thread) => thread.threadId !== attempt.threadId,
+      );
+      session.updatedAt = new Date().toISOString();
+    }
+  }
+  return threadArchiveResultMessage(attempt);
 }
 
 function isTerminalJobStatus(status: DurableCodexJobStatus): boolean {

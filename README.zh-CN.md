@@ -59,6 +59,7 @@ Summarize this repository.
 
 | 命令 | 作用 |
 | --- | --- |
+| `/help` | 显示适合手机查看的 Chat2Codex 常用命令指南。 |
 | `chat2codex` / `chat2codex start` | 启动飞书/Lark 桥接服务。 |
 | `chat2codex setup --workdir <path>` | 创建/连接飞书/Lark 应用，并写入 `.env`。 |
 | `chat2codex init --workdir <path>` | 已有应用时，创建一份初始 `.env`。 |
@@ -72,7 +73,7 @@ Summarize this repository.
 
 - 飞书/Lark 长连接机器人，不需要公网 webhook 服务。
 - 每个 chat/thread scope 复用一个 Codex app-server 进程。只要发送者、cwd、thread、策略和 session epoch 不变，连续 turn 会保留同一进程以及 session 级授权。
-- 支持 `/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/compact`、`/plan <任务>`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/answer`、`/mcp-answer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
+- 支持 `/help`、`/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/archive`、`/archived`、`/unarchive`、`/retry`、`/usage`、`/service status|logs|restart`、`/compact`、`/plan <任务>`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/answer`、`/mcp-answer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
 - 使用 JSON 保存本地状态。
 - 使用 Codex app-server JSON-RPC 获取机器可读的进度、最终输出和审批回调。
 - Codex 运行时会限频更新状态卡片，并提供停止/重试、本轮详情按钮；卡片不可用时自动回退为文本。
@@ -118,6 +119,11 @@ chat2codex smoke
 ```bash
 chat2codex smoke --mode turn
 ```
+
+指定历史 turn 的分叉采用更严格的兼容保护：只有正在运行的 app-server
+版本与内置协议快照精确一致时，`/fork --turn` 才会发送 `thread/fork`。
+旧版服务端可能忽略 `lastTurnId` 并静默退化为整线程分叉；普通 `/fork`
+仍保留原有兼容行为。
 
 如果要验证真实的命令审批请求：
 
@@ -190,6 +196,7 @@ ALLOWED_CHAT_IDS=oc_xxx
    ```
 
    在 macOS 上会安装名为 `com.chat2codex.bridge` 的 launchd agent；在 Linux 上会安装名为 `chat2codex.service` 的 systemd user service。
+   从旧版本升级后请重新运行 `chat2codex service install`，写入 `/service restart` 所需的 supervisor 标记。
 
 常用服务命令：
 
@@ -227,6 +234,15 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/search <关键词>` | 搜索 Codex 历史对话，并把结果保存为可 `/resume <编号>` 或 `/fork <编号>` 操作的列表。 |
 | `/resume <index\|thread_id>` | 通过编号继续已列出的对话，或直接通过 Codex thread id 加载。 |
 | `/fork [index\|thread_id]` | 分叉当前、已列出或指定的 Codex 会话，并把当前 chat 切到新 thread。 |
+| `/fork --turn <历史编号\|turn_id>` | 从选中的非进行中 turn 分叉当前会话。可以使用 `/history` 中的编号，也可以直接传 turn id；原 thread 保持不变，且不会恢复本地文件。 |
+| `/retry` | 为同一 chat 的原任务发送者重试当前 bridge 进程记住的最近任务；bridge 重启后精确 prompt 上下文会清空。 |
+| `/usage` | 在 Codex 提供用量通知时，查看最近一轮和当前 thread 的累计 token 用量及 context 占用。 |
+| `/archive` | 归档当前选中的 Codex thread 并从 chat 清除选择，不修改本地文件。 |
+| `/archived` | 列出当前项目的已归档 thread。 |
+| `/unarchive <已归档编号\|thread_id>` | 恢复已归档 thread；之后用 `/threads` 和 `/resume` 继续。 |
+| `/service status` | 查看 bridge PID、运行时长、队列、重启能力和日志来源。 |
+| `/service logs` | 查看有界的最近服务日志；必须是私聊且发送者明确列在 `ALLOWED_USER_IDS`。 |
+| `/service restart` | 优雅重启由 launchd/systemd 托管的 bridge；沿用日志命令的管理员边界，并在有运行中或排队任务时拒绝。 |
 | `/compact` | 请求压缩当前 Codex 会话。 |
 | `/plan <任务>` | 只把当前任务切换到 Codex Plan 模式；需要 Codex 调用 `request_user_input` 时使用，下一条普通消息会恢复 Default 模式。 |
 | `/new` | 在当前项目开始一个新的 Codex 对话。 |
@@ -292,5 +308,4 @@ bun run check
 
 ## 后续功能
 
-1. 通过 `thread/fork.lastTurnId` 从指定历史 turn 分叉，并保持原 thread 不变。这个操作不是文件系统回滚，也不会恢复本地文件变更。
-2. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。
+1. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。

@@ -276,6 +276,14 @@ rl.on("line", (line) => {
     send({ id: message.id, result: {} });
     return;
   }
+  if (message.method === "thread/archive") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.method === "thread/unarchive") {
+    send({ id: message.id, result: { thread: { id: message.params.threadId, cwd: "/repo/a", name: "Restored", cliVersion: "0.144.5" } } });
+    return;
+  }
   send({ id: message.id, error: { code: -32601, message: "unexpected method: " + message.method } });
 });
 process.on("SIGTERM", () => process.exit(0));
@@ -315,6 +323,152 @@ process.on("SIGTERM", () => process.exit(0));
       expect(forked).toMatchObject({ id: "thread_fork", cwd: "/repo/a", resumable: true });
 
       await expect(runner.compactThread("thread_fork")).resolves.toBeUndefined();
+      await expect(runner.archiveThread("thread_fork")).resolves.toBeUndefined();
+      await expect(runner.unarchiveThread("thread_fork")).resolves.toMatchObject({
+        id: "thread_fork",
+        cwd: "/repo/a",
+        resumable: true,
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("sends lastTurnId only for an explicitly historical fork", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "Codex Desktop/0.144.5 test", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/fork") {
+  send({ id: message.id, result: { thread: { id: "thread_fork", cwd: message.params.cwd, name: "Forked", cliVersion: "0.144.5" } } });
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const runner = new CodexRunner(config, new ConsoleLogger("error"));
+
+      await runner.forkThread({
+        threadId: "thread_search",
+        cwd: "/repo/a",
+        lastTurnId: "turn_1",
+      });
+      await runner.forkThread({ threadId: "thread_search", cwd: "/repo/a" });
+
+      const forkRequests = (await readJsonl(receivedPath)).filter(
+        (message): message is { method: string; params: Record<string, unknown> } =>
+          typeof message === "object" &&
+          message !== null &&
+          (message as { method?: unknown }).method === "thread/fork",
+      );
+      expect(forkRequests).toHaveLength(2);
+      expect(forkRequests[0]?.params).toMatchObject({
+        threadId: "thread_search",
+        cwd: "/repo/a",
+        lastTurnId: "turn_1",
+      });
+      expect(forkRequests[1]?.params).not.toHaveProperty("lastTurnId");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails historical forks closed before sending when the app-server version differs", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "Codex Desktop/0.142.4 test", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/fork") {
+  send({ id: message.id, result: { thread: { id: "silently_wrong_fork", cwd: message.params.cwd, name: "Ignored lastTurnId", cliVersion: "0.142.4" } } });
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const runner = new CodexRunner(config, new ConsoleLogger("error"));
+
+      await expect(
+        runner.forkThread({
+          threadId: "thread_search",
+          cwd: "/repo/a",
+          lastTurnId: "turn_1",
+        }),
+      ).rejects.toThrow("match the bundled protocol snapshot");
+      await runner.forkThread({ threadId: "thread_search", cwd: "/repo/a" });
+
+      const forkRequests = (await readJsonl(receivedPath)).filter(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          (message as { method?: unknown }).method === "thread/fork",
+      );
+      expect(forkRequests).toHaveLength(1);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a prerelease app-server before sending a historical fork", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const { fakeCodex, receivedPath } = await createRecordingFakeCodex(
+      tempDir,
+      `
+if (message.method === "initialize") {
+  send({ id: message.id, result: { userAgent: "Codex Desktop/0.144.5-dev test", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+  return;
+}
+if (message.method === "thread/fork") {
+  send({ id: message.id, result: { thread: { id: "silently_wrong_fork", cwd: message.params.cwd, name: "Ignored lastTurnId", cliVersion: "0.144.5-dev" } } });
+  return;
+}
+`,
+    );
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const runner = new CodexRunner(config, new ConsoleLogger("error"));
+
+      await expect(
+        runner.forkThread({
+          threadId: "thread_search",
+          cwd: "/repo/a",
+          lastTurnId: "turn_1",
+        }),
+      ).rejects.toThrow("reported 0.144.5-dev");
+      const forkRequests = (await readJsonl(receivedPath)).filter(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          (message as { method?: unknown }).method === "thread/fork",
+      );
+      expect(forkRequests).toHaveLength(0);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -363,6 +517,71 @@ process.on("SIGTERM", () => process.exit(0));
       });
 
       expect(result.finalText).toBe("schema-shaped failure");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("captures schema-shaped token usage for the active turn", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-runner-"));
+    const fakeCodex = path.join(tempDir, "fake-codex.cjs");
+    await writeFile(
+      fakeCodex,
+      `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+function send(message) { console.log(JSON.stringify(message)); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "Codex Desktop/0.144.5 test", codexHome: "/tmp/codex", platformFamily: "unix", platformOs: "macos" } });
+    return;
+  }
+  if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread_fake" } } });
+    return;
+  }
+  if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn_fake" } } });
+    send({ method: "thread/tokenUsage/updated", params: { threadId: "thread_fake", turnId: "turn_fake", tokenUsage: { last: { cachedInputTokens: 20, inputTokens: 100, outputTokens: 30, reasoningOutputTokens: 10, totalTokens: 130 }, total: { cachedInputTokens: 200, inputTokens: 1000, outputTokens: 300, reasoningOutputTokens: 100, totalTokens: 1300 }, modelContextWindow: 120000 } } });
+    send({ method: "item/completed", params: { threadId: "thread_fake", turnId: "turn_fake", item: { id: "agent_1", type: "agentMessage", text: "done", phase: "final_answer" } } });
+    send({ method: "turn/completed", params: { threadId: "thread_fake", turn: { id: "turn_fake", items: [], itemsView: "full", status: "completed", error: null, startedAt: 1, completedAt: 2, durationMs: 100 } } });
+  }
+});
+process.on("SIGTERM", () => process.exit(0));
+`,
+    );
+    await chmod(fakeCodex, 0o755);
+
+    try {
+      const config = loadConfig({
+        FEISHU_APP_ID: "cli_test",
+        FEISHU_APP_SECRET: "secret",
+        CODEX_BIN: fakeCodex,
+        CODEX_WORKDIR: tempDir,
+      });
+      const result = await new CodexRunner(config, new ConsoleLogger("error")).run({
+        prompt: "report token usage",
+        cwd: tempDir,
+      });
+
+      expect(result.summary?.tokenUsage).toEqual({
+        last: {
+          cachedInputTokens: 20,
+          inputTokens: 100,
+          outputTokens: 30,
+          reasoningOutputTokens: 10,
+          totalTokens: 130,
+        },
+        total: {
+          cachedInputTokens: 200,
+          inputTokens: 1_000,
+          outputTokens: 300,
+          reasoningOutputTokens: 100,
+          totalTokens: 1_300,
+        },
+        modelContextWindow: 120_000,
+      });
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

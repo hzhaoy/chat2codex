@@ -36,6 +36,11 @@ describe("Codex app-server session manager", () => {
 
       expect(first.finalText).toBe("done:first");
       expect(second.finalText).toBe("done:second");
+      expect(second.summary?.tokenUsage).toMatchObject({
+        last: { totalTokens: 130 },
+        total: { totalTokens: 1_300 },
+        modelContextWindow: 120_000,
+      });
       expect(boundThreads).toEqual(["thread_shared"]);
 
       const received = await readMessages(fixture.receivedPath);
@@ -878,6 +883,7 @@ function send(message) { console.log(JSON.stringify(message)); }
 function completeTurn(status, text) {
   if (completedTurns.has(activeTurnId)) return;
   completedTurns.add(activeTurnId);
+  send({ method: "thread/tokenUsage/updated", params: { threadId: activeThreadId, turnId: activeTurnId, tokenUsage: { last: { cachedInputTokens: 20, inputTokens: 100, outputTokens: 30, reasoningOutputTokens: 10, totalTokens: 130 }, total: { cachedInputTokens: 200, inputTokens: 1000, outputTokens: 300, reasoningOutputTokens: 100, totalTokens: 1300 }, modelContextWindow: 120000 } } });
   if (text) {
     send({ method: "item/completed", params: { threadId: activeThreadId, turnId: activeTurnId, item: { type: "agentMessage", id: "msg_" + turnSeq, text, phase: "final_answer" } } });
   }

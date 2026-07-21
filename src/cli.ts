@@ -204,7 +204,7 @@ Options:
       shutdown.request("SIGTERM");
     }
     try {
-      runtime = await runBridge(config, logger);
+      runtime = await runBridge(config, logger, () => shutdown?.request("SIGTERM"));
     } finally {
       resolveRuntimeReady(runtime);
     }

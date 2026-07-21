@@ -7,6 +7,45 @@ numbers once releases are published.
 
 ## Unreleased
 
+### Added
+
+- `/fork --turn <history-index|turn_id>` now creates a non-destructive fork at a
+  selected non-running turn through `thread/fork.lastTurnId`. The source thread
+  and local files remain unchanged.
+- `/help` provides a compact mobile command guide, and `/retry` reruns the most
+  recent in-memory task for the same chat and original sender without depending
+  on an interactive-card callback.
+- `/usage` shows the latest turn and cumulative thread token usage plus context
+  window occupancy when the active Codex provider emits usage notifications.
+- `/archive`, `/archived`, and `/unarchive` provide a mobile archive workflow
+  without deleting thread history or changing local files.
+- `/service status|logs|restart` exposes bridge health, bounded recent logs, and
+  supervisor-backed graceful restart from the mobile chat.
+
+### Fixed
+
+- Historical-turn fork intent and results are persisted around the external
+  app-server call. Delivery retries and bridge restarts replay the known result
+  without creating another thread, and later chat session choices are not
+  overwritten during recovery.
+- Archive and unarchive intent/results use the same fail-closed recovery rule:
+  known results are redelivered without repeating the external mutation, while
+  uncertain outcomes are never replayed automatically.
+- The transitive `protobufjs` dependency is pinned to the patched 7.6.5 release
+  so the Lark SDK cannot resolve to versions affected by CVE-2026-59877.
+
+### Security
+
+- Historical-turn forks fail closed before sending `thread/fork` unless the
+  running app-server version exactly matches the bundled protocol snapshot,
+  including prerelease and build metadata.
+- Text and card retries are bound to the original task sender. Exact retry
+  prompts stay in process memory and are unavailable after a bridge restart.
+- Service logs and restart require a direct message from an explicitly
+  allowlisted user. Restart is disabled unless the installed launchd/systemd
+  unit marks the process as supervisor-managed, and it refuses while work is
+  running or queued.
+
 ## 0.5.0 - 2026-07-20
 
 ### Added

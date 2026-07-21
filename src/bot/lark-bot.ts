@@ -59,7 +59,11 @@ export interface BridgeRuntime {
   dispose(): Promise<void>;
 }
 
-export async function runBridge(config: BridgeConfig, logger: Logger): Promise<BridgeRuntime> {
+export async function runBridge(
+  config: BridgeConfig,
+  logger: Logger,
+  requestRestart?: () => void,
+): Promise<BridgeRuntime> {
   const domain = config.larkDomain === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
   const client = new lark.Client({
     appId: config.feishuAppId,
@@ -335,6 +339,8 @@ export async function runBridge(config: BridgeConfig, logger: Logger): Promise<B
     }),
     sender,
     logger,
+    undefined,
+    { requestRestart },
   );
   let wsClient: lark.WSClient | undefined;
   try {

@@ -9,6 +9,7 @@ export interface ChatSession {
   updatedAt: string;
   lastProjects?: ProjectSelection[];
   lastThreads?: ThreadSelection[];
+  lastArchivedThreads?: ThreadSelection[];
   lastTurns?: TurnSelection[];
   lastRun?: LastRunSummary;
 }
@@ -48,6 +49,21 @@ export interface TurnSelection {
   summary?: string;
 }
 
+export interface PendingForkAttempt {
+  sourceThreadId: string;
+  lastTurnId?: string;
+  startedAt: string;
+  result?: ThreadSelection;
+  selectionPersisted?: boolean;
+}
+
+export interface PendingThreadArchiveAttempt {
+  action: "archive" | "unarchive";
+  threadId: string;
+  startedAt: string;
+  completed?: boolean;
+}
+
 export type LastRunStatus = "success" | "failed" | "stopped";
 
 export interface LastRunCommandSummary {
@@ -78,7 +94,22 @@ export interface LastRunSummary {
   durationMs?: number;
   finalTextPreview?: string;
   errorPreview?: string;
+  tokenUsage?: LastRunTokenUsage;
   review: LastRunReviewSummary;
+}
+
+export interface LastRunTokenUsageBreakdown {
+  cachedInputTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+export interface LastRunTokenUsage {
+  last: LastRunTokenUsageBreakdown;
+  total: LastRunTokenUsageBreakdown;
+  modelContextWindow?: number | null;
 }
 
 export type EventDiagnosticOutcome = "routed" | "dropped";
@@ -159,6 +190,8 @@ export interface PendingMessageDelivery {
    * classified conservatively during recovery for state-file compatibility.
    */
   route?: PendingMessageRoute;
+  forkAttempt?: PendingForkAttempt;
+  threadArchiveAttempt?: PendingThreadArchiveAttempt;
 }
 
 export type DurableCodexJobStatus =

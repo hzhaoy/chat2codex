@@ -87,6 +87,7 @@ If card creation or updates fail, it falls back to text progress replies.
 
 | Command | Effect |
 | --- | --- |
+| `/help` | Show a compact mobile guide to the main Chat2Codex commands. |
 | `chat2codex` / `chat2codex start` | Start the Feishu/Lark bridge. |
 | `chat2codex setup --workdir <path>` | Create/connect a Feishu/Lark app and write `.env`. |
 | `chat2codex init --workdir <path>` | Create a starter `.env` when you already have an app. |
@@ -104,8 +105,9 @@ when you need a separate bot instance.
 - One reusable Codex app-server session per chat/thread scope. Consecutive turns
   keep the same process—and therefore session-scoped grants—while the sender,
   cwd, thread, policy, and session epoch remain unchanged.
-- `/status`, `/host`, `/projects`, `/project <index|path>`, `/threads`,
-  `/history`, `/search`, `/resume`, `/fork`, `/compact`, `/plan <task>`, `/new`,
+- `/help`, `/status`, `/host`, `/projects`, `/project <index|path>`, `/threads`,
+  `/history`, `/search`, `/resume`, `/fork`, `/archive`, `/archived`, `/unarchive`,
+  `/retry`, `/usage`, `/service status|logs|restart`, `/compact`, `/plan <task>`, `/new`,
   `/cd <path>`,
   `/stop`, `/steer`, `/answer`, `/mcp-answer`, `/summary`, `/files`, `/diff`,
   `/logs`, and `/whoami` commands.
@@ -180,6 +182,12 @@ without starting a model turn. To verify a full model-backed turn as well:
 ```bash
 chat2codex smoke --mode turn
 ```
+
+Historical-turn forks use a stricter compatibility gate. `/fork --turn` stops
+before sending `thread/fork` unless the running app-server version exactly
+matches the bundled protocol snapshot. Older servers may ignore `lastTurnId`
+and silently create a whole-thread fork; ordinary `/fork` keeps its existing
+compatibility behavior.
 
 To verify a real command-approval request, run:
 
@@ -304,6 +312,8 @@ service instead of leaving `chat2codex start` in a terminal.
 
    On macOS this installs a launchd agent named `com.chat2codex.bridge`. On
    Linux this installs a systemd user service named `chat2codex.service`.
+   Re-run `chat2codex service install` after upgrading from an older release to
+   install the supervisor marker required by `/service restart`.
 
 Useful service commands:
 
@@ -345,6 +355,15 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/search <term>` | Search Codex conversation history and save results for `/resume <index>` or `/fork <index>`. |
 | `/resume <index\|thread_id>` | Continue a listed conversation by number, or load one directly by Codex thread id. |
 | `/fork [index\|thread_id]` | Fork the current, listed, or specified Codex conversation and switch this chat to the new thread. |
+| `/fork --turn <history-index\|turn_id>` | Fork the current conversation through a selected non-running turn. Use an index from `/history` or pass a turn id directly; the source thread stays unchanged and local files are not restored. |
+| `/retry` | Retry the latest task remembered in this bridge process for the same chat and original sender. Restarting the bridge clears this exact-prompt retry context. |
+| `/usage` | Show the latest turn and cumulative thread token usage plus context-window occupancy when Codex provides it. |
+| `/archive` | Archive the currently selected Codex thread and clear it from the chat without changing local files. |
+| `/archived` | List archived threads for the current project. |
+| `/unarchive <archived-index\|thread_id>` | Restore an archived thread. Use `/threads` and `/resume` afterward to continue it. |
+| `/service status` | Show bridge PID, uptime, queue state, restart availability, and log source. |
+| `/service logs` | Show a bounded recent service-log tail. Direct message plus an explicit `ALLOWED_USER_IDS` match is required. |
+| `/service restart` | Gracefully restart a supervisor-managed bridge. Uses the same admin boundary as logs and refuses while work is active or queued. |
 | `/compact` | Request compaction for the current Codex conversation. |
 | `/plan <task>` | Run one task in Codex Plan mode. Use this mode when Codex should call `request_user_input`; the next ordinary message returns to Default mode. |
 | `/new` | Start a fresh Codex conversation in the current project. |
@@ -472,8 +491,5 @@ chat or reporting a security issue.
 
 ## Next Features To Add
 
-1. Fork from a selected historical turn with
-   `thread/fork.lastTurnId`, leaving the source thread unchanged. This is not a
-   filesystem rollback and does not restore local file changes.
-2. Introduce a chat-adapter boundary before adding Slack, Discord, or
+1. Introduce a chat-adapter boundary before adding Slack, Discord, or
    other platforms.

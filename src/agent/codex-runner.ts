@@ -6,7 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { isDeepStrictEqual } from "node:util";
 
 import type { BridgeConfig } from "../config/env.js";
-import { readPackageVersion } from "../package-info.js";
+import { readBundledProtocolManifest, readPackageVersion } from "../package-info.js";
 import type { Logger } from "../util/logger.js";
 import { buildCodexChildEnv } from "./codex-environment.js";
 
@@ -113,11 +113,26 @@ export interface CodexRunControl {
 
 export interface CodexRunSummary {
   durationMs?: number;
+  tokenUsage?: CodexThreadTokenUsage;
   diff?: string;
   diffStat?: string;
   changedFiles: string[];
   fileChangeCount: number;
   commands: CodexCommandSummary[];
+}
+
+export interface CodexTokenUsageBreakdown {
+  cachedInputTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+export interface CodexThreadTokenUsage {
+  last: CodexTokenUsageBreakdown;
+  total: CodexTokenUsageBreakdown;
+  modelContextWindow?: number | null;
 }
 
 export interface CodexCommandSummary {
@@ -436,6 +451,12 @@ export interface CodexThreadItem {
 export interface CodexForkThreadInput {
   threadId: string;
   cwd?: string;
+  lastTurnId?: string;
+}
+
+interface AppServerRequestOptions {
+  requiredCliVersion?: string;
+  capabilityLabel?: string;
 }
 
 interface JsonRpcRequest {
@@ -629,6 +650,20 @@ export class CodexRunner {
   }
 
   async forkThread(input: CodexForkThreadInput): Promise<CodexThread> {
+    let requestOptions: AppServerRequestOptions | undefined;
+    if (input.lastTurnId) {
+      const manifest = await readBundledProtocolManifest();
+      const requiredCliVersion = parseCodexVersion(manifest.codexVersion);
+      if (!requiredCliVersion) {
+        throw new Error(
+          "Cannot verify historical-turn fork compatibility: the bundled protocol manifest has no parseable Codex version.",
+        );
+      }
+      requestOptions = {
+        requiredCliVersion,
+        capabilityLabel: "Historical-turn fork",
+      };
+    }
     const result = await this.requestAppServer("thread/fork", {
       threadId: input.threadId,
       excludeTurns: true,
@@ -636,8 +671,9 @@ export class CodexRunner {
       approvalPolicy: this.config.codexApprovalPolicy,
       approvalsReviewer: "user",
       sandbox: this.config.codexSandbox,
+      ...(input.lastTurnId ? { lastTurnId: input.lastTurnId } : {}),
       ...(this.config.codexModel ? { model: this.config.codexModel } : {}),
-    });
+    }, requestOptions);
     const thread = parseCodexThread(asRecord(result)?.thread);
     if (!thread) {
       throw new Error("Codex app-server did not return a forked thread.");
@@ -647,6 +683,19 @@ export class CodexRunner {
 
   async compactThread(threadId: string): Promise<void> {
     await this.requestAppServer("thread/compact/start", { threadId });
+  }
+
+  async archiveThread(threadId: string): Promise<void> {
+    await this.requestAppServer("thread/archive", { threadId });
+  }
+
+  async unarchiveThread(threadId: string): Promise<CodexThread> {
+    const result = await this.requestAppServer("thread/unarchive", { threadId });
+    const thread = parseCodexThread(asRecord(result)?.thread);
+    if (!thread) {
+      throw new Error("Codex app-server did not return the unarchived thread.");
+    }
+    return markThreadResumability(thread, this.appServerCliVersion);
   }
 
   async run(input: CodexRunInput): Promise<CodexRunResult> {
@@ -955,6 +1004,16 @@ export class CodexRunner {
             formatTurnError(turn?.error),
             this.config.chatOutputMaxChars,
           );
+        }
+      }
+      if (
+        message.method === "thread/tokenUsage/updated" &&
+        getString(message.params, "threadId") === threadId &&
+        (!activeTurnId || getString(message.params, "turnId") === activeTurnId)
+      ) {
+        const tokenUsage = parseThreadTokenUsage(message.params?.tokenUsage);
+        if (tokenUsage) {
+          summary.tokenUsage = tokenUsage;
         }
       }
       if (message.method === "error") {
@@ -1639,7 +1698,11 @@ export class CodexRunner {
       });
   }
 
-  private async requestAppServer(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private async requestAppServer(
+    method: string,
+    params: Record<string, unknown>,
+    options: AppServerRequestOptions = {},
+  ): Promise<unknown> {
     if (this.disposed) {
       throw new Error("Codex session manager is disposed.");
     }
@@ -1797,7 +1860,18 @@ export class CodexRunner {
             requestAttestation: false,
           },
         });
+        const currentCliVersion = parseCodexVersion(
+          getString(asRecord(initializeResult), "userAgent"),
+        );
         this.rememberAppServerInfo(initializeResult);
+        if (
+          options.requiredCliVersion &&
+          currentCliVersion !== options.requiredCliVersion
+        ) {
+          throw new Error(
+            `${options.capabilityLabel ?? method} requires Codex ${options.requiredCliVersion} to match the bundled protocol snapshot; the app-server reported ${currentCliVersion ?? "an unknown version"}. Run chat2codex doctor and refresh the protocol snapshot before retrying.`,
+          );
+        }
         sendJson({ method: "initialized" });
         return sendRequest(method, params);
       })();
@@ -2437,6 +2511,11 @@ class CodexAppServerSession {
         );
       }
       context.resolveTurn();
+    } else if (message.method === "thread/tokenUsage/updated") {
+      const tokenUsage = parseThreadTokenUsage(message.params?.tokenUsage);
+      if (tokenUsage) {
+        context.summary.tokenUsage = tokenUsage;
+      }
     } else if (message.method === "error") {
       if (message.params?.willRetry !== true) {
         context.turnError = truncateTextChars(
@@ -4807,6 +4886,75 @@ function parseCodexThread(value: unknown): CodexThread | null {
   };
 }
 
+function parseThreadTokenUsage(value: unknown): CodexThreadTokenUsage | null {
+  const record = asRecord(value);
+  const last = parseTokenUsageBreakdown(record?.last);
+  const total = parseTokenUsageBreakdown(record?.total);
+  if (!last || !total) {
+    return null;
+  }
+  const modelContextWindow = getNullableNonNegativeInteger(record, "modelContextWindow");
+  if (record && "modelContextWindow" in record && modelContextWindow === undefined) {
+    return null;
+  }
+  return {
+    last,
+    total,
+    ...(modelContextWindow !== undefined ? { modelContextWindow } : {}),
+  };
+}
+
+function parseTokenUsageBreakdown(value: unknown): CodexTokenUsageBreakdown | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+  const cachedInputTokens = getNonNegativeInteger(record, "cachedInputTokens");
+  const inputTokens = getNonNegativeInteger(record, "inputTokens");
+  const outputTokens = getNonNegativeInteger(record, "outputTokens");
+  const reasoningOutputTokens = getNonNegativeInteger(record, "reasoningOutputTokens");
+  const totalTokens = getNonNegativeInteger(record, "totalTokens");
+  if (
+    cachedInputTokens === undefined ||
+    inputTokens === undefined ||
+    outputTokens === undefined ||
+    reasoningOutputTokens === undefined ||
+    totalTokens === undefined
+  ) {
+    return null;
+  }
+  return {
+    cachedInputTokens,
+    inputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens,
+  };
+}
+
+function getNonNegativeInteger(
+  record: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const value = record[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function getNullableNonNegativeInteger(
+  record: Record<string, unknown> | null,
+  key: string,
+): number | null | undefined {
+  if (!record || !(key in record)) {
+    return undefined;
+  }
+  if (record[key] === null) {
+    return null;
+  }
+  return getNonNegativeInteger(record, key);
+}
+
 function parseThreadTurns(value: unknown): CodexThreadTurn[] {
   if (!Array.isArray(value)) {
     return [];
@@ -4955,7 +5103,9 @@ function codexVersionFamily(value: string | undefined): string | null {
 }
 
 function parseCodexVersion(value: string | undefined): string | null {
-  const match = value?.match(/\b\d+\.\d+\.\d+\b/u);
+  const match = value?.match(
+    /\b\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\b/u,
+  );
   return match?.[0] ?? null;
 }
 
