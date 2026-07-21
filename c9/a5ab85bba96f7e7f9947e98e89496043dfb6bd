@@ -1,0 +1,27 @@
+src/agent/codex-runner.ts
+  s_ab0df3be43c3ef::t_fdc523fce3c56b 9,116,124-137,454-459,653-666,674,676,688-700,1009-1018,1701-1705,1863-1865,1867-1874,2514-2518,4889-4957,5106-5108
+src/state/types.ts
+  s_ab0df3be43c3ef::t_e29ab75162638d 12,52-66,97,101-114,193-194
+tests/codex-runner.test.ts
+  s_ab0df3be43c3ef::t_a8f2d34638d4a3 279-286,326-471,525-589
+tests/codex-session-manager.test.ts
+  s_ab0df3be43c3ef::t_d725c3a93171c2 39-43,886
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c9a5ab85bba96f7e7f9947e98e89496043dfb6bd",
+  "prompts": {},
+  "sessions": {
+    "s_ab0df3be43c3ef": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f835b-def1-7f21-ad95-a21b4f1eed53",
+        "model": "unknown"
+      },
+      "human_author": "hzhaoy <hzywong@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
