@@ -4,8 +4,10 @@ import path from "node:path";
 
 import {
   type BridgeState,
+  type BridgeStateEnvelopeV2,
   type DurableCodexJob,
   type DurableOutboxMessage,
+  bridgeStateSchemaVersion,
   createSessionEpoch,
   emptyState,
 } from "./types.js";
@@ -15,11 +17,15 @@ const maxRecentFailures = 5;
 const saveQueues = new Map<string, Promise<void>>();
 
 export interface JsonStateStoreOptions {
+  adapterId?: string;
   jobRetentionCount?: number;
   outboxRetentionCount?: number;
 }
 
+export const defaultAdapterId = "feishu:default";
+
 export class JsonStateStore {
+  readonly adapterId: string;
   private readonly jobRetentionCount: number;
   private readonly outboxRetentionCount: number;
 
@@ -27,6 +33,7 @@ export class JsonStateStore {
     private readonly filePath: string,
     options: JsonStateStoreOptions = {},
   ) {
+    this.adapterId = normalizeAdapterId(options.adapterId ?? defaultAdapterId);
     this.jobRetentionCount = retentionCount(
       options.jobRetentionCount,
       "jobRetentionCount",
@@ -40,15 +47,11 @@ export class JsonStateStore {
   async load(): Promise<BridgeState> {
     try {
       const raw = await fs.readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<BridgeState>;
-      const state: BridgeState = {
-        chats: parsed.chats ?? {},
-        jobs: parsed.jobs ?? {},
-        outbox: parsed.outbox ?? {},
-        pendingMessages: parsed.pendingMessages ?? {},
-        processedMessageIds: parsed.processedMessageIds ?? [],
-        diagnostics: parsed.diagnostics ?? {},
-      };
+      const persisted = JSON.parse(raw) as unknown;
+      assertSupportedSchema(persisted);
+      const state = isBridgeStateEnvelopeV2(persisted)
+        ? coerceBridgeState(persisted.adapters[this.adapterId])
+        : coerceBridgeState(persisted);
       normalizeChatSessionEpochs(state);
       enforceDurableRetention(
         state,
@@ -80,7 +83,6 @@ export class JsonStateStore {
         diagnostics.recentFailures = diagnostics.recentFailures.slice(-maxRecentFailures);
       }
     }
-    const serializedState = `${JSON.stringify(state, null, 2)}\n`;
     const queueKey = path.resolve(this.filePath);
     const previousSave = saveQueues.get(queueKey) ?? Promise.resolve();
     const currentSave = previousSave.catch(() => undefined).then(async () => {
@@ -88,6 +90,24 @@ export class JsonStateStore {
       const createdDirectory = await fs.mkdir(directory, { recursive: true, mode: 0o700 });
       if (createdDirectory) {
         await fs.chmod(directory, 0o700);
+      }
+
+      const currentPersisted = await readPersistedState(this.filePath);
+      assertSupportedSchema(currentPersisted);
+      const migratedLegacy = currentPersisted !== null && !isBridgeStateEnvelopeV2(currentPersisted);
+      const envelope: BridgeStateEnvelopeV2 = isBridgeStateEnvelopeV2(currentPersisted)
+        ? currentPersisted
+        : {
+            schemaVersion: bridgeStateSchemaVersion,
+            adapters: currentPersisted === null
+              ? {}
+              : { [this.adapterId]: coerceBridgeState(currentPersisted) },
+          };
+      envelope.adapters[this.adapterId] = state;
+      const serializedState = `${JSON.stringify(envelope, null, 2)}\n`;
+
+      if (migratedLegacy) {
+        await preserveLegacyBackup(this.filePath);
       }
 
       const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -116,6 +136,72 @@ export class JsonStateStore {
   }
 }
 
+function normalizeAdapterId(value: string): string {
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 160 || /[\u0000-\u001f]/.test(normalized)) {
+    throw new RangeError("adapterId must be a non-empty bounded string without control characters.");
+  }
+  return normalized;
+}
+
+function coerceBridgeState(value: unknown): BridgeState {
+  const parsed = isRecord(value) ? value as Partial<BridgeState> : {};
+  return {
+    chats: parsed.chats ?? {},
+    jobs: parsed.jobs ?? {},
+    outbox: parsed.outbox ?? {},
+    pendingMessages: parsed.pendingMessages ?? {},
+    processedMessageIds: parsed.processedMessageIds ?? [],
+    diagnostics: parsed.diagnostics ?? {},
+  };
+}
+
+function isBridgeStateEnvelopeV2(value: unknown): value is BridgeStateEnvelopeV2 {
+  return Boolean(
+    isRecord(value) &&
+      value.schemaVersion === bridgeStateSchemaVersion &&
+      isRecord(value.adapters),
+  );
+}
+
+function assertSupportedSchema(value: unknown): void {
+  if (
+    isRecord(value) &&
+    Object.prototype.hasOwnProperty.call(value, "schemaVersion") &&
+    !isBridgeStateEnvelopeV2(value)
+  ) {
+    throw new Error(`Unsupported bridge state schema version: ${String(value.schemaVersion)}`);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function readPersistedState(filePath: string): Promise<unknown | null> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+  } catch (error) {
+    if (isNotFound(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function preserveLegacyBackup(filePath: string): Promise<void> {
+  const backupPath = `${filePath}.v0.6.bak`;
+  try {
+    await fs.copyFile(filePath, backupPath, fs.constants.COPYFILE_EXCL);
+    await fs.chmod(backupPath, 0o600);
+  } catch (error) {
+    if (isAlreadyExists(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
 function normalizeChatSessionEpochs(state: BridgeState): void {
   for (const session of Object.values(state.chats)) {
     if (
@@ -129,6 +215,10 @@ function normalizeChatSessionEpochs(state: BridgeState): void {
 
 function isNotFound(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 function retentionCount(value: number | undefined, name: string): number {

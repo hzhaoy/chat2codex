@@ -6,7 +6,7 @@ import { config as loadDotenv } from "dotenv";
 import { ZodError } from "zod";
 
 import { buildCodexChildEnv } from "./agent/codex-environment.js";
-import { runBridge } from "./bot/lark-bot.js";
+import { runBridge } from "./adapters/feishu/adapter.js";
 import { loadConfig } from "./config/env.js";
 import { defaultChat2CodexHome, defaultEnvPath } from "./config/paths.js";
 import {

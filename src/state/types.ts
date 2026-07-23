@@ -254,6 +254,14 @@ export interface BridgeState {
   diagnostics: BridgeDiagnostics;
 }
 
+export const bridgeStateSchemaVersion = 2 as const;
+
+/** On-disk envelope. Each adapter receives an isolated v0.6-compatible state partition. */
+export interface BridgeStateEnvelopeV2 {
+  schemaVersion: typeof bridgeStateSchemaVersion;
+  adapters: Record<string, BridgeState>;
+}
+
 export const emptyState = (): BridgeState => ({
   chats: {},
   jobs: {},

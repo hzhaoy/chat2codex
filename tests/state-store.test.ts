@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -12,6 +12,7 @@ import type {
   DurableOutboxMessage,
   DurableOutboxStatus,
 } from "../src/state/types.js";
+import { emptyState } from "../src/state/types.js";
 
 describe("JsonStateStore", () => {
   test("loads empty state when no file exists and persists state atomically", async () => {
@@ -161,6 +162,106 @@ describe("JsonStateStore", () => {
       expect(loaded.jobs).toEqual({});
       expect(loaded.outbox).toEqual({});
       expect(loaded.processedMessageIds).toEqual(["legacy"]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("migrates v0.6 state into one adapter partition and preserves a private backup", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const statePath = path.join(tempDir, "state.json");
+    const legacy = {
+      chats: {
+        oc_legacy: {
+          sessionEpoch: "epoch_legacy",
+          cwd: tempDir,
+          updatedAt: "2026-07-22T00:00:00.000Z",
+        },
+      },
+      jobs: {},
+      outbox: {},
+      pendingMessages: {},
+      processedMessageIds: ["m_legacy"],
+      diagnostics: {},
+    };
+    try {
+      await Bun.write(statePath, `${JSON.stringify(legacy)}\n`);
+      const store = new JsonStateStore(statePath, { adapterId: "lark:default" });
+      const loaded = await store.load();
+      expect(loaded.chats.oc_legacy?.sessionEpoch).toBe("epoch_legacy");
+
+      await store.save(loaded);
+
+      const persisted = JSON.parse(await readFile(statePath, "utf8"));
+      expect(persisted.schemaVersion).toBe(2);
+      expect(persisted.adapters["lark:default"].processedMessageIds).toEqual(["m_legacy"]);
+      expect(JSON.parse(await readFile(`${statePath}.v0.6.bak`, "utf8"))).toEqual(legacy);
+      if (process.platform !== "win32") {
+        expect((await stat(`${statePath}.v0.6.bak`)).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("isolates adapter partitions while sharing one atomic state file", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const statePath = path.join(tempDir, "state.json");
+    try {
+      const feishu = new JsonStateStore(statePath, { adapterId: "feishu:default" });
+      const slack = new JsonStateStore(statePath, { adapterId: "slack:team-a" });
+      const feishuState = await feishu.load();
+      feishuState.processedMessageIds.push("same-message-id");
+      feishuState.chats.same_chat = {
+        sessionEpoch: "epoch_feishu",
+        cwd: tempDir,
+        updatedAt: "2026-07-22T00:00:00.000Z",
+      };
+      await feishu.save(feishuState);
+
+      const slackState = await slack.load();
+      expect(slackState).toEqual({
+        chats: {},
+        jobs: {},
+        outbox: {},
+        pendingMessages: {},
+        processedMessageIds: [],
+        diagnostics: {},
+      });
+      slackState.processedMessageIds.push("same-message-id");
+      slackState.chats.same_chat = {
+        sessionEpoch: "epoch_slack",
+        cwd: tempDir,
+        updatedAt: "2026-07-22T00:00:00.000Z",
+      };
+      await slack.save(slackState);
+
+      expect((await feishu.load()).chats.same_chat?.sessionEpoch).toBe("epoch_feishu");
+      expect((await slack.load()).chats.same_chat?.sessionEpoch).toBe("epoch_slack");
+      const persisted = JSON.parse(await readFile(statePath, "utf8"));
+      expect(Object.keys(persisted.adapters).sort()).toEqual([
+        "feishu:default",
+        "slack:team-a",
+      ]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses to overwrite an unknown future state schema", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "chat2codex-state-"));
+    const statePath = path.join(tempDir, "state.json");
+    const futureState = `${JSON.stringify({ schemaVersion: 3, adapters: {} }, null, 2)}\n`;
+    try {
+      await writeFile(statePath, futureState, { mode: 0o600 });
+      const store = new JsonStateStore(statePath, { adapterId: "feishu:default" });
+
+      await expect(store.load()).rejects.toThrow("Unsupported bridge state schema version: 3");
+      await expect(store.save(emptyState())).rejects.toThrow(
+        "Unsupported bridge state schema version: 3",
+      );
+      expect(await readFile(statePath, "utf8")).toBe(futureState);
+      expect(await stat(`${statePath}.v0.6.bak`).catch(() => null)).toBeNull();
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

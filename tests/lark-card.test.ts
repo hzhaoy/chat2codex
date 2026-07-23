@@ -23,7 +23,6 @@ import {
   resolvePermissionApprovalCardAction,
   retryRunCardActionValue,
   runCardActionApp,
-  stopRunCardActionValue,
 } from "../src/bot/lark-card-action.js";
 
 describe("Lark run status cards", () => {
@@ -50,9 +49,8 @@ describe("Lark run status cards", () => {
     });
     const serialized = JSON.stringify(card);
     expect(serialized).toContain("Codex 正在调用工具。");
-    expect(serialized).toContain("可点击停止按钮或发送 /stop");
-    expect(serialized).toContain("停止");
-    expect(serialized).toContain(JSON.stringify(stopRunCardActionValue));
+    expect(serialized).toContain("发送 /stop 可以停止当前任务");
+    expect(serialized).not.toContain("stop_run");
     expect(serialized).not.toContain("retry_run");
   });
 

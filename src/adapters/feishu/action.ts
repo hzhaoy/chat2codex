@@ -1,0 +1,252 @@
+import type { SenderIdentity } from "../../core/access-control.js";
+import type { ActionResponse } from "../../core/actions.js";
+
+export const runCardActionApp = "chat2codex";
+export const stopRunCardAction = "stop_run";
+export const retryRunCardAction = "retry_run";
+export const resolveApprovalCardAction = "resolve_approval";
+export const answerUserInputCardAction = "answer_user_input";
+export const cancelUserInputCardAction = "cancel_user_input";
+export const resolvePermissionApprovalCardAction = "resolve_permission_approval";
+export const answerMcpElicitationCardAction = "answer_mcp_elicitation";
+export const resolveMcpElicitationCardAction = "resolve_mcp_elicitation";
+export const selectProjectCardAction = "select_project";
+export const resumeThreadCardAction = "resume_thread";
+export const pageProjectsCardAction = "page_projects";
+export const pageSessionsCardAction = "page_sessions";
+export const showRunDetailCardAction = "show_run_detail";
+export const stopRunCardActionValue = Object.freeze({
+  app: runCardActionApp,
+  action: stopRunCardAction,
+});
+export const retryRunCardActionValue = Object.freeze({
+  app: runCardActionApp,
+  action: retryRunCardAction,
+});
+
+export type RunCardActionKind =
+  | typeof stopRunCardAction
+  | typeof retryRunCardAction
+  | typeof resolveApprovalCardAction
+  | typeof answerUserInputCardAction
+  | typeof cancelUserInputCardAction
+  | typeof resolvePermissionApprovalCardAction
+  | typeof answerMcpElicitationCardAction
+  | typeof resolveMcpElicitationCardAction
+  | typeof selectProjectCardAction
+  | typeof resumeThreadCardAction
+  | typeof pageProjectsCardAction
+  | typeof pageSessionsCardAction
+  | typeof showRunDetailCardAction;
+export type CardActionToastType = "success" | "warning" | "error" | "info";
+export type RunDetailKind = "summary" | "files" | "diff" | "logs";
+export type PermissionApprovalCardDecision = "deny" | "grantTurn" | "grantSession";
+export type McpElicitationCardDecision = "accept" | "decline" | "cancel" | "skip";
+export type InteractiveCardDecision =
+  | PermissionApprovalCardDecision
+  | McpElicitationCardDecision;
+
+export interface IncomingCardAction {
+  action: RunCardActionKind;
+  chatId: string;
+  messageId?: string;
+  sender: SenderIdentity;
+  approvalId?: string;
+  decisionIndex?: number;
+  userInputId?: string;
+  questionId?: string;
+  optionIndex?: number;
+  requestId?: string;
+  fieldId?: string;
+  decision?: InteractiveCardDecision;
+  detailKind?: RunDetailKind;
+  projectIndex?: number;
+  threadIndex?: number;
+  page?: number;
+}
+
+export interface CardActionToastResponse {
+  toast: {
+    type: CardActionToastType;
+    content: string;
+  };
+}
+
+export interface CardActionCardResponse {
+  card: {
+    type: "raw";
+    data: unknown;
+  };
+}
+
+export type CardActionResponse = CardActionToastResponse | CardActionCardResponse;
+
+export function renderLarkActionResponse(
+  response: ActionResponse,
+  renderView: (view: Extract<ActionResponse, { kind: "replace_view" }>["view"]) => unknown,
+): CardActionResponse {
+  if (response.kind === "toast") {
+    return cardActionToast(response.level, response.text);
+  }
+  return cardActionCard(renderView(response.view));
+}
+
+export function cardActionToast(type: CardActionToastType, content: string): CardActionResponse {
+  return {
+    toast: {
+      type,
+      content,
+    },
+  };
+}
+
+export function cardActionCard(card: unknown): CardActionResponse {
+  return {
+    card: {
+      type: "raw",
+      data: card,
+    },
+  };
+}
+
+export function adaptLarkCardActionEvent(event: unknown): IncomingCardAction | null {
+  const source = eventSource(event);
+  if (!source) {
+    return null;
+  }
+
+  const action = asRecord(source.action);
+  const actionKind = getRunCardActionKind(action?.value);
+  if (!actionKind) {
+    return null;
+  }
+
+  const context = asRecord(source.context);
+  const chatId = getString(context, "open_chat_id") ?? getString(source, "open_chat_id");
+  if (!chatId) {
+    return null;
+  }
+
+  const operator = asRecord(source.operator);
+  const value = asRecord(action?.value);
+  return {
+    action: actionKind,
+    chatId,
+    messageId: getString(context, "open_message_id") ?? getString(source, "open_message_id"),
+    sender: {
+      openId: getString(operator, "open_id"),
+      userId: getString(operator, "user_id"),
+      unionId: getString(operator, "union_id"),
+    },
+    approvalId: getString(value, "approvalId"),
+    decisionIndex: getNumber(value, "decisionIndex"),
+    userInputId: getString(value, "userInputId"),
+    questionId: getString(value, "questionId"),
+    optionIndex: getBoundedIndex(value, "optionIndex", 9),
+    requestId: getBoundedString(value, "requestId", 128),
+    fieldId: getBoundedString(value, "fieldId", 128),
+    decision: getInteractiveCardDecision(actionKind, value),
+    detailKind: getRunDetailKind(value),
+    projectIndex: getNumber(value, "projectIndex"),
+    threadIndex: getNumber(value, "threadIndex"),
+    page: getNumber(value, "page"),
+  };
+}
+
+function eventSource(event: unknown): Record<string, unknown> | null {
+  const record = asRecord(event);
+  if (!record) {
+    return null;
+  }
+  return asRecord(record.event) ?? record;
+}
+
+function getRunCardActionKind(value: unknown): RunCardActionKind | null {
+  const record = asRecord(value);
+  if (getString(record, "app") !== runCardActionApp) {
+    return null;
+  }
+
+  const action = getString(record, "action");
+  if (
+    action === stopRunCardAction ||
+    action === retryRunCardAction ||
+    action === resolveApprovalCardAction ||
+    action === answerUserInputCardAction ||
+    action === cancelUserInputCardAction ||
+    action === resolvePermissionApprovalCardAction ||
+    action === answerMcpElicitationCardAction ||
+    action === resolveMcpElicitationCardAction ||
+    action === selectProjectCardAction ||
+    action === resumeThreadCardAction ||
+    action === pageProjectsCardAction ||
+    action === pageSessionsCardAction ||
+    action === showRunDetailCardAction
+  ) {
+    return action;
+  }
+  return null;
+}
+
+function getInteractiveCardDecision(
+  action: RunCardActionKind,
+  record: Record<string, unknown> | null,
+): InteractiveCardDecision | undefined {
+  const value = getString(record, "decision");
+  if (
+    action === resolvePermissionApprovalCardAction &&
+    (value === "deny" || value === "grantTurn" || value === "grantSession")
+  ) {
+    return value;
+  }
+  if (
+    action === resolveMcpElicitationCardAction &&
+    (value === "accept" || value === "decline" || value === "cancel")
+  ) {
+    return value;
+  }
+  if (action === answerMcpElicitationCardAction && value === "skip") {
+    return value;
+  }
+  return undefined;
+}
+
+function getRunDetailKind(record: Record<string, unknown> | null): RunDetailKind | undefined {
+  const value = getString(record, "detailKind");
+  if (value === "summary" || value === "files" || value === "diff" || value === "logs") {
+    return value;
+  }
+  return undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+function getString(record: Record<string, unknown> | null, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function getBoundedString(
+  record: Record<string, unknown> | null,
+  key: string,
+  maxLength: number,
+): string | undefined {
+  const value = getString(record, key);
+  return value !== undefined && value.length <= maxLength ? value : undefined;
+}
+
+function getNumber(record: Record<string, unknown> | null, key: string): number | undefined {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+function getBoundedIndex(
+  record: Record<string, unknown> | null,
+  key: string,
+  max: number,
+): number | undefined {
+  const value = getNumber(record, key);
+  return value !== undefined && value >= 0 && value <= max ? value : undefined;
+}

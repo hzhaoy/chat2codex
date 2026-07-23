@@ -8,7 +8,7 @@ Chat2Codex 会把一个飞书/Lark 机器人变成本机 Codex CLI 的消息平�
 
 ## 当前状态
 
-- 当前已经实现的是飞书/Lark 长连接适配器。Slack、Discord 等其他聊天平台还在路线图中。
+- 当前已经实现的是飞书/Lark 长连接适配器。Slack、Discord 等其他聊天平台还在路线图中。平台传输已通过契约和 supervisor 与核心隔离，详见 [架构说明](docs/architecture.md)。
 - 私聊路由默认开启，但除 `/whoami` 外，发送者或私聊 chat 必须显式加入允许列表；授权后的私聊可以切换到任意本机目录。
 - 群聊默认关闭，启用后必须同时允许 chat 和发送者，并且可以用 `CODEX_GROUP_ALLOWED_ROOTS` 限制可访问目录。
 - Codex app-server 协议仍是实验性能力。安装或升级 Codex CLI 后，请先运行 `chat2codex doctor`，再按 [Codex App-Server 防护检查](#codex-app-server-防护检查) 完成验证。
@@ -53,7 +53,7 @@ Summarize this repository.
 
 你也可以发送文件或图片。Chat2Codex 会把支持的附件下载到 `ATTACHMENT_DOWNLOAD_DIR`，并把本地路径附加到 Codex prompt 中。如果消息只有附件没有文字，它会使用默认 prompt，让 Codex 检查这个文件或图片。
 
-运行过程中，Chat2Codex 会发送一张状态卡片，最多每 15 秒更新一次，并把最终 Codex 回复渲染成飞书/Lark 富文本消息。点击卡片里的停止按钮，或发送 `/stop`，可以中止当前运行。失败和已停止的卡片会带有重试按钮，可以重新运行同一个 prompt。完成卡片会展示紧凑的本轮结果，并提供摘要、文件、Diff、日志详情按钮；也可以发送 `/summary`、`/files`、`/diff`、`/logs` 查看同一轮详情。如果卡片创建或更新失败，会回退为文本进度消息。
+运行过程中，Chat2Codex 会在原消息下添加“处理中”表情，并最多每 30 秒发送一条普通文本进度。任务结束后会移除“处理中”表情；失败任务会添加失败表情。最终 Codex 回复仍会渲染成飞书/Lark 富文本消息。发送 `/stop` 可以中止当前运行，发送 `/retry` 可以重试当前进程记住的最近任务；用 `/summary`、`/files`、`/diff`、`/logs` 查看同一轮详情。如果平台不支持消息表情，Chat2Codex 会回退为一条普通文本确认消息。
 
 ### CLI 命令
 
@@ -76,7 +76,7 @@ Summarize this repository.
 - 支持 `/help`、`/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/archive`、`/archived`、`/unarchive`、`/retry`、`/usage`、`/service status|logs|restart`、`/compact`、`/plan <任务>`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/answer`、`/mcp-answer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
 - 使用 JSON 保存本地状态。
 - 使用 Codex app-server JSON-RPC 获取机器可读的进度、最终输出和审批回调。
-- Codex 运行时会限频更新状态卡片，并提供停止/重试、本轮详情按钮；卡片不可用时自动回退为文本。
+- Codex 运行时会在原消息下添加“处理中”表情、限频发送普通文本进度，并在失败时添加失败表情；`/stop`、`/retry` 和本轮详情都使用普通文本命令。
 - 支持用飞书/Lark 审批卡片处理 Codex 命令执行和文件变更审批请求。按钮会根据 Codex 当前提供的审批选项生成，包括 Approve、Approve session、Deny、Cancel turn 等。
 - `/plan <任务>` 会只把当前一轮切换到 Codex Plan 模式，并支持结构化 `requestUserInput` 提问卡；自由输入可使用显式的 `/answer <回复码> <内容>`。选项会按原始请求在服务端重新校验；secret 问题会安全拒绝，不通过聊天记录收集凭据。下一条普通消息会显式恢复 Default 模式。
 - 支持标准 MCP form 和 URL elicitation，并渲染为绑定原发送者的卡片。类型化表单字段也可以使用 `/mcp-answer <回复码> <JSON 引号包裹的字段 ID> <内容>`；字段值会按原始 schema 校验，敏感字段则安全拒绝。
@@ -146,7 +146,7 @@ git diff -- docs/codex-app-server-protocol
 
 当 `CODEX_APPROVAL_POLICY` 允许交互式审批时，Codex app-server 会在 turn 运行过程中发出审批请求。Chat2Codex 会向同一个 chat 发送一张独立审批卡片，并暂停 Codex，直到授权用户点击其中一个选项。命令执行审批卡片的按钮会镜像 Codex 的 `availableDecisions`。当前文件变更审批请求不包含目标文件或补丁详情，因此在这些信息能够被关联并完整展示前，Chat2Codex 只提供拒绝/取消。命令决策缺失或为 `null` 时，桥接层同样只展示拒绝/取消；决策列表格式不合法时则直接返回 invalid-params。审批卡会展示额外的文件系统/网络权限以及每条完整的 exec/network policy 规则；如果安全相关详情无法完整展示，卡片会移除所有允许类操作，只保留拒绝/取消，消息路由在处理卡片回调时也会执行相同的决策过滤。
 
-用当前 `chat2codex setup` 流程创建的应用会包含这个回调。如果你的飞书/Lark 应用是在状态卡片动作加入之前创建的，请在开发者后台手动订阅 `card.action.trigger` 回调，这样停止按钮才能通过长连接回到这个桥接服务。
+用当前 `chat2codex setup` 流程创建的应用会包含这个回调。如果你的飞书/Lark 应用是在交互式审批和输入卡片加入之前创建的，请在开发者后台手动订阅 `card.action.trigger` 回调，这样这些卡片决定才能通过长连接回到这个桥接服务。
 
 如果你的应用是在附件能力加入之前创建的，也需要补充飞书/Lark `im.v1.messageResource.get` API 所需的消息资源读取权限；否则文本消息仍然可用，但附件下载会失败。
 
@@ -247,7 +247,7 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/plan <任务>` | 只把当前任务切换到 Codex Plan 模式；需要 Codex 调用 `request_user_input` 时使用，下一条普通消息会恢复 Default 模式。 |
 | `/new` | 在当前项目开始一个新的 Codex 对话。 |
 | `/cd <path>` | 修改当前 chat 的 cwd，并开始一个新的 Codex thread。 |
-| `/stop` | 停止当前 chat 正在运行的 Codex。运行状态卡片里也有停止按钮。 |
+| `/stop` | 停止当前 chat 正在运行的 Codex；该命令会绕过普通聊天任务队列。 |
 | `/steer <补充指令>` | 立即把补充指令发送给当前 Codex 运行，绕过当前 chat 的普通任务队列。 |
 | `/answer <回复码> <内容>` | 回答当前非 secret 的 Codex `requestUserInput` 问题。回复码会显示在提问卡上；回答会立即绕过 chat 队列，且不会被桥接层持久化或回显。 |
 | `/mcp-answer <回复码> <JSON 引号包裹的字段 ID> <内容>` | 使用卡片上展示的精确命令回答当前非敏感 MCP 字段。`/skip` 会跳过可选字段；如果实际字符串就是 `/skip`，请把值写成 `"/skip"`。类型化字段值会按原始 schema 校验；回答会立即绕过 chat 队列，且不会被桥接层持久化或回显。 |
@@ -300,7 +300,7 @@ Chat2Codex 是非官方项目，与 OpenAI 没有关联。
 bun run check
 ```
 
-这个命令会运行 TypeScript 类型检查、Bun 测试套件和生产构建。可以使用 `bun audit` 检查 Bun 依赖锁文件。
+这个命令会运行应用与 adapter 契约类型检查、Bun 测试套件、架构边界检查和生产构建。可以使用 `bun audit` 检查 Bun 依赖锁文件。
 
 ## 参与贡献
 
@@ -308,4 +308,5 @@ bun run check
 
 ## 后续功能
 
-1. 在新增 Slack、Discord 或其他平台前，抽象聊天适配器边界。
+1. 使用 adapter 契约交付第二个生产 adapter，且不修改核心 Router/Runner 业务。
+2. 对进程级凭据与 SDK 隔离有要求时，可选把 adapter 移到外部 gateway 后面。

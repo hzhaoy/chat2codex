@@ -9,6 +9,12 @@ import type { BridgeConfig } from "../config/env.js";
 import { readBundledProtocolManifest, readPackageVersion } from "../package-info.js";
 import type { Logger } from "../util/logger.js";
 import { buildCodexChildEnv } from "./codex-environment.js";
+import {
+  hasStableIdentity,
+  identitiesIntersect,
+  identityKeys,
+  type SenderIdentity,
+} from "../core/identity.js";
 
 const appServerSteerRetryDelaysMs = [0, 100, 250, 500, 1000, 1500];
 const maxUserInputQuestions = 3;
@@ -84,16 +90,13 @@ export interface CodexRunInput {
 export type CodexCollaborationMode = "default" | "plan";
 
 export interface CodexSessionScope {
+  adapterId?: string;
   chatId: string;
   sessionEpoch: string;
   principal: CodexSessionPrincipal;
 }
 
-export interface CodexSessionPrincipal {
-  openId?: string;
-  userId?: string;
-  unionId?: string;
-}
+export type CodexSessionPrincipal = SenderIdentity;
 
 export interface CodexRunResult {
   threadId?: string;
@@ -2063,6 +2066,7 @@ class CodexAppServerSession {
   matches(expected: CodexSessionDescriptor): boolean {
     return (
       this.isHealthy() &&
+      this.descriptor.scope.adapterId === expected.scope.adapterId &&
       this.descriptor.scope.chatId === expected.scope.chatId &&
       this.descriptor.scope.sessionEpoch === expected.scope.sessionEpoch &&
       sameStableSessionPrincipal(
@@ -2668,9 +2672,13 @@ function createSessionDescriptor(
 ): CodexSessionDescriptor {
   return {
     scope: {
+      adapterId: scope.adapterId,
       chatId: scope.chatId,
       sessionEpoch: scope.sessionEpoch,
-      principal: { ...scope.principal },
+      principal: {
+        ...scope.principal,
+        keys: identityKeys(scope.principal),
+      },
     },
     cwdKey,
     threadId,
@@ -2689,9 +2697,7 @@ function isReusableSessionScope(scope: CodexSessionScope | undefined): scope is 
     scope &&
       scope.chatId.trim() &&
       scope.sessionEpoch.trim() &&
-      Object.values(scope.principal).some(
-        (value) => typeof value === "string" && value.trim().length > 0,
-      ),
+      hasStableIdentity(scope.principal),
   );
 }
 
@@ -2699,11 +2705,7 @@ function sameStableSessionPrincipal(
   left: CodexSessionPrincipal,
   right: CodexSessionPrincipal,
 ): boolean {
-  return (["openId", "userId", "unionId"] as const).some((key) => {
-    const leftValue = left[key]?.trim();
-    const rightValue = right[key]?.trim();
-    return Boolean(leftValue && rightValue && leftValue === rightValue);
-  });
+  return identitiesIntersect(left, right);
 }
 
 function notificationBelongsToRun(

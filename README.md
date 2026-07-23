@@ -12,7 +12,8 @@ without exposing a public webhook server.
 ## Current Status
 
 - The shipped adapter is Feishu/Lark long connection. Slack, Discord, and other
-  adapters are roadmap items.
+  adapters are roadmap items. Platform transport is isolated behind a contract
+  and supervisor; see [Architecture](docs/architecture.md).
 - Direct-message routing is enabled by default, but every sender or direct chat
   must be explicitly allowlisted except for `/whoami` discovery.
 - Group chats are disabled by default and require both chat and sender
@@ -74,14 +75,14 @@ under `ATTACHMENT_DOWNLOAD_DIR` and appends their local paths to the Codex
 prompt. If the message contains only an attachment, it uses a default prompt
 asking Codex to inspect that file or image.
 
-During a run, Chat2Codex sends a status card, updates that card at most once
-every 15 seconds, and sends the final Codex response as a rendered rich-text
-post. Click the card's stop button or send `/stop` to abort the active run.
-Failed and stopped cards include a retry button for re-running the same prompt.
-Completed cards include a compact run result and detail buttons for summary,
-changed files, diff, and command logs. The same details are available with
-`/summary`, `/files`, `/diff`, and `/logs`.
-If card creation or updates fail, it falls back to text progress replies.
+During a run, Chat2Codex adds a processing reaction below the original message
+and sends throttled plain-text progress at most once every 30 seconds. The
+processing reaction is removed when the run ends; failures receive a failure
+reaction. The final Codex response is sent as a rendered rich-text post. Send
+`/stop` to abort the active run and `/retry` to re-run the latest remembered
+prompt. Run details remain available through `/summary`, `/files`, `/diff`, and
+`/logs`. If message reactions are unavailable, Chat2Codex falls back to a
+plain-text acknowledgement.
 
 ### CLI Commands
 
@@ -114,8 +115,9 @@ when you need a separate bot instance.
 - Local state in JSON.
 - Codex app-server JSON-RPC for machine-readable progress, final output, and
   approval callbacks.
-- Throttled run-status card updates while Codex is running, with stop/retry
-  buttons, completed-run detail buttons, and text fallback.
+- A processing reaction on the original message, throttled plain-text progress,
+  and a failure reaction when a run fails. `/stop`, `/retry`, and the run-detail
+  commands remain ordinary text commands.
 - Feishu/Lark approval cards for Codex command/file-change approval requests.
   Buttons are generated from Codex's current approval decisions, including
   Approve, Approve session, Deny, and Cancel turn when those options are
@@ -246,9 +248,10 @@ completely, allow actions are removed and only decline/cancel remain; the
 message router enforces the same decision filter when processing card callbacks.
 
 Apps created with the current `chat2codex setup` flow include that callback.
-If you created the Feishu/Lark app before status-card actions were added,
-manually subscribe the `card.action.trigger` callback in the developer console
-so the stop button can reach this bridge over the long connection.
+If you created the Feishu/Lark app before interactive approvals and input cards
+were added, manually subscribe the `card.action.trigger` callback in the
+developer console so those card decisions can reach this bridge over the long
+connection.
 
 If you created the app before attachment support was added, also grant the
 message resource/read permission used by Feishu/Lark's
@@ -368,7 +371,7 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/plan <task>` | Run one task in Codex Plan mode. Use this mode when Codex should call `request_user_input`; the next ordinary message returns to Default mode. |
 | `/new` | Start a fresh Codex conversation in the current project. |
 | `/cd <path>` | Change the current chat cwd and start a fresh Codex thread. |
-| `/stop` | Stop the active Codex run for the current chat. The running status card also has a stop button. |
+| `/stop` | Stop the active Codex run for the current chat. This command bypasses queued chat work. |
 | `/steer <instruction>` | Send extra guidance to the active Codex run immediately, bypassing queued chat work. |
 | `/answer <reply-code> <value>` | Answer the current non-secret Codex `requestUserInput` question. The reply code is shown on the question card; answers bypass queued chat work and are neither persisted nor echoed by the bridge. |
 | `/mcp-answer <reply-code> <JSON-quoted-field-id> <value>` | Answer the current non-sensitive MCP form field using the exact command shown on its card. `/skip` skips an optional field; quote the value as `"/skip"` when that literal string is intended. Typed values are checked against the original schema; answers bypass queued chat work and are neither persisted nor echoed by the bridge. |
@@ -480,8 +483,9 @@ Chat2Codex is an unofficial project and is not affiliated with OpenAI.
 bun run check
 ```
 
-This runs TypeScript type checking, the Bun test suite, and the production
-build. Use `bun audit` to check the Bun dependency lockfile.
+This runs application and adapter-contract type checking, the Bun test suite,
+architecture-boundary checks, and the production build. Use `bun audit` to
+check the Bun dependency lockfile.
 
 ## Contributing
 
@@ -491,5 +495,7 @@ chat or reporting a security issue.
 
 ## Next Features To Add
 
-1. Introduce a chat-adapter boundary before adding Slack, Discord, or
-   other platforms.
+1. Ship a second production adapter using the adapter contract without changing
+   core Router/Runner behavior.
+2. Optionally move adapters behind an external gateway when deployments need
+   process-level credential and SDK isolation.

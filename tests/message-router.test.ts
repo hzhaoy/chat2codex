@@ -38,6 +38,14 @@ import type {
   RunStatusCardInput,
   UserInputCardInput,
 } from "../src/bot/lark-card.js";
+import { renderFeishuInteractiveView } from "../src/adapters/feishu/adapter.js";
+import { renderLarkActionResponse } from "../src/adapters/feishu/action.js";
+import type { ActionResponse } from "../src/core/actions.js";
+import type {
+  MessageReaction,
+  MessageReactionHandle,
+} from "../src/core/contracts.js";
+import type { ChatView } from "../src/core/view-models.js";
 import {
   MessageRouter,
   type ChatSender,
@@ -73,6 +81,12 @@ class ToggleFailingStateStore extends JsonStateStore {
 
 class CollectingSender implements ChatSender {
   readonly messages: Array<{ chatId: string; text: string; kind: "text" | "markdown" }> = [];
+  readonly reactions: Array<{
+    operation: "add" | "remove";
+    chatId: string;
+    messageId: string;
+    reaction: MessageReaction;
+  }> = [];
 
   async sendText(chatId: string, text: string): Promise<void> {
     this.messages.push({ chatId, text, kind: "text" });
@@ -80,6 +94,30 @@ class CollectingSender implements ChatSender {
 
   async sendMarkdown(chatId: string, markdown: string): Promise<void> {
     this.messages.push({ chatId, text: markdown, kind: "markdown" });
+  }
+
+  async addReaction(
+    chatId: string,
+    messageId: string,
+    reaction: MessageReaction,
+  ): Promise<MessageReactionHandle> {
+    this.reactions.push({ operation: "add", chatId, messageId, reaction });
+    return {
+      adapterId: "test:default",
+      conversationId: chatId,
+      messageId,
+      reaction,
+      reactionId: `reaction-${this.reactions.length}`,
+    };
+  }
+
+  async removeReaction(handle: MessageReactionHandle): Promise<void> {
+    this.reactions.push({
+      operation: "remove",
+      chatId: handle.conversationId,
+      messageId: handle.messageId,
+      reaction: handle.reaction,
+    });
   }
 }
 
@@ -265,6 +303,18 @@ class CardCollectingSender extends CollectingSender {
     this.interactiveCards.push({ chatId, card });
   }
 
+  async sendView(chatId: string, view: ChatView): Promise<void> {
+    if (view.kind === "text") {
+      await this.sendText(chatId, view.text);
+      return;
+    }
+    if (view.kind === "markdown") {
+      await this.sendMarkdown(chatId, view.markdown);
+      return;
+    }
+    await this.sendInteractiveCard(chatId, renderFeishuInteractiveView(view));
+  }
+
   async updateInteractiveCard(messageId: string, card: LarkInteractiveCard): Promise<void> {
     this.interactiveCardUpdates.push({ messageId, card });
   }
@@ -379,17 +429,18 @@ class DelayedApprovalCardSender extends CardCollectingSender {
   }
 }
 
-class DelayedStatusCardSender extends CardCollectingSender {
+class DelayedReactionSender extends CardCollectingSender {
   readonly createStarted = deferred<void>();
   readonly releaseCreate = deferred<void>();
 
-  override async createStatusCard(
+  override async addReaction(
     chatId: string,
-    input: RunStatusCardInput,
-  ): Promise<StatusCardHandle> {
+    messageId: string,
+    reaction: MessageReaction,
+  ): Promise<MessageReactionHandle> {
     this.createStarted.resolve();
     await this.releaseCreate.promise;
-    return super.createStatusCard(chatId, input);
+    return super.addReaction(chatId, messageId, reaction);
   }
 }
 
@@ -2895,7 +2946,8 @@ describe("MessageRouter access control", () => {
         text: "continue from card",
       });
 
-      expect(projectResponse).toMatchObject({
+      const renderedProjectResponse = renderFeishuActionForTest(projectResponse);
+      expect(renderedProjectResponse).toMatchObject({
         card: {
           type: "raw",
           data: {
@@ -2907,8 +2959,9 @@ describe("MessageRouter access control", () => {
           },
         },
       });
-      expect(JSON.stringify(projectResponse)).not.toContain("select_project");
-      expect(response).toMatchObject({
+      expect(JSON.stringify(renderedProjectResponse)).not.toContain("select_project");
+      const renderedSessionResponse = renderFeishuActionForTest(response);
+      expect(renderedSessionResponse).toMatchObject({
         card: {
           type: "raw",
           data: {
@@ -2920,8 +2973,8 @@ describe("MessageRouter access control", () => {
           },
         },
       });
-      expect(JSON.stringify(response)).toContain("已选择会话：A older");
-      expect(JSON.stringify(response)).not.toContain("resume_thread");
+      expect(JSON.stringify(renderedSessionResponse)).toContain("已选择会话：A older");
+      expect(JSON.stringify(renderedSessionResponse)).not.toContain("resume_thread");
       expect(sender.interactiveCards.at(-1)?.card.header.title.content).toBe("当前项目会话");
       expect(sender.interactiveCardUpdates).toHaveLength(0);
       expect(codex.runs[0]?.cwd).toBe("/repo/a");
@@ -2962,7 +3015,8 @@ describe("MessageRouter access control", () => {
         sender: { openId: "ou_user" },
       });
 
-      expect(projectPage).toMatchObject({
+      const renderedProjectPage = renderFeishuActionForTest(projectPage);
+      expect(renderedProjectPage).toMatchObject({
         card: {
           type: "raw",
           data: {
@@ -2974,9 +3028,9 @@ describe("MessageRouter access control", () => {
           },
         },
       });
-      expect(JSON.stringify(projectPage)).toContain("进入 6");
-      expect(JSON.stringify(projectPage)).toContain("上一页");
-      expect(JSON.stringify(projectPage)).not.toContain("下一页");
+      expect(JSON.stringify(renderedProjectPage)).toContain("进入 6");
+      expect(JSON.stringify(renderedProjectPage)).toContain("上一页");
+      expect(JSON.stringify(renderedProjectPage)).not.toContain("下一页");
 
       await router.handleCardAction({
         action: "select_project",
@@ -3001,7 +3055,8 @@ describe("MessageRouter access control", () => {
         sender: { openId: "ou_user" },
       });
 
-      expect(sessionPage).toMatchObject({
+      const renderedSessionPage = renderFeishuActionForTest(sessionPage);
+      expect(renderedSessionPage).toMatchObject({
         card: {
           type: "raw",
           data: {
@@ -3013,9 +3068,9 @@ describe("MessageRouter access control", () => {
           },
         },
       });
-      expect(JSON.stringify(sessionPage)).toContain("继续 6");
-      expect(JSON.stringify(sessionPage)).toContain("上一页");
-      expect(JSON.stringify(sessionPage)).not.toContain("下一页");
+      expect(JSON.stringify(renderedSessionPage)).toContain("继续 6");
+      expect(JSON.stringify(renderedSessionPage)).toContain("上一页");
+      expect(JSON.stringify(renderedSessionPage)).not.toContain("下一页");
       expect(sender.interactiveCardUpdates).toHaveLength(0);
     });
   });
@@ -3967,11 +4022,22 @@ describe("MessageRouter access control", () => {
 
         expect(codex.runs).toHaveLength(1);
         expect(codex.runs[0]?.prompt).toBe("run this");
-        expect(sender.messages.map((message) => message.text)).toEqual([
-          "收到，已开始处理。",
-          "done",
+        expect(sender.messages.map((message) => message.text)).toEqual(["done"]);
+        expect(sender.messages.map((message) => message.kind)).toEqual(["markdown"]);
+        expect(sender.reactions).toEqual([
+          {
+            operation: "add",
+            chatId: "oc_group",
+            messageId: "m1",
+            reaction: "processing",
+          },
+          {
+            operation: "remove",
+            chatId: "oc_group",
+            messageId: "m1",
+            reaction: "processing",
+          },
         ]);
-        expect(sender.messages.map((message) => message.kind)).toEqual(["text", "markdown"]);
       },
     );
   });
@@ -4093,19 +4159,21 @@ describe("MessageRouter access control", () => {
       });
 
       expect(sender.messages.map((message) => message.text)).toEqual([
-        "收到，已开始处理。",
         "Codex 正在处理。",
         "done",
       ]);
       expect(sender.messages.map((message) => message.kind)).toEqual([
         "text",
-        "text",
         "markdown",
+      ]);
+      expect(sender.reactions.map(({ operation, reaction }) => ({ operation, reaction }))).toEqual([
+        { operation: "add", reaction: "processing" },
+        { operation: "remove", reaction: "processing" },
       ]);
     });
   });
 
-  test("uses a single status card for progress and completion when supported", async () => {
+  test("uses ordinary text progress instead of a mutable run-status card", async () => {
     const codex = new FakeCodex([
       {
         kind: "running",
@@ -4127,23 +4195,78 @@ describe("MessageRouter access control", () => {
         text: "run with card progress",
       });
 
-      expect(sender.cards).toHaveLength(1);
-      expect(sender.cards[0]?.input).toMatchObject({
-        status: "running",
-        detail: "收到，已开始处理。",
-        prompt: "run with card progress",
+      expect(sender.cards).toHaveLength(0);
+      expect(sender.cardUpdates).toHaveLength(0);
+      expect(sender.messages.map((message) => message.text)).toEqual([
+        "Codex 正在处理。",
+        "done",
+      ]);
+      expect(sender.messages.map((message) => message.kind)).toEqual(["text", "markdown"]);
+      expect(sender.reactions.map(({ operation, reaction }) => ({ operation, reaction }))).toEqual([
+        { operation: "add", reaction: "processing" },
+        { operation: "remove", reaction: "processing" },
+      ]);
+    });
+  });
+
+  test("drains an in-flight progress message before sending the final answer", async () => {
+    const codex = new FakeCodex([
+      {
+        kind: "running",
+        text: "Codex 正在调用工具。",
+      },
+    ]);
+    const sender = new DelayedTextSender();
+
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_progress_order",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "run with delayed progress",
       });
-      expect(sender.cardUpdates).toHaveLength(2);
-      expect(sender.cardUpdates[0]?.input).toMatchObject({
-        status: "running",
-        detail: "Codex 正在处理。",
+
+      await sender.sendStarted.promise;
+      expect(sender.messages).toHaveLength(0);
+      sender.releaseSend.resolve();
+      await running;
+
+      expect(sender.messages.map((message) => message.text)).toEqual([
+        "Codex 正在调用工具。",
+        "done",
+      ]);
+    });
+  });
+
+  test("suppresses progress callbacks that arrive after the run is terminal", async () => {
+    let runInput: CodexRunInput | undefined;
+    const codex: CodexClient = {
+      async run(input) {
+        runInput = input;
+        return {
+          threadId: "thread_test",
+          finalText: "done",
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+    };
+
+    await withRouterAndCodex({}, codex, async ({ router, sender }) => {
+      await router.enqueue({
+        messageId: "m_late_progress",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "finish before late progress",
       });
-      expect(sender.cardUpdates[1]?.input).toMatchObject({
-        status: "success",
-        detail: "Codex 已完成，正在发送最终回答。",
+
+      await runInput?.onProgress?.({
+        kind: "running",
+        text: "this progress is stale",
       });
-      expect(sender.messages.map((message) => message.kind)).toEqual(["markdown"]);
-      expect(sender.messages[0]?.text).toBe("done");
+      expect(sender.messages.map((message) => message.text)).toEqual(["done"]);
     });
   });
 
@@ -4159,16 +4282,8 @@ describe("MessageRouter access control", () => {
         text: "make a small edit",
       });
 
-      expect(sender.cardUpdates.at(-1)?.input).toMatchObject({
-        status: "success",
-        result: {
-          filesPreview: ["src/app.ts"],
-          changedFileCount: 1,
-          commandCount: 1,
-          diffAvailable: true,
-          logsAvailable: true,
-        },
-      });
+      expect(sender.cards).toHaveLength(0);
+      expect(sender.cardUpdates).toHaveLength(0);
 
       for (const [command, expected] of [
         ["/summary", "状态：success"],
@@ -4190,19 +4305,6 @@ describe("MessageRouter access control", () => {
         }
       }
 
-      const response = await router.handleCardAction({
-        action: "show_run_detail",
-        detailKind: "diff",
-        chatId: "oc_chat",
-        messageId: sender.cards[0]?.handle.messageId,
-        sender: { openId: "ou_user" },
-      });
-      expect(response).toMatchObject({
-        toast: {
-          type: "success",
-        },
-      });
-      expect(sender.messages.at(-1)?.text).toContain("diff --git a/src/app.ts b/src/app.ts");
     });
   });
 
@@ -4278,7 +4380,7 @@ describe("MessageRouter access control", () => {
 
   test("steer queues guidance while a run is starting but not active yet", async () => {
     const codex = new DelayedSteerableCodex(20);
-    const sender = new DelayedStatusCardSender();
+    const sender = new DelayedReactionSender();
     await withRouterAndSender({}, codex, sender, async ({ router }) => {
       const running = router.enqueue({
         messageId: "m_run",
@@ -4513,16 +4615,16 @@ describe("MessageRouter access control", () => {
         text: "run and fail",
       });
 
-      expect(sender.messages).toHaveLength(2);
-      expect(sender.messages[1]?.text).toContain("Codex 运行失败。");
-      expect(sender.messages[1]?.text).toContain("exit: code=2");
-      expect(sender.messages[1]?.text).toContain("cwd:");
-      expect(sender.messages[1]?.text).toContain("fatal: not a git repository");
-      expect(sender.messages[1]?.text).toContain("CODEX_SKIP_GIT_REPO_CHECK=true");
+      expect(sender.messages).toHaveLength(1);
+      expect(sender.messages[0]?.text).toContain("Codex 运行失败。");
+      expect(sender.messages[0]?.text).toContain("exit: code=2");
+      expect(sender.messages[0]?.text).toContain("cwd:");
+      expect(sender.messages[0]?.text).toContain("fatal: not a git repository");
+      expect(sender.messages[0]?.text).toContain("CODEX_SKIP_GIT_REPO_CHECK=true");
     });
   });
 
-  test("updates the status card before sending a failure summary", async () => {
+  test("replaces the processing reaction with a failure reaction", async () => {
     const codex = new FailingCodex();
     const sender = new CardCollectingSender();
 
@@ -4535,14 +4637,15 @@ describe("MessageRouter access control", () => {
         text: "run and fail",
       });
 
-      expect(sender.cards).toHaveLength(1);
-      expect(sender.cardUpdates).toHaveLength(1);
-      expect(sender.cardUpdates[0]?.input).toMatchObject({
-        status: "failed",
-        detail: "Codex 运行失败，错误摘要已发送。",
-      });
+      expect(sender.cards).toHaveLength(0);
+      expect(sender.cardUpdates).toHaveLength(0);
       expect(sender.messages).toHaveLength(1);
       expect(sender.messages[0]?.text).toContain("Codex 运行失败。");
+      expect(sender.reactions.map(({ operation, reaction }) => ({ operation, reaction }))).toEqual([
+        { operation: "add", reaction: "processing" },
+        { operation: "remove", reaction: "processing" },
+        { operation: "add", reaction: "failure" },
+      ]);
     });
   });
 
@@ -4557,12 +4660,12 @@ describe("MessageRouter access control", () => {
         text: "run but codex is missing",
       });
 
-      expect(sender.messages).toHaveLength(2);
-      expect(sender.messages[1]?.text).toContain("Codex 启动失败。");
-      expect(sender.messages[1]?.text).toContain("command: codex");
-      expect(sender.messages[1]?.text).toContain("spawn codex ENOENT");
-      expect(sender.messages[1]?.text).toContain("CODEX_BIN");
-      expect(sender.messages[1]?.text).toContain("PATH");
+      expect(sender.messages).toHaveLength(1);
+      expect(sender.messages[0]?.text).toContain("Codex 启动失败。");
+      expect(sender.messages[0]?.text).toContain("command: codex");
+      expect(sender.messages[0]?.text).toContain("spawn codex ENOENT");
+      expect(sender.messages[0]?.text).toContain("CODEX_BIN");
+      expect(sender.messages[0]?.text).toContain("PATH");
     });
   });
 
@@ -4647,13 +4750,16 @@ describe("MessageRouter access control", () => {
 
       expect(codex.abortCount).toBe(1);
       expect(sender.messages.map((message) => message.text)).toEqual([
-        "收到，已开始处理。",
         "已请求停止当前 chat 的 Codex 任务。",
+      ]);
+      expect(sender.reactions.map(({ operation, reaction }) => ({ operation, reaction }))).toEqual([
+        { operation: "add", reaction: "processing" },
+        { operation: "remove", reaction: "processing" },
       ]);
     });
   });
 
-  test("updates the status card when a run is stopped", async () => {
+  test("removes the processing reaction when a run is stopped", async () => {
     const codex = new BlockingCodex();
     const sender = new CardCollectingSender();
     await withRouterAndSender({}, codex, sender, async ({ router }) => {
@@ -4675,13 +4781,14 @@ describe("MessageRouter access control", () => {
       });
       await running;
 
-      expect(sender.cards).toHaveLength(1);
-      expect(sender.cardUpdates.at(-1)?.input).toMatchObject({
-        status: "stopped",
-        detail: "已停止当前 Codex 任务。",
-      });
+      expect(sender.cards).toHaveLength(0);
+      expect(sender.cardUpdates).toHaveLength(0);
       expect(sender.messages.map((message) => message.text)).toEqual([
         "已请求停止当前 chat 的 Codex 任务。",
+      ]);
+      expect(sender.reactions.map(({ operation, reaction }) => ({ operation, reaction }))).toEqual([
+        { operation: "add", reaction: "processing" },
+        { operation: "remove", reaction: "processing" },
       ]);
     });
   });
@@ -4703,11 +4810,14 @@ describe("MessageRouter access control", () => {
         });
 
         expect(codex.abortCount).toBe(1);
-        expect(sender.cardUpdates.at(-1)?.input).toMatchObject({
-          status: "failed",
-          detail: "Codex 运行超时，已停止当前任务。",
-        });
+        expect(sender.cards).toHaveLength(0);
+        expect(sender.cardUpdates).toHaveLength(0);
         expect(sender.messages.at(-1)?.text).toContain("CODEX_RUN_TIMEOUT_MS=10");
+        expect(sender.reactions.map(({ operation, reaction }) => ({ operation, reaction }))).toEqual([
+          { operation: "add", reaction: "processing" },
+          { operation: "remove", reaction: "processing" },
+          { operation: "add", reaction: "failure" },
+        ]);
 
         await router.enqueue({
           messageId: "m_status",
@@ -4743,13 +4853,13 @@ describe("MessageRouter access control", () => {
       await running;
 
       expect(response).toEqual({
-        toast: {
-          type: "success",
-          content: "已请求停止当前 chat 的 Codex 任务。",
-        },
+        kind: "toast",
+        level: "success",
+        text: "已请求停止当前 chat 的 Codex 任务。",
       });
       expect(codex.abortCount).toBe(1);
-      expect(sender.cardUpdates.at(-1)?.input.status).toBe("stopped");
+      expect(sender.cards).toHaveLength(0);
+      expect(sender.cardUpdates).toHaveLength(0);
       expect(sender.messages).toHaveLength(0);
     });
   });
@@ -4773,10 +4883,9 @@ describe("MessageRouter access control", () => {
       });
 
       expect(response).toEqual({
-        toast: {
-          type: "warning",
-          content: "当前 chat 没有正在运行的 Codex 任务。",
-        },
+        kind: "toast",
+        level: "warning",
+        text: "当前 chat 没有正在运行的 Codex 任务。",
       });
       expect(sender.messages).toHaveLength(0);
     });
@@ -4851,7 +4960,8 @@ describe("MessageRouter access control", () => {
       });
       await running;
 
-      expect(response).toMatchObject({
+      const renderedResponse = renderFeishuActionForTest(response);
+      expect(renderedResponse).toMatchObject({
         card: {
           type: "raw",
           data: {
@@ -4863,8 +4973,8 @@ describe("MessageRouter access control", () => {
           },
         },
       });
-      expect(JSON.stringify(response)).toContain("已选择：Approve session。");
-      expect(JSON.stringify(response)).not.toContain("resolve_approval");
+      expect(JSON.stringify(renderedResponse)).toContain("已选择：Approve session。");
+      expect(JSON.stringify(renderedResponse)).not.toContain("resolve_approval");
       expect(codex.decision).toBe("acceptForSession");
       expect(sender.approvalCards[0]?.input.request.decisions).toEqual([
         "accept",
@@ -5469,7 +5579,7 @@ describe("MessageRouter access control", () => {
         optionIndex: 1,
         sender: { openId: "ou_user" },
       });
-      expect(nextQuestion).toHaveProperty("card");
+      expectReplacementView(nextQuestion, "user_input");
       expect(JSON.stringify(nextQuestion)).toContain("Any extra note?");
       expect(codex.response).toBeUndefined();
       expect(sender.userInputCardUpdates.at(-1)?.input).toMatchObject({
@@ -5485,7 +5595,7 @@ describe("MessageRouter access control", () => {
         questionId: "note",
         sender: { openId: "ou_user" },
       });
-      expect(resolved).toHaveProperty("card");
+      expectReplacementView(resolved, "user_input");
       await running;
 
       expect(codex.runs).toHaveLength(1);
@@ -5560,7 +5670,7 @@ describe("MessageRouter access control", () => {
           userInputId: request.id,
           sender: { openId: "ou_user" },
         });
-        expect(cancelled).toHaveProperty("card");
+        expectReplacementView(cancelled, "user_input");
         await running;
 
         expect(codex.response).toEqual({ answers: {} });
@@ -5964,7 +6074,7 @@ describe("MessageRouter access control", () => {
           decision: "grantSession",
           sender: { openId: "ou_user" },
         });
-        expect(resolved).toHaveProperty("card");
+        expectReplacementView(resolved, "permission_approval");
         await running;
 
         expect(codex.decision).toBe("grantSession");
@@ -6136,7 +6246,7 @@ describe("MessageRouter access control", () => {
         optionIndex: 1,
         sender: { openId: "ou_user" },
       });
-      expect(selected).toHaveProperty("card");
+      expectReplacementView(selected, "mcp_elicitation");
       expect(sender.mcpElicitationCardUpdates.at(-1)?.input).toMatchObject({
         status: "pending",
         answeredFieldIds: ["environment"],
@@ -6408,7 +6518,7 @@ describe("MessageRouter access control", () => {
           decision: "accept",
           sender: { openId: "ou_user" },
         });
-        expect(accepted).toHaveProperty("card");
+        expectReplacementView(accepted, "mcp_elicitation");
         await running;
 
         expect(codex.response).toEqual({ action: "accept", content: null });
@@ -6468,64 +6578,6 @@ describe("MessageRouter access control", () => {
         sender: { openId: "ou_user" },
       });
       expect(expectToast(late).toast.type).toBe("warning");
-    });
-  });
-
-  test("card retry action reruns the prompt from the status card context", async () => {
-    const codex = new SequencedCodex([
-      {
-        threadId: "thread_test",
-        finalText: "",
-        stderr: "temporary failure",
-        exitCode: 1,
-      },
-      {
-        threadId: "thread_test",
-        finalText: "retried done",
-        stderr: "",
-        exitCode: 0,
-      },
-    ]);
-    const sender = new CardCollectingSender();
-    await withRouterAndSender({}, codex, sender, async ({ router }) => {
-      await router.enqueue({
-        messageId: "m1",
-        chatId: "oc_chat",
-        chatType: "direct",
-        sender: { openId: "ou_user" },
-        text: "flaky task",
-      });
-
-      const response = await router.handleCardAction({
-        action: "retry_run",
-        chatId: "oc_chat",
-        messageId: sender.cards[0]?.handle.messageId,
-        sender: { openId: "ou_user" },
-      });
-      await waitFor(() => codex.runs.length === 2);
-      await waitFor(() => sender.cards.length === 2);
-      await waitFor(() =>
-        sender.cardUpdates.some((update) => update.input.status === "success"),
-      );
-
-      expect(response).toEqual({
-        toast: {
-          type: "success",
-          content: "已把这次任务重新加入当前 chat 的 Codex 队列。",
-        },
-      });
-      expect(codex.runs.map((run) => run.prompt)).toEqual(["flaky task", "flaky task"]);
-      expect(sender.cards[1]?.input).toMatchObject({
-        status: "running",
-        prompt: "flaky task",
-      });
-      expect(sender.cardUpdates.at(-1)?.input).toMatchObject({
-        status: "success",
-      });
-      expect(sender.messages.at(-1)).toMatchObject({
-        kind: "markdown",
-        text: "retried done",
-      });
     });
   });
 
@@ -6667,7 +6719,7 @@ describe("MessageRouter access control", () => {
     });
   });
 
-  test("text and card retry reject a different allowed sender", async () => {
+  test("text retry rejects a different allowed sender", async () => {
     const codex = new SequencedCodex([
       { threadId: "thread_test", finalText: "done", stderr: "", exitCode: 0 },
     ]);
@@ -6692,16 +6744,8 @@ describe("MessageRouter access control", () => {
           sender: { openId: "ou_other" },
           text: "/retry",
         });
-        const cardResponse = await router.handleCardAction({
-          action: "retry_run",
-          chatId: "oc_chat",
-          messageId: sender.cards[0]?.handle.messageId,
-          sender: { openId: "ou_other" },
-        });
-
         expect(codex.runs).toHaveLength(1);
         expect(sender.messages.at(-1)?.text).toContain("只有发起最近一轮任务的用户");
-        expect(expectToast(cardResponse).toast.type).toBe("error");
       },
     );
   });
@@ -6725,10 +6769,9 @@ describe("MessageRouter access control", () => {
       });
 
       expect(response).toEqual({
-        toast: {
-          type: "warning",
-          content: "无法重试：当前服务没有这张状态卡的任务上下文。",
-        },
+        kind: "toast",
+        level: "warning",
+        text: "无法重试：当前服务没有这张状态卡的任务上下文。",
       });
       expect(sender.messages).toHaveLength(0);
     });
@@ -6809,8 +6852,19 @@ function formatDecisionForTest(decision: CodexApprovalDecision | undefined): str
 }
 
 function expectToast(response: unknown): { toast: { type: string; content: string } } {
-  expect(response).toHaveProperty("toast");
-  return response as { toast: { type: string; content: string } };
+  expect(response).toMatchObject({ kind: "toast" });
+  const toast = response as { kind: "toast"; level: string; text: string };
+  return { toast: { type: toast.level, content: toast.text } };
+}
+
+function expectReplacementView(response: unknown, kind: ChatView["kind"]): ChatView {
+  expect(response).toMatchObject({ kind: "replace_view", view: { kind } });
+  return (response as Extract<ActionResponse, { kind: "replace_view" }>).view;
+}
+
+function renderFeishuActionForTest(response: unknown): unknown {
+  expect(response).toHaveProperty("kind");
+  return renderLarkActionResponse(response as ActionResponse, renderFeishuInteractiveView);
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
