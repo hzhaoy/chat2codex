@@ -7,6 +7,43 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.7.0 - 2026-07-23
+
+### Added
+
+- A platform-neutral adapter contract now covers inbound messages and actions,
+  attachments, actor identities, view models, delivery handles, and adapter
+  capabilities. A compile-only reference adapter protects this extension API.
+- `AdapterSupervisor` owns adapter lifecycle and routes events, view delivery,
+  updates, and attachment access strictly by `adapterId`. One adapter may fail
+  to start without stopping other ready adapters.
+- Persisted state now uses a versioned adapter-partitioned envelope. Existing
+  v0.6 state migrates into the Feishu/Lark partition and receives a private
+  one-time backup before the first v0.7 write.
+
+### Changed
+
+- The ingress `MessageRouter` is now a thin facade over `BridgeRunner`, which
+  owns Codex execution, durable queues, approvals, and recovery.
+- Feishu/Lark transport, event adaptation, cards, action callbacks, and posts
+  now live under an independent adapter. The production startup path registers
+  it through the adapter supervisor.
+- Core action handling returns platform-neutral toast or replacement-view
+  responses; the Feishu adapter alone renders Lark callback payloads.
+- Ordinary runs now use a platform-neutral processing reaction and throttled
+  text progress instead of mutating a run-status card. New runs expose `/stop`
+  as their stopping control; failures replace the processing reaction with a
+  failure reaction, while approval and structured-input cards remain
+  interactive.
+
+### Security
+
+- Architecture tests reject platform SDK or adapter imports from `src/core`.
+  Interactive callback disclosure checks are injected as an adapter policy,
+  so forged decisions remain fail-closed without coupling core to card code.
+- Actor identity comparisons use typed identity keys, and reusable Codex
+  sessions include their adapter partition in the session scope.
+
 ## 0.6.0 - 2026-07-21
 
 ### Added
