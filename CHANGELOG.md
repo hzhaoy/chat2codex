@@ -7,6 +7,30 @@ numbers once releases are published.
 
 ## Unreleased
 
+### Added
+
+- Native personal-Weixin ClawBot adapter using the iLink HTTP protocol, QR
+  setup, durable long-poll cursors, typing indicators, and encrypted inbound
+  image/file downloads without installing OpenClaw.
+- `CHAT2CODEX_ADAPTER=feishu|weixin`,
+  `WEIXIN_CREDENTIALS_PATH`, `chat2codex setup weixin`, and adapter-aware
+  doctor checks.
+- Sender-bound text fallbacks for approvals, additional permissions, and MCP
+  URL decisions through `/approve`, `/permit`, and `/mcp-decide`.
+
+### Changed
+
+- `CodexRunner`, `MessageRouter`, state, `AdapterSupervisor`, and `ChatSender`
+  construction now live in a common composition root instead of the Feishu
+  adapter.
+
+### Security
+
+- Weixin credentials and runtime protocol state use owner-only files; secret
+  tokens and context values stay out of `.env` and logs. Weixin v1 rejects
+  groups and unsupported media, while text decisions are bound to the original
+  conversation, stable sender identity, request, and expiry lifecycle.
+
 ## 0.7.0 - 2026-07-23
 
 ### Added

@@ -2,18 +2,18 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Run Codex on your own machine from Feishu/Lark chat.
+Run Codex on your own machine from Feishu/Lark or Weixin chat.
 
-Chat2Codex turns a Feishu/Lark bot into a message platform for the local Codex
-CLI. Send prompts, files, and images from chat; receive Codex progress and final
-answers; approve Codex actions with cards; and resume local Codex threads
-without exposing a public webhook server.
+Chat2Codex turns a chat bot into a message platform for the local Codex CLI.
+Send prompts, files, and images; receive progress and final answers; approve
+Codex actions; and resume local Codex threads without a public webhook server.
 
 ## Current Status
 
-- The shipped adapter is Feishu/Lark long connection. Slack, Discord, and other
-  adapters are roadmap items. Platform transport is isolated behind a contract
-  and supervisor; see [Architecture](docs/architecture.md).
+- Production adapters are Feishu/Lark long connection and native Weixin
+  ClawBot iLink long polling. Select exactly one per process with
+  `CHAT2CODEX_ADAPTER=feishu|weixin`; the omitted selector remains `feishu`.
+  See [Architecture](docs/architecture.md).
 - Direct-message routing is enabled by default, but every sender or direct chat
   must be explicitly allowlisted except for `/whoami` discovery.
 - Group chats are disabled by default and require both chat and sender
@@ -29,8 +29,8 @@ without exposing a public webhook server.
 - Node.js `>= 20.12.0`
 - npm for installing the package.
 - Codex CLI installed and logged in on the machine running this bridge.
-- A Feishu/Lark account that can create an app, or an existing Feishu/Lark app
-  with bot enabled.
+- Either a Feishu/Lark account that can create a bot app, or a personal Weixin
+  account with the ClawBot entry enabled.
 - The app needs message receive/send/resource permissions, long-connection
   event subscriptions for message events, and the `card.action.trigger`
   callback.
@@ -63,6 +63,21 @@ chat2codex doctor
 chat2codex start
 ```
 
+For Weixin, connect Chat2Codex directly to ClawBot instead:
+
+```bash
+chat2codex setup weixin --workdir /absolute/path/to/your/repo
+```
+
+The QR flow handles confirmation, numeric verification, IDC redirects, and
+expiry refresh. It writes `CHAT2CODEX_ADAPTER=weixin`, the work directory, and
+the scanning user's stable iLink id to the env allowlist. Bot Token, Bot ID,
+API base URL, and user ID are stored with mode `0600` in
+`~/.chat2codex/weixin/credentials.json`, never in `.env`. This route uses the
+native iLink HTTP protocol; OpenClaw is not installed or run.
+The machine still has to stay powered on, online, and running the Chat2Codex
+service; ClawBot is only the transport and does not run another agent or model.
+
 Send a DM to the bot:
 
 ```text
@@ -89,8 +104,9 @@ plain-text acknowledgement.
 | Command | Effect |
 | --- | --- |
 | `/help` | Show a compact mobile guide to the main Chat2Codex commands. |
-| `chat2codex` / `chat2codex start` | Start the Feishu/Lark bridge. |
+| `chat2codex` / `chat2codex start` | Start the adapter selected by `CHAT2CODEX_ADAPTER`. |
 | `chat2codex setup --workdir <path>` | Create/connect a Feishu/Lark app and write `.env`. |
+| `chat2codex setup weixin --workdir <path>` | Scan and connect a Weixin ClawBot and write private credentials plus `.env`. |
 | `chat2codex init --workdir <path>` | Create a starter `.env` when you already have an app. |
 | `chat2codex doctor` | Check `.env`, Node.js, Codex CLI and protocol-snapshot versions, workspace paths, and mobile/team-bot safety warnings. |
 | `chat2codex smoke [--mode turn\|approval]` | Verify the Codex app-server protocol locally. |
@@ -102,7 +118,8 @@ when you need a separate bot instance.
 
 ## Features
 
-- Feishu/Lark long-connection bot, no public webhook server required.
+- Feishu/Lark long connection or native Weixin ClawBot long polling; neither
+  requires a public webhook server.
 - One reusable Codex app-server session per chat/thread scope. Consecutive turns
   keep the same process—and therefore session-scoped grants—while the sender,
   cwd, thread, policy, and session epoch remain unchanged.
@@ -110,8 +127,8 @@ when you need a separate bot instance.
   `/history`, `/search`, `/resume`, `/fork`, `/archive`, `/archived`, `/unarchive`,
   `/retry`, `/usage`, `/service status|logs|restart`, `/compact`, `/plan <task>`, `/new`,
   `/cd <path>`,
-  `/stop`, `/steer`, `/answer`, `/mcp-answer`, `/summary`, `/files`, `/diff`,
-  `/logs`, and `/whoami` commands.
+  `/stop`, `/steer`, `/answer`, `/mcp-answer`, `/approve`, `/permit`,
+  `/mcp-decide`, `/summary`, `/files`, `/diff`, `/logs`, and `/whoami` commands.
 - Local state in JSON.
 - Codex app-server JSON-RPC for machine-readable progress, final output, and
   approval callbacks.
@@ -135,6 +152,16 @@ when you need a separate bot instance.
   rendered as complete-profile approval cards. Chat2Codex exposes only deny,
   turn-scoped grant, and session-scoped grant; a grant always returns the
   original profile requested by Codex.
+- Text-only adapters receive sender-bound, expiring eight-character reply codes:
+  `/approve <code> <number>` maps only to the original Codex decision array,
+  `/permit <code> <deny|turn|session>` maps only to the three permission
+  decisions, and `/mcp-decide <code> <accept|decline|cancel>` handles MCP URL
+  decisions.
+- Weixin v1 is deliberately direct-message only. It accepts text, quoted text,
+  inbound images, and inbound files; decrypts official CDN media with
+  AES-128-ECB; maps processing reactions to typing; and drops groups,
+  voice/video, and unsupported media with diagnostics. Outbound media and
+  in-place message updates are not supported.
 - Feishu/Lark image and file messages downloaded to local paths and passed to
   Codex with the prompt.
 - Event diagnostics in logs and `/status` for recent routed/dropped messages.
@@ -375,6 +402,9 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/steer <instruction>` | Send extra guidance to the active Codex run immediately, bypassing queued chat work. |
 | `/answer <reply-code> <value>` | Answer the current non-secret Codex `requestUserInput` question. The reply code is shown on the question card; answers bypass queued chat work and are neither persisted nor echoed by the bridge. |
 | `/mcp-answer <reply-code> <JSON-quoted-field-id> <value>` | Answer the current non-sensitive MCP form field using the exact command shown on its card. `/skip` skips an optional field; quote the value as `"/skip"` when that literal string is intended. Typed values are checked against the original schema; answers bypass queued chat work and are neither persisted nor echoed by the bridge. |
+| `/approve <reply-code> <option-number>` | Resolve a Codex command/file approval on text-only adapters; the number maps only to the original decision array. |
+| `/permit <reply-code> <deny\|turn\|session>` | Deny additional permissions or grant them for the current turn/session. |
+| `/mcp-decide <reply-code> <accept\|decline\|cancel>` | Resolve an MCP URL request on text-only adapters. |
 | `/summary` | Show the most recent run summary for this chat. |
 | `/files` | Show changed files from the most recent run. |
 | `/diff` | Show the latest captured diff from the most recent run. |
@@ -495,7 +525,7 @@ chat or reporting a security issue.
 
 ## Next Features To Add
 
-1. Ship a second production adapter using the adapter contract without changing
-   core Router/Runner behavior.
+1. Design and validate safe Weixin outbound media, additional message types,
+   and controlled group-chat support.
 2. Optionally move adapters behind an external gateway when deployments need
    process-level credential and SDK isolation.

@@ -2,13 +2,13 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-从飞书/Lark 聊天里运行你本机的 Codex。
+从飞书/Lark 或个人微信里运行你本机的 Codex。
 
-Chat2Codex 会把一个飞书/Lark 机器人变成本机 Codex CLI 的消息平台。你可以在聊天里发送需求、文件和图片；接收 Codex 的执行进度和最终回复；通过卡片审批 Codex 动作；也可以继续本机已有的 Codex 会话，而不需要暴露公网 webhook 服务。
+Chat2Codex 会把聊天机器人变成本机 Codex CLI 的消息平台。你可以发送需求、文件和图片，接收执行进度和最终回复，审批 Codex 动作，也可以继续本机已有的 Codex 会话，而不需要暴露公网 webhook 服务。
 
 ## 当前状态
 
-- 当前已经实现的是飞书/Lark 长连接适配器。Slack、Discord 等其他聊天平台还在路线图中。平台传输已通过契约和 supervisor 与核心隔离，详见 [架构说明](docs/architecture.md)。
+- 当前生产适配器包括飞书/Lark 长连接和原生微信 ClawBot iLink 长轮询。每个进程通过 `CHAT2CODEX_ADAPTER=feishu|weixin` 二选一；不配置时仍默认飞书，现有配置无需迁移。平台传输已通过契约和 supervisor 与核心隔离，详见 [架构说明](docs/architecture.md)。
 - 私聊路由默认开启，但除 `/whoami` 外，发送者或私聊 chat 必须显式加入允许列表；授权后的私聊可以切换到任意本机目录。
 - 群聊默认关闭，启用后必须同时允许 chat 和发送者，并且可以用 `CODEX_GROUP_ALLOWED_ROOTS` 限制可访问目录。
 - Codex app-server 协议仍是实验性能力。安装或升级 Codex CLI 后，请先运行 `chat2codex doctor`，再按 [Codex App-Server 防护检查](#codex-app-server-防护检查) 完成验证。
@@ -20,7 +20,7 @@ Chat2Codex 会把一个飞书/Lark 机器人变成本机 Codex CLI 的消息平�
 - Node.js `>= 20.12.0`。
 - npm，用于安装包。
 - 运行 Chat2Codex 的机器上已经安装并登录 Codex CLI。
-- 一个可以创建应用的飞书/Lark 账号，或一个已经启用机器人的飞书/Lark 应用。
+- 一个可以创建应用的飞书/Lark 账号，或已经获得 ClawBot 入口的个人微信账号。
 - 飞书/Lark 应用需要消息接收、消息发送、消息资源读取权限，消息事件的长连接订阅，以及 `card.action.trigger` 卡片回调。
 
 ### 安装并运行
@@ -36,6 +36,20 @@ chat2codex setup --workdir /absolute/path/to/your/repo
 ```
 
 setup 命令会在终端渲染二维码，并保留授权 URL 作为备用入口。用飞书/Lark 扫码，确认创建应用后，它会把 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`LARK_DOMAIN` 和扫码用户的 `open_id`（写入 `ALLOWED_USER_IDS`）保存到 `~/.chat2codex/.env`。如果你已经有应用，也可以运行 `chat2codex init --workdir /absolute/path/to/your/repo` 后手动编辑这份 env 文件；首次启动后可以发送 `/whoami` 获取需要加入允许列表的 id。
+
+如果要接入个人微信 ClawBot：
+
+```bash
+chat2codex setup weixin --workdir /absolute/path/to/your/repo
+```
+
+扫码流程支持等待确认、数字验证码、IDC 跳转和二维码过期刷新。成功后会写入
+`CHAT2CODEX_ADAPTER=weixin`、工作目录和扫码用户的稳定 iLink ID。Bot Token、
+Bot ID、API Base URL 和用户 ID 只保存在权限为 `0600` 的
+`~/.chat2codex/weixin/credentials.json`，不会写入 `.env`。该路径直接使用
+iLink HTTP 协议，不安装也不运行 OpenClaw。
+本机仍必须保持开机、联网且 Chat2Codex 服务正在运行；ClawBot 只是消息传输层，
+不会运行第二套 Agent 或额外模型。
 
 检查本地配置，然后启动桥接服务：
 
@@ -60,8 +74,9 @@ Summarize this repository.
 | 命令 | 作用 |
 | --- | --- |
 | `/help` | 显示适合手机查看的 Chat2Codex 常用命令指南。 |
-| `chat2codex` / `chat2codex start` | 启动飞书/Lark 桥接服务。 |
+| `chat2codex` / `chat2codex start` | 启动 `CHAT2CODEX_ADAPTER` 选择的平台。 |
 | `chat2codex setup --workdir <path>` | 创建/连接飞书/Lark 应用，并写入 `.env`。 |
+| `chat2codex setup weixin --workdir <path>` | 扫码连接微信 ClawBot，写入私有凭据和 `.env`。 |
 | `chat2codex init --workdir <path>` | 已有应用时，创建一份初始 `.env`。 |
 | `chat2codex doctor` | 检查 `.env`、Node.js、Codex CLI 与协议快照版本、工作目录和移动/群机器人安全提示。 |
 | `chat2codex smoke [--mode turn\|approval]` | 本地验证 Codex app-server 协议。 |
@@ -71,9 +86,9 @@ Summarize this repository.
 
 ## 功能
 
-- 飞书/Lark 长连接机器人，不需要公网 webhook 服务。
+- 支持飞书/Lark 长连接和原生微信 ClawBot 长轮询，都不需要公网 webhook 服务。
 - 每个 chat/thread scope 复用一个 Codex app-server 进程。只要发送者、cwd、thread、策略和 session epoch 不变，连续 turn 会保留同一进程以及 session 级授权。
-- 支持 `/help`、`/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/archive`、`/archived`、`/unarchive`、`/retry`、`/usage`、`/service status|logs|restart`、`/compact`、`/plan <任务>`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/answer`、`/mcp-answer`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
+- 支持 `/help`、`/status`、`/host`、`/projects`、`/project <index|path>`、`/threads`、`/history`、`/search`、`/resume`、`/fork`、`/archive`、`/archived`、`/unarchive`、`/retry`、`/usage`、`/service status|logs|restart`、`/compact`、`/plan <任务>`、`/new`、`/cd <path>`、`/stop`、`/steer`、`/answer`、`/mcp-answer`、`/approve`、`/permit`、`/mcp-decide`、`/summary`、`/files`、`/diff`、`/logs` 和 `/whoami` 命令。
 - 使用 JSON 保存本地状态。
 - 使用 Codex app-server JSON-RPC 获取机器可读的进度、最终输出和审批回调。
 - Codex 运行时会在原消息下添加“处理中”表情、限频发送普通文本进度，并在失败时添加失败表情；`/stop`、`/retry` 和本轮详情都使用普通文本命令。
@@ -81,6 +96,8 @@ Summarize this repository.
 - `/plan <任务>` 会只把当前一轮切换到 Codex Plan 模式，并支持结构化 `requestUserInput` 提问卡；自由输入可使用显式的 `/answer <回复码> <内容>`。选项会按原始请求在服务端重新校验；secret 问题会安全拒绝，不通过聊天记录收集凭据。下一条普通消息会显式恢复 Default 模式。
 - 支持标准 MCP form 和 URL elicitation，并渲染为绑定原发送者的卡片。类型化表单字段也可以使用 `/mcp-answer <回复码> <JSON 引号包裹的字段 ID> <内容>`；字段值会按原始 schema 校验，敏感字段则安全拒绝。
 - 支持 `item/permissions/requestApproval` 额外权限请求，并用卡片完整展示权限 profile。Chat2Codex 只提供拒绝、当前 turn 授权和当前 session 授权；任何授权都会返回 Codex 原始请求的 profile。
+- 在不支持卡片的平台，每个待处理请求会生成绑定同一会话和原发送者、结束即失效的 8 位回复码。`/approve <code> <编号>` 只能映射到原始 Codex decision 数组，`/permit <code> <deny|turn|session>` 只能映射到三种权限决定，`/mcp-decide <code> <accept|decline|cancel>` 用于 MCP URL 请求。
+- 微信首版只处理个人私聊，支持文本、引用、入站图片和文件；官方 CDN 附件会执行 AES-128-ECB 解密，“处理中”映射为正在输入。普通群聊、语音/视频、出站媒体和消息原地更新暂不支持，并会记录 dropped diagnostic。
 - 支持飞书/Lark 图片和文件消息，把附件下载为本地路径后随 prompt 传给 Codex。
 - 在日志和 `/status` 中记录近期消息路由/丢弃诊断信息。
 - `/status` 会显示队列深度、当前运行时长、审批等待时长和近期失败信息。
@@ -251,6 +268,9 @@ bun src/index.ts service install --env .env --project-dir . \
 | `/steer <补充指令>` | 立即把补充指令发送给当前 Codex 运行，绕过当前 chat 的普通任务队列。 |
 | `/answer <回复码> <内容>` | 回答当前非 secret 的 Codex `requestUserInput` 问题。回复码会显示在提问卡上；回答会立即绕过 chat 队列，且不会被桥接层持久化或回显。 |
 | `/mcp-answer <回复码> <JSON 引号包裹的字段 ID> <内容>` | 使用卡片上展示的精确命令回答当前非敏感 MCP 字段。`/skip` 会跳过可选字段；如果实际字符串就是 `/skip`，请把值写成 `"/skip"`。类型化字段值会按原始 schema 校验；回答会立即绕过 chat 队列，且不会被桥接层持久化或回显。 |
+| `/approve <回复码> <选项编号>` | 在纯文本平台处理 Codex 命令/文件审批；编号只映射到原始 decision 数组。 |
+| `/permit <回复码> <deny\|turn\|session>` | 拒绝额外权限，或仅为当前 turn / 当前 session 授权。 |
+| `/mcp-decide <回复码> <accept\|decline\|cancel>` | 在纯文本平台处理 MCP URL 请求。 |
 | `/summary` | 查看当前 chat 最近一轮运行摘要。 |
 | `/files` | 查看最近一轮变更文件。 |
 | `/diff` | 查看最近一轮捕获到的 diff。 |
@@ -308,5 +328,5 @@ bun run check
 
 ## 后续功能
 
-1. 使用 adapter 契约交付第二个生产 adapter，且不修改核心 Router/Runner 业务。
+1. 完成微信出站媒体、更多消息类型与受控群聊能力的安全设计和验收。
 2. 对进程级凭据与 SDK 隔离有要求时，可选把 adapter 移到外部 gateway 后面。

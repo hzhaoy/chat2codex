@@ -135,6 +135,15 @@ Expected behavior:
 - The completed card shows run details, and `/summary`, `/files`, `/diff`, and
   `/logs` return the latest captured run data when available.
 
+## Live Weixin Debug Checklist
+
+Automated protocol tests do not replace a real ClawBot acceptance pass. With a
+Weixin account that has the ClawBot entry enabled, run
+`chat2codex setup weixin`, then verify a text task, an image task, a file task,
+`/approve`, `/permit`, `/mcp-decide`, `/stop`, and restart recovery. Confirm
+that group and voice/video messages are dropped, typing is cancelled at the
+end of a run, and the same task is not executed twice after a delivery retry.
+
 ## Local Validation
 
 Run targeted tests while developing:

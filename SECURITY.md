@@ -11,8 +11,8 @@ upgrade before reporting or validating a suspected vulnerability.
 
 | Version | Supported |
 | --- | --- |
-| `0.6.x` | Yes |
-| `<= 0.5.x` | No |
+| `0.7.x` | Yes |
+| `<= 0.6.x` | No |
 
 ## Reporting a Vulnerability
 
@@ -20,7 +20,7 @@ Open a private report through GitHub's security advisory flow if it is enabled
 for the repository. If that is not available yet, open an issue with a minimal
 description and ask for a private contact path before sharing exploit details.
 
-Do not include real Feishu/Lark credentials, Codex tokens, chat ids, local
+Do not include real Feishu/Lark or Weixin credentials, Codex tokens, chat ids, local
 paths, screenshots of private chats, or attached documents in public reports.
 
 ## Deployment Guidance
@@ -42,6 +42,13 @@ paths, screenshots of private chats, or attached documents in public reports.
 - Use `CODEX_SANDBOX=read-only` for Q&A-only bots and avoid
   `danger-full-access` in shared chats.
 - Rotate `FEISHU_APP_SECRET` if `.env` or a service log may have been shared.
+- Keep Weixin `credentials.json` and `runtime.json` private. The Bot Token,
+  attachment AES keys, and context tokens must never be copied into `.env`,
+  logs, issues, or chat transcripts. Rerun the QR binding after suspected
+  credential exposure.
+- Weixin v1 is a personal direct-message adapter. Keep `ALLOW_GROUPS=false`;
+  ordinary groups, voice/video input, outbound media, and in-place updates are
+  intentionally rejected.
 - Platform credentials are removed from the environment passed to Codex child
   processes. Keep unrelated secrets out of the bridge service environment too.
 - After installing or upgrading Codex CLI, run `chat2codex doctor`. An exact
