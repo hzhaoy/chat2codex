@@ -1,7 +1,7 @@
 {
   "name": "chat2codex",
-  "version": "0.7.0",
-  "description": "Run local Codex from chat through isolated platform adapters.",
+  "version": "0.8.0",
+  "description": "Run local Codex from Feishu/Lark or Weixin chat.",
   "type": "module",
   "main": "./dist/index.js",
   "packageManager": "bun@1.3.9",

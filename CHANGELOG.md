@@ -7,6 +7,8 @@ numbers once releases are published.
 
 ## Unreleased
 
+## 0.8.0 - 2026-07-29
+
 ### Added
 
 - Native personal-Weixin ClawBot adapter using the iLink HTTP protocol, QR
