@@ -1369,8 +1369,8 @@ describe("MessageRouter access control", () => {
         sender: { openId: "ou_user" },
         text: "/status",
       });
-      expect(sender.messages.at(-1)?.text).toContain("queue_depth: 1");
-      expect(sender.messages.at(-1)?.text).toContain("state=waiting_for_workspace");
+      expect(sender.messages.at(-1)?.text).toContain("• 队列：1");
+      expect(sender.messages.at(-1)?.text).toContain("• 当前任务：等待执行");
 
       await router.enqueue({
         messageId: "m_workspace_stop",
@@ -1543,7 +1543,7 @@ describe("MessageRouter access control", () => {
           sender: { openId: "ou_user" },
           text: "/status",
         });
-        expect(sender.messages.at(-1)?.text).toContain("state=waiting_for_global_capacity");
+        expect(sender.messages.at(-1)?.text).toContain("• 当前任务：等待执行");
 
         codex.complete(0, "thread_global_limit_1");
         await waitFor(() => codex.runs.length === 2);
@@ -1598,7 +1598,9 @@ describe("MessageRouter access control", () => {
           sender: { openId: "ou_user" },
           text: "/status",
         });
-        await waitFor(() => sender.messages.some((message) => message.text.includes("active_run:")));
+        await waitFor(() =>
+          sender.messages.some((message) => message.text.includes("• 当前任务：运行中")),
+        );
 
         const store = new JsonStateStore(config.bridgeStatePath);
         const state = await store.load();
@@ -2481,11 +2483,9 @@ describe("MessageRouter access control", () => {
 
       expect(codex.runs).toHaveLength(0);
       expect(sender.messages).toHaveLength(1);
-      expect(sender.messages[0]?.text).toContain("chat_id: oc_group");
-      expect(sender.messages[0]?.text).not.toContain("sender.open_id:");
-      expect(sender.messages[0]?.text).not.toContain("sender.user_id:");
-      expect(sender.messages[0]?.text).not.toContain("sender.union_id:");
-      expect(sender.messages[0]?.text).toContain("access: denied (groups_disabled)");
+      expect(sender.messages[0]?.text).toContain("chat_id：oc_group");
+      expect(sender.messages[0]?.text).not.toContain("【发送者】");
+      expect(sender.messages[0]?.text).toContain("未授权（groups_disabled）");
     });
   });
 
@@ -2501,9 +2501,10 @@ describe("MessageRouter access control", () => {
 
       expect(codex.runs).toHaveLength(0);
       expect(sender.messages).toHaveLength(1);
-      expect(sender.messages[0]?.text).toContain("sender.open_id: ou_user");
-      expect(sender.messages[0]?.text).toContain("sender.user_id: u_user");
-      expect(sender.messages[0]?.text).toContain("sender.union_id: on_user");
+      expect(sender.messages[0]?.text).toContain("open_id：ou_user");
+      expect(sender.messages[0]?.text).toContain("user_id：u_user");
+      expect(sender.messages[0]?.text).toContain("union_id：on_user");
+      expect(sender.messages[0]?.text).toContain("【访问权限】\n• 已授权");
     });
   });
 
@@ -2519,8 +2520,8 @@ describe("MessageRouter access control", () => {
 
       expect(codex.runs).toHaveLength(0);
       expect(sender.messages).toHaveLength(1);
-      expect(sender.messages[0]?.text).toContain("chat_id: oc_group");
-      expect(sender.messages[0]?.text).toContain("access: denied (groups_disabled)");
+      expect(sender.messages[0]?.text).toContain("chat_id：oc_group");
+      expect(sender.messages[0]?.text).toContain("未授权（groups_disabled）");
     });
   });
 
@@ -2547,15 +2548,16 @@ describe("MessageRouter access control", () => {
         text: "/status",
       });
 
-      expect(sender.messages[0]?.text).toContain("attachment_dir:");
-      expect(sender.messages[0]?.text).toContain("last_event:");
-      expect(sender.messages[0]?.text).toContain("type=audio");
-      expect(sender.messages[0]?.text).toContain("reason=unsupported_message_type");
-      expect(sender.messages[0]?.text).toContain("last_dropped:");
-      expect(sender.messages[0]?.text).toContain("queue_depth: 0");
-      expect(sender.messages[0]?.text).toContain("active_run: (none)");
-      expect(sender.messages[0]?.text).toContain("approval_wait: (none)");
-      expect(sender.messages[0]?.text).toContain("recent_failures: (none)");
+      expect(sender.messages[0]?.text).toContain("【诊断】");
+      expect(sender.messages[0]?.text).toContain("附件目录：");
+      expect(sender.messages[0]?.text).toContain("最近消息：已丢弃");
+      expect(sender.messages[0]?.text).toContain("类型 audio");
+      expect(sender.messages[0]?.text).toContain("原因 unsupported_message_type");
+      expect(sender.messages[0]?.text).toContain("最近丢弃：已丢弃");
+      expect(sender.messages[0]?.text).toContain("• 队列：0");
+      expect(sender.messages[0]?.text).toContain("• 当前任务：无");
+      expect(sender.messages[0]?.text).toContain("• 命令审批：无");
+      expect(sender.messages[0]?.text).toContain("• 最近失败：无");
     });
   });
 
@@ -2680,9 +2682,9 @@ describe("MessageRouter access control", () => {
       });
 
       const status = sender.messages.at(-1)?.text ?? "";
-      expect(status).toContain("queue_depth: 1");
-      expect(status).toContain("active_run: age=");
-      expect(status).toContain('prompt="long running task"');
+      expect(status).toContain("• 队列：1");
+      expect(status).toContain("• 当前任务：运行中");
+      expect(status).not.toContain("long running task");
 
       await router.enqueue({
         messageId: "m_stop",
@@ -5268,10 +5270,8 @@ describe("MessageRouter access control", () => {
       });
 
       const status = sender.messages.at(-1)?.text ?? "";
-      expect(status).toContain("approval_wait: count=1");
-      expect(status).toContain("type=commandExecution");
-      expect(status).toContain("decisions=3");
-      expect(status).toContain('command="rm -rf build"');
+      expect(status).toContain("• 命令审批：1 条待处理");
+      expect(status).not.toContain("rm -rf build");
 
       await router.handleCardAction({
         action: "resolve_approval",

@@ -1316,6 +1316,12 @@ export class BridgeRunner {
     }
     const reportProgress = this.createProgressReporter(chatId, controller.signal, runState);
     this.activeRuns.set(chatId, runState);
+    this.logger.info("Codex run started", {
+      chatId,
+      cwd: session.cwd,
+      threadId: session.threadId ?? "(new)",
+      collaborationMode: queuedRun.collaborationMode,
+    });
     try {
       const codexRunTask = this.codex.run({
         prompt,
@@ -1453,6 +1459,13 @@ export class BridgeRunner {
       const completedAt = new Date().toISOString();
 
       if (result.exitCode !== 0) {
+        this.logger.warn("Codex run completed with failure", {
+          chatId,
+          cwd: session.cwd,
+          exitCode: result.exitCode,
+          signal: result.signal ?? null,
+          durationMs: Date.now() - startedAtMs,
+        });
         const lastRun = buildLastRunSummary({
           status: "failed",
           cwd: session.cwd,
@@ -1511,6 +1524,12 @@ export class BridgeRunner {
         completedAt,
         summary: result.summary,
         finalText: result.finalText,
+      });
+      this.logger.info("Codex run completed", {
+        chatId,
+        cwd: session.cwd,
+        threadId: resultThreadId ?? "(none)",
+        durationMs: Date.now() - startedAtMs,
       });
       const chatOutput = truncateChatOutput(result.finalText, this.config.chatOutputMaxChars);
       const durable = await this.persistRunTerminal({
@@ -2302,29 +2321,61 @@ export class BridgeRunner {
   private async sendStatus(chatId: string): Promise<void> {
     const state = this.requireState();
     const session = state.chats[chatId];
-    if (!session) {
-      await this.sender.sendText(
-        chatId,
-        [
-          "当前 chat 还没有 Codex session。",
-          `默认 cwd: ${this.config.codexWorkdir}`,
-          ...this.formatRuntimeStatusLines(chatId, state),
-          ...this.formatDiagnosticStatusLines(chatId, state),
-        ].join("\n"),
-      );
-      return;
-    }
-
+    const queuedRun = this.queuedRuns.get(chatId);
+    const activeRun = this.activeRuns.get(chatId);
+    const diagnostics = diagnosticsForChat(state, chatId);
+    const approvals = [...this.activeApprovals.values()].filter(
+      (approval) => approval.chatId === chatId,
+    );
+    const interactionCounts = {
+      userInput: [...this.activeUserInputs.values()].filter(
+        (request) => request.chatId === chatId,
+      ).length,
+      permission: [...this.activePermissionApprovals.values()].filter(
+        (request) => request.chatId === chatId,
+      ).length,
+      mcp: [...this.activeMcpElicitations.values()].filter(
+        (request) => request.chatId === chatId,
+      ).length,
+    };
+    const latestFailure = diagnostics.recentFailures?.at(-1);
+    const lastEvent = diagnostics.lastEvent;
+    const lastDropped = diagnostics.lastDroppedEvent;
     await this.sender.sendText(
       chatId,
       [
-        "当前 chat 状态：",
-        `cwd: ${session.cwd}`,
-        `thread: ${session.threadId ?? "(未创建)"}`,
-        `updated: ${session.updatedAt}`,
-        ...this.formatRuntimeStatusLines(chatId, state),
-        ...this.formatDiagnosticStatusLines(chatId, state),
-      ].join("\n"),
+        "Chat2Codex 状态",
+        "",
+        "【会话】",
+        `• 当前 chat：${session ? "已建立" : "尚未创建 Codex 会话"}`,
+        `• 工作目录：${session?.cwd ?? this.config.codexWorkdir}`,
+        session ? `• Thread：${session.threadId ?? "尚未创建"}` : null,
+        session ? `• 最近更新：${formatLocalMinute(new Date(session.updatedAt))}` : null,
+        "",
+        "【运行】",
+        `• 队列：${(this.queueDepths.get(chatId) ?? 0) + (queuedRun ? 1 : 0)}`,
+        `• 当前任务：${
+          activeRun
+            ? `运行中（${formatDuration(Date.now() - activeRun.startedAtMs)}）`
+            : queuedRun
+              ? "等待执行"
+              : "无"
+        }`,
+        `• 命令审批：${approvals.length > 0 ? `${approvals.length} 条待处理` : "无"}`,
+        `• 其他交互：输入 ${interactionCounts.userInput}｜权限 ${interactionCounts.permission}｜MCP ${interactionCounts.mcp}`,
+        "",
+        "【安全配置】",
+        `• 审批策略：${this.config.codexApprovalPolicy}`,
+        `• Sandbox：${this.config.codexSandbox}`,
+        "",
+        "【诊断】",
+        `• 附件目录：${this.config.attachmentDownloadDir}`,
+        `• 最近消息：${formatReadableEventDiagnostic(lastEvent)}`,
+        `• 最近丢弃：${formatReadableEventDiagnostic(lastDropped)}`,
+        latestFailure
+          ? `• 最近失败：${latestFailure.category} · ${latestFailure.detail}`
+          : "• 最近失败：无",
+      ].filter((line): line is string => line !== null).join("\n"),
     );
   }
 
@@ -5437,19 +5488,23 @@ export class BridgeRunner {
     const senderLines =
       message.chatType === "direct"
         ? [
-            `sender.open_id: ${message.sender.openId ?? "(unknown)"}`,
-            ...(message.sender.userId ? [`sender.user_id: ${message.sender.userId}`] : []),
-            `sender.union_id: ${message.sender.unionId ?? "(unknown)"}`,
+            ...(message.sender.openId ? [`• open_id：${message.sender.openId}`] : []),
+            ...(message.sender.userId ? [`• user_id：${message.sender.userId}`] : []),
+            ...(message.sender.unionId ? [`• union_id：${message.sender.unionId}`] : []),
           ]
         : [];
     await this.sender.sendText(
       message.chatId,
       [
-        "Chat2Codex 当前会话信息：",
-        `chat_id: ${message.chatId}`,
-        `chat_type: ${message.chatType}`,
-        ...senderLines,
-        `access: ${decision.allowed ? "allowed" : `denied (${decision.reason ?? "unknown"})`}`,
+        "Chat2Codex 当前身份",
+        "",
+        "【会话】",
+        `• chat_id：${message.chatId}`,
+        `• chat_type：${message.chatType === "direct" ? "direct（私聊）" : "group（群聊）"}`,
+        ...(senderLines.length > 0 ? ["", "【发送者】", ...senderLines] : []),
+        "",
+        "【访问权限】",
+        `• ${decision.allowed ? "已授权" : `未授权（${decision.reason ?? "unknown"}）`}`,
       ].join("\n"),
     );
   }
@@ -7641,6 +7696,24 @@ function formatEventDiagnostic(diagnostic: EventDiagnosticSnapshot | undefined):
     parts.push(`message=${diagnostic.messageId}`);
   }
   return parts.join(" ");
+}
+
+function formatReadableEventDiagnostic(
+  diagnostic: EventDiagnosticSnapshot | undefined,
+): string {
+  if (!diagnostic) {
+    return "无";
+  }
+  return [
+    diagnostic.outcome === "routed" ? "已路由" : "已丢弃",
+    formatLocalMinute(new Date(diagnostic.at)),
+    diagnostic.messageId ? `消息 ${diagnostic.messageId}` : null,
+    diagnostic.messageType ? `类型 ${diagnostic.messageType}` : null,
+    diagnostic.attachmentCount > 0 ? `附件 ${diagnostic.attachmentCount}` : null,
+    diagnostic.reason ? `原因 ${diagnostic.reason}` : null,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
 }
 
 function formatActiveRun(run: ActiveRunState | undefined): string {

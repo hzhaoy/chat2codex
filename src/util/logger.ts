@@ -77,8 +77,8 @@ export class ConsoleLogger implements Logger {
     const prefix = `[${new Date().toISOString()}] ${level.toUpperCase()} ${message}`;
     const rendered = data === undefined ? prefix : `${prefix} ${formatLogData(data)}`;
     const line = truncateUtf8(rendered, this.maxEntryBytes);
+    console.error(line);
     if (!this.fileSink) {
-      console.error(line);
       return;
     }
     try {

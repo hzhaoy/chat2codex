@@ -53,6 +53,7 @@ interface InitOptions {
 
 interface EnvBackedOptions {
   envFile: string;
+  envFileExplicit: boolean;
   help: boolean;
 }
 
@@ -163,10 +164,10 @@ Options:
     return;
   }
 
-  loadRuntimeEnv(options.envFile);
+  loadRuntimeEnv(options.envFile, options.envFileExplicit);
   const config = loadConfig(process.env);
   const logger = new ConsoleLogger(config.logLevel, {
-    filePath: process.env.CHAT2CODEX_LOG_FILE,
+    filePath: config.logFilePath,
     maxEntryBytes: config.logEntryMaxBytes,
     maxFileBytes: config.logFileMaxBytes,
     maxFiles: config.logFileMaxFiles,
@@ -414,7 +415,7 @@ Options:
     status: envExists ? "ok" : "error",
     detail: envExists ? envPath : "missing; run chat2codex setup or chat2codex init",
   });
-  loadRuntimeEnv(envPath);
+  loadRuntimeEnv(envPath, options.envFileExplicit);
 
   let config: ReturnType<typeof loadConfig> | null = null;
   try {
@@ -547,7 +548,11 @@ function parseInitArgs(args: string[]): InitOptions {
 }
 
 function parseEnvBackedArgs(args: string[], command: string): EnvBackedOptions {
-  const options: EnvBackedOptions = { envFile: defaultEnvPath(), help: false };
+  const options: EnvBackedOptions = {
+    envFile: defaultEnvPath(),
+    envFileExplicit: false,
+    help: false,
+  };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "-h" || arg === "--help") {
@@ -556,6 +561,7 @@ function parseEnvBackedArgs(args: string[], command: string): EnvBackedOptions {
     }
     if (arg === "--env" || arg === "--env-file") {
       options.envFile = requireValue(args, ++index, arg);
+      options.envFileExplicit = true;
       continue;
     }
     throw new Error(`Unknown ${command} argument: ${arg}`);
@@ -595,8 +601,8 @@ async function readEnvExample(): Promise<string> {
   throw new Error("Could not find .env.example in the current directory or package.");
 }
 
-function loadRuntimeEnv(envFile: string): void {
-  loadDotenv({ path: envFile, override: false, quiet: true });
+function loadRuntimeEnv(envFile: string, override = false): void {
+  loadDotenv({ path: envFile, override, quiet: true });
   process.env.CHAT2CODEX_HOME ??= defaultChat2CodexHome();
 }
 

@@ -51,6 +51,28 @@ describe("bounded logger", () => {
     }
   });
 
+  test("keeps foreground terminal logs visible when a file sink is configured", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat2codex-logger-tee-"));
+    const logPath = path.join(tempDir, "chat2codex.log");
+    const originalError = console.error;
+    const terminal: string[] = [];
+    try {
+      console.error = (line?: unknown) => {
+        terminal.push(String(line ?? ""));
+      };
+      const logger = new ConsoleLogger("info", { filePath: logPath });
+
+      logger.info("adapter ready", { adapterId: "weixin:test-bot" });
+
+      expect(terminal.join("\n")).toContain("adapter ready");
+      expect(terminal.join("\n")).toContain("weixin:test-bot");
+      expect(await fs.readFile(logPath, "utf8")).toContain("adapter ready");
+    } finally {
+      console.error = originalError;
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("keeps only the active file when maxFiles is one", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat2codex-logger-one-"));
     const logPath = path.join(tempDir, "chat2codex.log");

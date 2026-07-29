@@ -278,6 +278,99 @@ describe("CLI", () => {
     }
   });
 
+  test("doctor treats an explicit env file as authoritative over preloaded values", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat2codex-explicit-env-"));
+    const workdir = path.join(tempDir, "workspace");
+    const stateDir = path.join(tempDir, "state");
+    const attachmentDir = path.join(tempDir, "attachments");
+    const credentialsPath = path.join(tempDir, "credentials.json");
+    const envFile = path.join(tempDir, "weixin.env");
+    const fakeCodex = path.join(tempDir, "codex");
+    const scanningUserId = "wx_scanning_user@im.wechat";
+    const output: string[] = [];
+    const envKeys = [
+      "CHAT2CODEX_ADAPTER",
+      "FEISHU_APP_ID",
+      "FEISHU_APP_SECRET",
+      "WEIXIN_CREDENTIALS_PATH",
+      "CODEX_BIN",
+      "CODEX_WORKDIR",
+      "ALLOW_DIRECT_MESSAGES",
+      "ALLOW_GROUPS",
+      "ALLOWED_CHAT_IDS",
+      "ALLOWED_USER_IDS",
+      "ATTACHMENT_DOWNLOAD_DIR",
+      "BRIDGE_STATE_PATH",
+    ];
+    const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+    const previousExitCode = process.exitCode;
+    try {
+      await fs.mkdir(workdir);
+      await fs.mkdir(stateDir);
+      await fs.mkdir(attachmentDir);
+      await fs.writeFile(fakeCodex, "#!/bin/sh\nprintf 'codex-cli 0.144.5\\n'\n");
+      await fs.chmod(fakeCodex, 0o755);
+      await fs.writeFile(
+        credentialsPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          accountId: "test-bot@im.bot",
+          token: "test-token",
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          userId: scanningUserId,
+          savedAt: new Date(0).toISOString(),
+        }),
+      );
+      await fs.writeFile(
+        envFile,
+        [
+          "CHAT2CODEX_ADAPTER=weixin",
+          `WEIXIN_CREDENTIALS_PATH=${credentialsPath}`,
+          `CODEX_BIN=${fakeCodex}`,
+          `CODEX_WORKDIR=${workdir}`,
+          "ALLOW_DIRECT_MESSAGES=true",
+          "ALLOW_GROUPS=false",
+          "ALLOWED_CHAT_IDS=",
+          `ALLOWED_USER_IDS=${scanningUserId}`,
+          `ATTACHMENT_DOWNLOAD_DIR=${attachmentDir}`,
+          `BRIDGE_STATE_PATH=${path.join(stateDir, "state.json")}`,
+        ].join("\n"),
+      );
+
+      process.env.CHAT2CODEX_ADAPTER = "feishu";
+      process.env.FEISHU_APP_ID = "preloaded_feishu_app";
+      process.env.FEISHU_APP_SECRET = "preloaded_feishu_secret";
+      process.env.WEIXIN_CREDENTIALS_PATH = path.join(tempDir, "wrong-credentials.json");
+      process.env.CODEX_BIN = fakeCodex;
+      process.env.CODEX_WORKDIR = originalCwd;
+      process.env.ALLOW_DIRECT_MESSAGES = "true";
+      process.env.ALLOW_GROUPS = "true";
+      process.env.ALLOWED_CHAT_IDS = "preloaded-chat";
+      process.env.ALLOWED_USER_IDS = "preloaded-user";
+      process.env.ATTACHMENT_DOWNLOAD_DIR = originalCwd;
+      process.env.BRIDGE_STATE_PATH = path.join(originalCwd, ".data", "state.json");
+      console.log = (line?: unknown) => {
+        output.push(String(line ?? ""));
+      };
+      process.exitCode = undefined;
+
+      await runCli(["doctor", "--env", envFile]);
+
+      const text = output.join("\n");
+      expect(text).toContain(`CODEX_WORKDIR - ${workdir}`);
+      expect(text).toContain(`state directory - ${stateDir}`);
+      expect(text).toContain("Weixin private-chat boundary");
+      expect(text).not.toContain("credential userId is missing");
+      expect(process.exitCode).toBeUndefined();
+    } finally {
+      process.exitCode = previousExitCode;
+      for (const key of envKeys) {
+        setOptionalEnv(key, previousEnv.get(key));
+      }
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("doctor accepts the exact Codex version recorded by the bundled protocol manifest", async () => {
     const manifest = JSON.parse(
       await fs.readFile(
