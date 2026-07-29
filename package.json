@@ -11,6 +11,7 @@
   "files": [
     ".env.example",
     "README.zh-CN.md",
+    "THIRD_PARTY_NOTICES.md",
     "dist",
     "docs/architecture.md",
     "docs/codex-app-server-protocol"
@@ -19,6 +20,7 @@
     "codex",
     "feishu",
     "lark",
+    "weixin",
     "chatops",
     "bot"
   ],

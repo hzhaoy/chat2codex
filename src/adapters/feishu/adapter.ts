@@ -5,16 +5,11 @@ import { Readable } from "node:stream";
 
 import * as lark from "@larksuiteoapi/node-sdk";
 
-import { CodexRunner } from "../../agent/codex-runner.js";
 import type { BridgeConfig } from "../../config/env.js";
-import { MessageRouter } from "../../core/message-router.js";
 import type {
   ChatAdapter,
-  InboundEvent,
   MessageReaction,
 } from "../../core/contracts.js";
-import { JsonStateStore } from "../../state/store.js";
-import { AdapterSupervisor } from "../../runtime/adapter-supervisor.js";
 import type { Logger } from "../../util/logger.js";
 import {
   adaptLarkTextEvent,
@@ -44,10 +39,8 @@ import {
 } from "./card.js";
 import type { ChatView } from "../../core/view-models.js";
 import { buildMarkdownPost } from "./post.js";
-import { feishuInteractionPolicy } from "./interaction-policy.js";
 import {
   type ChatDeliveryOptions,
-  type DownloadedAttachment,
   type IncomingAttachment,
   type StatusCardHandle,
 } from "../../core/message-router.js";
@@ -75,15 +68,14 @@ interface BridgeMessageRouter {
   dispose(): void | Promise<void>;
 }
 
-export interface BridgeRuntime {
+interface LegacyBridgeRuntime {
   dispose(): Promise<void>;
 }
 
-export async function runBridge(
+export function createFeishuAdapter(
   config: BridgeConfig,
   logger: Logger,
-  requestRestart?: () => void,
-): Promise<BridgeRuntime> {
+): ChatAdapter {
   const domain = config.larkDomain === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
   const client = new lark.Client({
     appId: config.feishuAppId,
@@ -526,221 +518,13 @@ export async function runBridge(
       };
     },
   };
-  const supervisor = new AdapterSupervisor([adapter], logger);
-  let markSupervisorReady!: () => void;
-  const supervisorReady = new Promise<void>((resolve) => {
-    markSupervisorReady = resolve;
-  });
-  const target = (chatId: string) => ({ adapterId, conversationId: chatId });
-  const requireDelivered = async (result: Awaited<ReturnType<AdapterSupervisor["sendView"]>>) => {
-    if (result.status === "unsupported") {
-      throw new Error(result.reason);
-    }
-    return result;
-  };
-  const sendCoreView = async (chatId: string, view: ChatView, options?: ChatDeliveryOptions) => {
-    await supervisorReady;
-    return requireDelivered(await supervisor.sendView(target(chatId), view, options));
-  };
-  const createCoreView = async (chatId: string, view: ChatView): Promise<StatusCardHandle> => {
-    const result = await sendCoreView(chatId, view);
-    if (!result.handle) {
-      throw new Error(`Adapter ${adapterId} did not return a view handle.`);
-    }
-    return result.handle;
-  };
-  const updateCoreView = async (handle: StatusCardHandle, view: ChatView): Promise<void> => {
-    await supervisorReady;
-    await requireDelivered(await supervisor.updateView({
-      adapterId: handle.adapterId ?? adapterId,
-      conversationId: handle.conversationId ?? "",
-      messageId: handle.messageId,
-    }, view));
-  };
-  const sender: import("../../core/message-router.js").ChatSender = {
-    async sendText(chatId, text, options) {
-      await sendCoreView(chatId, { kind: "text", text }, options);
-    },
-    async sendMarkdown(chatId, markdown, options) {
-      await sendCoreView(chatId, { kind: "markdown", markdown }, options);
-    },
-    async sendView(chatId, view) {
-      await sendCoreView(chatId, view);
-    },
-    async addReaction(chatId, messageId, reaction) {
-      await supervisorReady;
-      const result = await supervisor.addReaction(
-        {
-          adapterId,
-          conversationId: chatId,
-          messageId,
-        },
-        reaction,
-      );
-      if (result.status === "unsupported") {
-        logger.debug("Message reaction is unsupported", {
-          adapterId,
-          reaction,
-          reason: result.reason,
-        });
-        return null;
-      }
-      return result.handle;
-    },
-    async removeReaction(handle) {
-      await supervisorReady;
-      const result = await supervisor.removeReaction(handle);
-      if (result.status === "unsupported") {
-        logger.debug("Message reaction removal is unsupported", {
-          adapterId: handle.adapterId,
-          reaction: handle.reaction,
-          reason: result.reason,
-        });
-      }
-    },
-    async downloadAttachment(message, attachment): Promise<DownloadedAttachment> {
-      await supervisorReady;
-      const stream = await supervisor.openAttachment({
-        message: {
-          adapterId,
-          conversationId: message.chatId,
-          messageId: message.messageId,
-        },
-        attachmentId: attachment.key,
-        kind: attachment.kind,
-        name: attachment.name,
-      });
-      const directory = path.join(
-        config.attachmentDownloadDir,
-        sanitizeMessageDirectoryName(message.messageId),
-      );
-      const downloadRoot = await ensurePrivateDirectory(config.attachmentDownloadDir);
-      const resolvedDirectory = await ensurePrivateDirectory(directory);
-      assertPathInside(downloadRoot, resolvedDirectory);
-      const fileName = buildAttachmentFileName(
-        { ...attachment, name: stream.name ?? attachment.name },
-        {},
-      );
-      const filePath = path.join(resolvedDirectory, fileName);
-      await writeAttachmentResponseAtomically(
-        {
-          headers: {},
-          getReadableStream: () => Readable.from(stream.chunks),
-        },
-        downloadRoot,
-        filePath,
-        config.attachmentMaxFileBytes,
-      );
-      return { kind: attachment.kind, name: attachment.name ?? fileName, path: filePath };
-    },
-    createStatusCard: (chatId, input) => createCoreView(chatId, { kind: "run_status", input }),
-    updateStatusCard: (handle, input) => updateCoreView(handle, { kind: "run_status", input }),
-    createApprovalCard: (chatId, input) => createCoreView(chatId, { kind: "approval", input }),
-    updateApprovalCard: (handle, input) => updateCoreView(handle, { kind: "approval", input }),
-    createUserInputCard: (chatId, input) => createCoreView(chatId, { kind: "user_input", input }),
-    updateUserInputCard: (handle, input) => updateCoreView(handle, { kind: "user_input", input }),
-    createPermissionApprovalCard: (chatId, input) =>
-      createCoreView(chatId, { kind: "permission_approval", input }),
-    updatePermissionApprovalCard: (handle, input) =>
-      updateCoreView(handle, { kind: "permission_approval", input }),
-    createMcpElicitationCard: (chatId, input) =>
-      createCoreView(chatId, { kind: "mcp_elicitation", input }),
-    updateMcpElicitationCard: (handle, input) =>
-      updateCoreView(handle, { kind: "mcp_elicitation", input }),
-  };
-  const router = new MessageRouter(
-    config,
-    new JsonStateStore(config.bridgeStatePath, {
-      adapterId,
-      jobRetentionCount: config.jobRetentionCount,
-      outboxRetentionCount: config.outboxRetentionCount,
-    }),
-    sender,
-    logger,
-    new CodexRunner(config, logger),
-    feishuInteractionPolicy,
-    { requestRestart },
-  );
-  try {
-    await router.start();
-    await supervisor.start((event) => routeInboundEvent(router, event));
-    markSupervisorReady();
-    return createSupervisorBridgeRuntime(supervisor, router);
-  } catch (error) {
-    markSupervisorReady();
-    try {
-      await createSupervisorBridgeRuntime(supervisor, router).dispose();
-    } catch (disposeError) {
-      logger.error("Failed to clean up the bridge after startup failed", disposeError);
-    }
-    throw error;
-  }
-}
-
-async function routeInboundEvent(
-  router: MessageRouter,
-  event: InboundEvent,
-) {
-  if (event.kind === "diagnostic") {
-    await router.recordEventDiagnostic(event.outcome, {
-      reason: event.reason,
-      messageId: event.messageId,
-      chatId: event.conversationId,
-      chatType: event.conversationKind,
-      messageType: event.payloadKind,
-      mentionCount: event.mentionCount,
-      startsWithMention: event.startsWithMention,
-      attachmentCount: event.attachmentCount,
-      textLength: event.textLength,
-      botIdentityResolved: event.botIdentityResolved,
-    });
-    return;
-  }
-  if (event.kind === "action") {
-    return router.handleCardAction(event.action);
-  }
-  await router.accept({
-    messageId: event.ref.messageId,
-    chatId: event.conversation.conversationId,
-    chatType: event.conversation.kind,
-    sender: event.sender,
-    text: event.text,
-    attachments: event.attachments.map((attachment) => ({
-      kind: attachment.kind,
-      key: attachment.attachmentId,
-      name: attachment.name,
-    })),
-  });
-}
-
-function createSupervisorBridgeRuntime(
-  supervisor: AdapterSupervisor,
-  router: BridgeMessageRouter,
-): BridgeRuntime {
-  let disposePromise: Promise<void> | undefined;
-  return {
-    dispose() {
-      disposePromise ??= disposeSupervisorBridgeRuntime(supervisor, router);
-      return disposePromise;
-    },
-  };
-}
-
-async function disposeSupervisorBridgeRuntime(
-  supervisor: AdapterSupervisor,
-  router: BridgeMessageRouter,
-): Promise<void> {
-  const results = await Promise.allSettled([supervisor.stop(), router.dispose()]);
-  const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
-  if (errors.length) {
-    throw new AggregateError(errors, "Failed to dispose the adapter runtime cleanly.");
-  }
+  return adapter;
 }
 
 function createBridgeRuntime(
   wsClient: BridgeWebSocketClient | undefined,
   router: BridgeMessageRouter,
-): BridgeRuntime {
+): LegacyBridgeRuntime {
   let disposePromise: Promise<void> | undefined;
   return {
     dispose() {

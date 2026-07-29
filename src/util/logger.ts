@@ -30,7 +30,7 @@ const defaultMaxFileBytes = 10 * 1024 * 1024;
 const defaultMaxFiles = 3;
 const truncationMarker = "[truncated]";
 const sensitiveFieldPattern =
-  /(authorization|cookie|credential|password|prompt|secret|token)/iu;
+  /(aes.?key|authorization|cookie|credential|encryption.?key|password|prompt|secret|token)/iu;
 
 export class ConsoleLogger implements Logger {
   private readonly fileSink: RotatingFileSink | undefined;

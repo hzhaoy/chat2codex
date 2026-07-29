@@ -1,4 +1,3 @@
-import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -6,6 +5,11 @@ import * as lark from "@larksuiteoapi/node-sdk";
 import qrcode from "qrcode-terminal";
 
 import { defaultEnvPath } from "../config/paths.js";
+import {
+  mergeCsvValue,
+  readExistingEnvValue,
+  updateEnvFile,
+} from "./env-file.js";
 
 type LarkDomain = "feishu" | "lark";
 
@@ -84,6 +88,7 @@ export async function runFeishuSetup(argv: string[] = []): Promise<void> {
 
     const domain = normalizeTenantBrand(result.user_info?.tenant_brand);
     const updates: Record<string, string> = {
+      CHAT2CODEX_ADAPTER: "feishu",
       FEISHU_APP_ID: result.client_id,
       FEISHU_APP_SECRET: result.client_secret,
       LARK_DOMAIN: domain,
@@ -170,94 +175,6 @@ function requireValue(argv: string[], index: number, flag: string): string {
   return value;
 }
 
-async function readExistingEnvValue(envPath: string, key: string): Promise<string | null> {
-  const env = await fs.readFile(envPath, "utf8").catch(() => null);
-  if (env === null) {
-    return null;
-  }
-  for (const line of env.split(/\r?\n/u)) {
-    const parsed = parseEnvLine(line);
-    if (parsed?.key === key) {
-      return parsed.value.trim() || null;
-    }
-  }
-  return null;
-}
-
-async function updateEnvFile(filePath: string, updates: Record<string, string>): Promise<void> {
-  const original = await readBaseEnv(filePath);
-  const lines = original.split(/\r?\n/u);
-  const remaining = new Map(Object.entries(updates));
-
-  const next = lines.map((line) => {
-    const parsed = parseEnvLine(line);
-    if (!parsed || !remaining.has(parsed.key)) {
-      return line;
-    }
-    const value = remaining.get(parsed.key) ?? "";
-    remaining.delete(parsed.key);
-    return `${parsed.key}=${formatEnvValue(value)}`;
-  });
-
-  const append = Array.from(remaining.entries()).map(
-    ([key, value]) => `${key}=${formatEnvValue(value)}`,
-  );
-  while (next.length > 0 && next[next.length - 1] === "") {
-    next.pop();
-  }
-  if (append.length > 0 && next.length > 0) {
-    next.push("");
-  }
-  next.push(...append);
-
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, `${next.join("\n")}\n`, { mode: 0o600 });
-  await fs.chmod(filePath, 0o600);
-}
-
-async function readBaseEnv(envPath: string): Promise<string> {
-  const existing = await fs.readFile(envPath, "utf8").catch(() => null);
-  if (existing !== null) {
-    return existing;
-  }
-  const envExamplePath = path.resolve(".env.example");
-  const localExample = await fs.readFile(envExamplePath, "utf8").catch(() => null);
-  if (localExample !== null) {
-    return localExample.trimEnd();
-  }
-  return (await fs.readFile(path.join(packageRoot(), ".env.example"), "utf8").catch(() => "")).trimEnd();
-}
-
-function parseEnvLine(line: string): { key: string; value: string } | null {
-  const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u.exec(line);
-  if (!match) {
-    return null;
-  }
-  return { key: match[1], value: stripEnvQuotes(match[2]) };
-}
-
-function stripEnvQuotes(value: string): string {
-  const trimmed = value.trim();
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1);
-  }
-  return value;
-}
-
-function mergeCsvValue(existing: string | null, value: string): string {
-  return [...new Set([...(existing ?? "").split(","), value].map((item) => item.trim()).filter(Boolean))].join(",");
-}
-
-function formatEnvValue(value: string): string {
-  if (/[\s#"'\\]/u.test(value)) {
-    return JSON.stringify(value);
-  }
-  return value;
-}
-
 function normalizeTenantBrand(value: unknown): LarkDomain {
   return value === "lark" ? "lark" : "feishu";
 }
@@ -318,11 +235,6 @@ function getErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
-}
-
-function packageRoot(): string {
-  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-  return path.resolve(moduleDir, "..", "..");
 }
 
 function isDirectRun(): boolean {

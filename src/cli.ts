@@ -6,7 +6,6 @@ import { config as loadDotenv } from "dotenv";
 import { ZodError } from "zod";
 
 import { buildCodexChildEnv } from "./agent/codex-environment.js";
-import { runBridge } from "./adapters/feishu/adapter.js";
 import { loadConfig } from "./config/env.js";
 import { defaultChat2CodexHome, defaultEnvPath } from "./config/paths.js";
 import {
@@ -17,6 +16,11 @@ import {
 } from "./package-info.js";
 import { acquireBridgeInstanceLock } from "./state/instance-lock.js";
 import { ConsoleLogger, type Logger } from "./util/logger.js";
+import {
+  runBridgeRuntime,
+  type BridgeRuntime,
+} from "./runtime/bridge-runtime.js";
+import { createPlatformAdapterBundle } from "./runtime/platform.js";
 
 type CliCommand =
   | "doctor"
@@ -126,8 +130,8 @@ export function printHelp(): void {
   console.log(`Usage: chat2codex [command] [options]
 
 Commands:
-  start                 Start the Feishu/Lark bridge (default)
-  setup                 Create/connect a Feishu/Lark app and write .env
+  start                 Start the selected chat adapter (default)
+  setup                 Connect Feishu/Lark or Weixin and write .env
   init                  Create a starter .env without registering an app
   doctor                Check local configuration and Codex availability
   smoke                 Run Codex app-server smoke checks
@@ -138,6 +142,7 @@ Commands:
 
 Examples:
   chat2codex setup --workdir /absolute/path/to/your/repo
+  chat2codex setup weixin --workdir /absolute/path/to/your/repo
   chat2codex doctor
   chat2codex start
   chat2codex smoke --mode approval
@@ -150,7 +155,7 @@ async function runStart(args: string[]): Promise<void> {
   if (args[0] === "-h" || args[0] === "--help") {
     console.log(`Usage: chat2codex start [options]
 
-Starts the Feishu/Lark bridge using the configured env file.
+Starts the adapter selected by CHAT2CODEX_ADAPTER using the configured env file.
 
 Options:
   --env <path>       Env file path (default: ~/.chat2codex/.env)
@@ -167,7 +172,7 @@ Options:
     maxFiles: config.logFileMaxFiles,
   });
 
-  let runtime: Awaited<ReturnType<typeof runBridge>> | undefined;
+  let runtime: BridgeRuntime | undefined;
   let instanceLock: Awaited<ReturnType<typeof acquireBridgeInstanceLock>> | undefined;
   let shutdown: GracefulShutdownController | undefined;
   let instanceLockCompromised = false;
@@ -188,9 +193,9 @@ Options:
       shutdown?.request("SIGTERM");
     });
     let resolveRuntimeReady!: (
-      runtime: Awaited<ReturnType<typeof runBridge>> | undefined,
+      runtime: BridgeRuntime | undefined,
     ) => void;
-    const runtimeReady = new Promise<Awaited<ReturnType<typeof runBridge>> | undefined>(
+    const runtimeReady = new Promise<BridgeRuntime | undefined>(
       (resolve) => {
         resolveRuntimeReady = resolve;
       },
@@ -204,7 +209,13 @@ Options:
       shutdown.request("SIGTERM");
     }
     try {
-      runtime = await runBridge(config, logger, () => shutdown?.request("SIGTERM"));
+      const platform = await createPlatformAdapterBundle(config, logger);
+      runtime = await runBridgeRuntime(
+        config,
+        platform,
+        logger,
+        () => shutdown?.request("SIGTERM"),
+      );
     } finally {
       resolveRuntimeReady(runtime);
     }
@@ -327,9 +338,8 @@ async function runSetup(args: string[]): Promise<void> {
   if (args[0] === "-h" || args[0] === "--help") {
     console.log(`Usage: chat2codex setup [options]
 
-Creates and connects a Feishu/Lark app through the official QR-code flow, then
-writes FEISHU_APP_ID, FEISHU_APP_SECRET, LARK_DOMAIN, CODEX_WORKDIR, and when
-available FEISHU_BOT_OPEN_ID and the scanning user's ALLOWED_USER_IDS to .env.
+Connects a Feishu/Lark app by default. Use "setup weixin" to connect a personal
+Weixin ClawBot through the official QR-code flow.
 
 Options:
   --env <path>       File to create or update (default: .env)
@@ -338,6 +348,11 @@ Options:
     return;
   }
 
+  if (args[0] === "weixin") {
+    const { runWeixinSetup } = await import("./setup/weixin.js");
+    await runWeixinSetup(args.slice(1));
+    return;
+  }
   const remaining = args[0] === "feishu" || args[0] === "lark" ? args.slice(1) : args;
 
   const { runFeishuSetup } = await import("./setup/feishu.js");
@@ -419,6 +434,47 @@ Options:
     checks.push(await checkRuntimeDirectory(path.dirname(config.bridgeStatePath), "state directory"));
     checks.push(await checkRuntimeDirectory(path.dirname(config.attachmentDownloadDir), "attachment parent"));
     checks.push(...checkMobileSafeConfig(config));
+    if (config.chatAdapter === "weixin") {
+      const { loadWeixinCredentials } = await import("./adapters/weixin/store.js");
+      try {
+        const credentials = await loadWeixinCredentials(config.weixinCredentialsPath);
+        checks.push({
+          label: "Weixin credentials",
+          status: "ok",
+          detail: `${config.weixinCredentialsPath} (bot ${credentials.accountId})`,
+        });
+        if (
+          credentials.userId &&
+          !config.access.allowedUserIds.includes(credentials.userId)
+        ) {
+          checks.push({
+            label: "Weixin scanning user",
+            status: "error",
+            detail: "credential userId is missing from ALLOWED_USER_IDS; rerun setup weixin",
+          });
+        }
+      } catch (error) {
+        checks.push({
+          label: "Weixin credentials",
+          status: "error",
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+      checks.push({
+        label: "Weixin private-chat boundary",
+        status:
+          config.access.allowDirectMessages &&
+          !config.access.allowGroups &&
+          (
+            config.access.allowedUserIds.length > 0 ||
+            config.access.allowedChatIds.length > 0
+          )
+            ? "ok"
+            : "error",
+        detail:
+          "Weixin v1 requires direct messages, disabled groups, and a user/chat allowlist",
+      });
+    }
   }
 
   printDoctorChecks(checks);

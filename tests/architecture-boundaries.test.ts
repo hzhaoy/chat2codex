@@ -40,6 +40,27 @@ describe("architecture boundaries", () => {
     );
     expect(`${routerSource}\n${runnerSource}`).not.toMatch(/new\s+CodexRunner\b/);
   });
+
+  test("platform adapters do not own the core composition root", async () => {
+    const files = await typescriptFiles(
+      path.join(workspaceRoot, "src/adapters"),
+    );
+    const source = (
+      await Promise.all(files.map((file) => readFile(file, "utf8")))
+    ).join("\n");
+    expect(source).not.toMatch(
+      /new\s+(?:CodexRunner|MessageRouter|JsonStateStore|AdapterSupervisor)\b/u,
+    );
+
+    const composition = await readFile(
+      path.join(workspaceRoot, "src/runtime/bridge-runtime.ts"),
+      "utf8",
+    );
+    expect(composition).toMatch(/new\s+CodexRunner\b/u);
+    expect(composition).toMatch(/new\s+MessageRouter\b/u);
+    expect(composition).toMatch(/new\s+JsonStateStore\b/u);
+    expect(composition).toMatch(/new\s+AdapterSupervisor\b/u);
+  });
 });
 
 async function typescriptFiles(directory: string): Promise<string[]> {

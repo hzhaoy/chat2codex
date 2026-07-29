@@ -3,6 +3,27 @@ import { describe, expect, test } from "bun:test";
 import { loadConfig } from "../src/config/env.js";
 
 describe("loadConfig", () => {
+  test("selects Weixin without requiring Feishu credentials", () => {
+    const config = loadConfig({
+      CHAT2CODEX_ADAPTER: "weixin",
+      CHAT2CODEX_HOME: "/tmp/chat2codex-weixin-home",
+      CODEX_WORKDIR: "/tmp/chat2codex",
+    });
+
+    expect(config.chatAdapter).toBe("weixin");
+    expect(config.feishuAppId).toBe("");
+    expect(config.feishuAppSecret).toBe("");
+    expect(config.weixinCredentialsPath).toBe(
+      "/tmp/chat2codex-weixin-home/weixin/credentials.json",
+    );
+  });
+
+  test("keeps Feishu as the default and requires its credentials", () => {
+    expect(() => loadConfig({ CODEX_WORKDIR: "/tmp/chat2codex" })).toThrow(
+      "CHAT2CODEX_ADAPTER=feishu",
+    );
+  });
+
   test("parses boolean and comma-separated access control env values", () => {
     const config = loadConfig({
       FEISHU_APP_ID: "cli_test",

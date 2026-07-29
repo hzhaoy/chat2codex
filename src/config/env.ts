@@ -70,10 +70,12 @@ const booleanEnv = (defaultValue: boolean) =>
   }, z.boolean());
 
 const configSchema = z.object({
-  FEISHU_APP_ID: z.string().min(1),
-  FEISHU_APP_SECRET: z.string().min(1),
+  CHAT2CODEX_ADAPTER: z.enum(["feishu", "weixin"]).default("feishu"),
+  FEISHU_APP_ID: z.string().optional(),
+  FEISHU_APP_SECRET: z.string().optional(),
   FEISHU_BOT_OPEN_ID: z.string().optional(),
   LARK_DOMAIN: z.enum(["feishu", "lark"]).default("feishu"),
+  WEIXIN_CREDENTIALS_PATH: z.string().optional(),
   CODEX_BIN: z.string().min(1).default("codex"),
   CODEX_WORKDIR: z.string().min(1).default(process.cwd()),
   CODEX_SANDBOX: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("workspace-write"),
@@ -113,6 +115,22 @@ const configSchema = z.object({
   CHAT2CODEX_SERVICE_RESTART_ENABLED: booleanEnv(false),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 }).superRefine((config, context) => {
+  if (config.CHAT2CODEX_ADAPTER === "feishu") {
+    if (!config.FEISHU_APP_ID?.trim()) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["FEISHU_APP_ID"],
+        message: "is required when CHAT2CODEX_ADAPTER=feishu",
+      });
+    }
+    if (!config.FEISHU_APP_SECRET?.trim()) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["FEISHU_APP_SECRET"],
+        message: "is required when CHAT2CODEX_ADAPTER=feishu",
+      });
+    }
+  }
   if (config.BRIDGE_MAX_PENDING_MESSAGES_PER_CHAT > config.BRIDGE_MAX_PENDING_MESSAGES) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -160,10 +178,15 @@ export function loadConfig(env: NodeJS.ProcessEnv) {
     path.resolve(entry),
   );
   return {
-    feishuAppId: parsed.FEISHU_APP_ID,
-    feishuAppSecret: parsed.FEISHU_APP_SECRET,
+    chatAdapter: parsed.CHAT2CODEX_ADAPTER,
+    feishuAppId: parsed.FEISHU_APP_ID?.trim() ?? "",
+    feishuAppSecret: parsed.FEISHU_APP_SECRET?.trim() ?? "",
     feishuBotOpenId: parsed.FEISHU_BOT_OPEN_ID?.trim() || undefined,
     larkDomain: parsed.LARK_DOMAIN,
+    weixinCredentialsPath: path.resolve(
+      parsed.WEIXIN_CREDENTIALS_PATH?.trim() ||
+        path.join(home, "weixin", "credentials.json"),
+    ),
     codexBin: parsed.CODEX_BIN,
     codexWorkdir,
     codexSandbox: parsed.CODEX_SANDBOX,

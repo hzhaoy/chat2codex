@@ -4992,6 +4992,80 @@ describe("MessageRouter access control", () => {
     });
   });
 
+  test("resolves text-only approvals by reply code and original decision index", async () => {
+    const request: CodexApprovalRequest = {
+      id: "approval_text_1",
+      kind: "command",
+      command: "bun test",
+      cwd: "/tmp/chat2codex",
+      proposedExecpolicyAmendment: ["bun", "test"],
+      decisions: [
+        "accept",
+        {
+          acceptWithExecpolicyAmendment: {
+            execpolicy_amendment: ["bun", "test"],
+          },
+        },
+        "cancel",
+      ],
+    };
+    const codex = new ApprovalCodex(request);
+    const sender = new CollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_approval_text",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "run tests",
+      });
+      await waitFor(() =>
+        sender.messages.some((message) => message.text.includes("/approve")),
+      );
+      const prompt = sender.messages.find((message) =>
+        message.text.includes("/approve"),
+      )?.text;
+      expect(prompt).toContain("【命令】\nbun test");
+      expect(prompt).toContain("1. 仅本次允许（Approve）");
+      expect(prompt).toContain("2. 允许并保存命令规则（Approve rule）");
+      expect(prompt).toContain("3. 拒绝并取消本轮（Cancel turn）");
+      expect(prompt).toContain("/permit 仅用于 Codex 单独发出的");
+      expect(prompt).not.toContain('"acceptWithExecpolicyAmendment"');
+      expect(prompt).not.toContain("【命令分析】");
+      expect(prompt).not.toContain("【建议命令规则】");
+      const replyCode = /\/approve ([a-f0-9]{8})/u.exec(prompt ?? "")?.[1];
+      expect(replyCode).toBeTruthy();
+
+      await router.enqueue({
+        messageId: "m_approval_wrong_user",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_other" },
+        text: `/approve ${replyCode} 1`,
+      });
+      expect(codex.decision).toBeUndefined();
+
+      await router.enqueue({
+        messageId: "m_approval_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/approve ${replyCode} 1`,
+      });
+      await running;
+      expect(codex.decision).toBe("accept");
+
+      await router.enqueue({
+        messageId: "m_approval_late_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/approve ${replyCode} 3`,
+      });
+      expect(sender.messages.at(-1)?.text).toContain("回复码无效");
+    });
+  });
+
   test("approval card action rejects a mismatched card message id", async () => {
     const codex = new ApprovalCodex({
       id: "approval_1",
@@ -6090,7 +6164,7 @@ describe("MessageRouter access control", () => {
     );
   });
 
-  test("denies extra permissions when approval cards are unavailable or fail to send", async () => {
+  test("falls back to /permit when permission approval cards are unavailable", async () => {
     const request: CodexPermissionApprovalRequest = {
       id: "permission_unavailable",
       cwd: "/repo",
@@ -6106,39 +6180,32 @@ describe("MessageRouter access control", () => {
     const unavailableCodex = new PermissionApprovalCodex(request);
     const unavailableSender = new CollectingSender();
     await withRouterAndSender({}, unavailableCodex, unavailableSender, async ({ router }) => {
-      await router.enqueue({
+      const running = router.enqueue({
         messageId: "m_permission_unavailable",
         chatId: "oc_chat",
         chatType: "direct",
         sender: { openId: "ou_user" },
         text: "request permission",
       });
-
-      expect(unavailableCodex.decision).toBe("deny");
-      expect(unavailableSender.messages.some((message) => message.text.includes("已拒绝"))).toBe(
-        true,
+      await waitFor(() =>
+        unavailableSender.messages.some((message) =>
+          message.text.includes("/permit"),
+        ),
       );
-    });
-
-    const failingCodex = new PermissionApprovalCodex({
-      ...request,
-      id: "permission_failed_card",
-    });
-    const failingSender = new FailingPermissionApprovalCardSender();
-    await withRouterAndSender({}, failingCodex, failingSender, async ({ router }) => {
+      const prompt = unavailableSender.messages.find((message) =>
+        message.text.includes("/permit"),
+      )?.text;
+      const replyCode = /\/permit ([a-f0-9]{8}) turn/u.exec(prompt ?? "")?.[1];
+      expect(replyCode).toBeTruthy();
       await router.enqueue({
-        messageId: "m_permission_failed_card",
+        messageId: "m_permission_answer",
         chatId: "oc_chat",
         chatType: "direct",
         sender: { openId: "ou_user" },
-        text: "request permission",
+        text: `/permit ${replyCode} turn`,
       });
-
-      expect(failingCodex.decision).toBe("deny");
-      expect(failingSender.permissionApprovalCardAttempts).toHaveLength(1);
-      expect(failingSender.messages.some((message) => message.text.includes("安全策略拒绝"))).toBe(
-        true,
-      );
+      await running;
+      expect(unavailableCodex.decision).toBe("grantTurn");
     });
   });
 
@@ -6528,6 +6595,50 @@ describe("MessageRouter access control", () => {
         });
       },
     );
+  });
+
+  test("falls back to /mcp-decide for URL requests on text-only adapters", async () => {
+    const request: CodexMcpElicitationRequest = {
+      id: "mcp_url_text",
+      serverName: "oauth-provider",
+      threadId: "thread_test",
+      turnId: "turn_1",
+      message: "Authorize access.",
+      mode: "url",
+      elicitationId: "elicit_text",
+      url: "https://auth.example.test/authorize",
+    };
+    const codex = new McpElicitationCodex(request);
+    const sender = new CollectingSender();
+    await withRouterAndSender({}, codex, sender, async ({ router }) => {
+      const running = router.enqueue({
+        messageId: "m_mcp_url_text",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: "authorize provider",
+      });
+      await waitFor(() =>
+        sender.messages.some((message) => message.text.includes("/mcp-decide")),
+      );
+      const prompt = sender.messages.find((message) =>
+        message.text.includes("/mcp-decide"),
+      )?.text;
+      expect(prompt).toContain(request.url);
+      const replyCode = /\/mcp-decide ([a-f0-9]{8}) accept/u.exec(
+        prompt ?? "",
+      )?.[1];
+      expect(replyCode).toBeTruthy();
+      await router.enqueue({
+        messageId: "m_mcp_url_text_answer",
+        chatId: "oc_chat",
+        chatType: "direct",
+        sender: { openId: "ou_user" },
+        text: `/mcp-decide ${replyCode} accept`,
+      });
+      await running;
+      expect(codex.response).toEqual({ action: "accept", content: null });
+    });
   });
 
   test("expires MCP elicitation on abort and rejects late card actions", async () => {

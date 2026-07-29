@@ -87,7 +87,11 @@ describe("bounded logger", () => {
         appSecret: "never-write-this-secret",
         prompt: "never-write-this-prompt",
         safeField: "kept",
-        nested: { accessToken: "never-write-this-token" },
+        nested: {
+          accessToken: "never-write-this-token",
+          aes_key: "never-write-this-aes-key",
+          context_token: "never-write-this-context",
+        },
       });
 
       const content = await fs.readFile(logPath, "utf8");

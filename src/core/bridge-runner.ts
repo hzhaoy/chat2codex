@@ -229,6 +229,7 @@ interface PendingApproval {
   chatId: string;
   originSender: SenderIdentity;
   request: CodexApprovalRequest;
+  replyCode: string;
   resolve: (decision: CodexApprovalDecision) => void;
   handle: StatusCardHandle | null;
   createdAt: string;
@@ -300,6 +301,7 @@ interface PendingPermissionApproval {
   chatId: string;
   originSender: SenderIdentity;
   request: CodexPermissionApprovalRequest;
+  replyCode: string;
   resolve: (decision: CodexPermissionApprovalDecision) => void;
   signal: AbortSignal;
   abortListener: () => void;
@@ -320,6 +322,7 @@ interface PendingMcpElicitation {
   signal: AbortSignal;
   abortListener: () => void;
   handle: StatusCardHandle | null;
+  timeoutTimer?: NodeJS.Timeout;
   terminalCard?: McpElicitationCardInput;
 }
 
@@ -495,7 +498,13 @@ export class BridgeRunner {
     }
     if (
       !message.attachments?.length &&
-      (isUserInputAnswerCommand(message) || isMcpAnswerCommand(message))
+      (
+        isApprovalAnswerCommand(message) ||
+        isPermissionAnswerCommand(message) ||
+        isMcpDecisionCommand(message) ||
+        isUserInputAnswerCommand(message) ||
+        isMcpAnswerCommand(message)
+      )
     ) {
       // Interactive answers can contain private values. Keep the
       // command in memory only; processMessage still persists its message id so
@@ -711,6 +720,15 @@ export class BridgeRunner {
     }
     if (!message.attachments?.length && isMcpAnswerCommand(message)) {
       return this.handleImmediateMcpAnswer(message);
+    }
+    if (!message.attachments?.length && isApprovalAnswerCommand(message)) {
+      return this.handleImmediateApprovalAnswer(message);
+    }
+    if (!message.attachments?.length && isPermissionAnswerCommand(message)) {
+      return this.handleImmediatePermissionAnswer(message);
+    }
+    if (!message.attachments?.length && isMcpDecisionCommand(message)) {
+      return this.handleImmediateMcpDecision(message);
     }
 
     return this.enqueueTask(message.chatId, () => this.handle(message));
@@ -2254,6 +2272,18 @@ export class BridgeRunner {
     await this.handleImmediateCommand(message, () => this.answerMcpElicitationFromText(message));
   }
 
+  private async handleImmediateApprovalAnswer(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.answerApprovalFromText(message));
+  }
+
+  private async handleImmediatePermissionAnswer(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.answerPermissionFromText(message));
+  }
+
+  private async handleImmediateMcpDecision(message: IncomingTextMessage): Promise<void> {
+    await this.handleImmediateCommand(message, () => this.decideMcpFromText(message));
+  }
+
   private async handleImmediateCommand(
     message: IncomingTextMessage,
     action: () => Promise<unknown>,
@@ -2317,6 +2347,7 @@ export class BridgeRunner {
         "- `/stop` / `/steer <补充指令>`：停止或补充当前任务",
         "- `/summary` / `/files` / `/diff` / `/logs`：查看最近运行结果",
         "- `/new` / `/cd <path>`：新建会话或切换工作目录",
+        "- `/approve` / `/permit` / `/mcp-decide`：按待处理提示在纯文本平台完成安全审批",
         "",
         "历史 turn 分叉不会恢复或回滚本地文件。",
       ].join("\n"),
@@ -3799,7 +3830,7 @@ export class BridgeRunner {
         chatType,
         originSender: { ...originSender },
         request,
-        replyCode: this.createUserInputReplyCode(),
+        replyCode: this.createInteractionReplyCode(),
         answers: new Map(),
         resolve,
         signal,
@@ -4017,14 +4048,17 @@ export class BridgeRunner {
     }
   }
 
-  private createUserInputReplyCode(): string {
+  private createInteractionReplyCode(): string {
     let code = "";
     do {
       code = randomUUID().replaceAll("-", "").slice(0, 8).toLowerCase();
     } while (
-      [...this.activeUserInputs.values()].some(
-        (pending) => pending.replyCode.toLowerCase() === code,
-      )
+      [
+        ...this.activeApprovals.values(),
+        ...this.activeUserInputs.values(),
+        ...this.activePermissionApprovals.values(),
+        ...this.activeMcpElicitations.values(),
+      ].some((pending) => pending.replyCode.toLowerCase() === code)
     );
     return code;
   }
@@ -4059,6 +4093,57 @@ export class BridgeRunner {
     const input = this.finishPendingPermissionApproval(pending, status, action.decision);
     await this.updatePermissionApprovalCard(pending.handle, input);
     return actionView({ kind: "permission_approval", input });
+  }
+
+  private async answerPermissionFromText(message: IncomingTextMessage): Promise<void> {
+    const command = parsePermissionAnswerCommand(routedText(message));
+    if (!command) {
+      await this.sender.sendText(
+        message.chatId,
+        "用法：/permit <replyCode> <deny|turn|session>",
+      );
+      return;
+    }
+    const pending = [...this.activePermissionApprovals.values()].find(
+      (candidate) =>
+        candidate.chatId === message.chatId &&
+        candidate.replyCode.toLowerCase() === command.replyCode,
+    );
+    if (!pending) {
+      await this.sender.sendText(message.chatId, "回复码无效，或这条权限请求已经结束。");
+      return;
+    }
+    if (!sameStableSenderIdentity(pending.originSender, message.sender)) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起当前 Codex 任务的用户可以处理这条权限请求。",
+      );
+      return;
+    }
+    const decision: CodexPermissionApprovalDecision =
+      command.decision === "deny"
+        ? "deny"
+        : command.decision === "turn"
+          ? "grantTurn"
+          : "grantSession";
+    if (!this.interactionPolicy.isPermissionDecisionAllowed(pending.request, decision)) {
+      await this.sender.sendText(
+        message.chatId,
+        "权限详情未能完整验证，不能执行这项授权。",
+      );
+      return;
+    }
+    const status = decision === "deny" ? "declined" : "resolved";
+    const input = this.finishPendingPermissionApproval(pending, status, decision);
+    await this.updatePermissionApprovalCard(pending.handle, input);
+    await this.sender.sendText(
+      message.chatId,
+      decision === "deny"
+        ? "已拒绝这次额外权限请求。"
+        : decision === "grantTurn"
+          ? "已仅为当前 turn 授予这次额外权限。"
+          : "已为当前 session 授予这次额外权限。",
+    );
   }
 
   private async requestPermissionApproval(
@@ -4104,6 +4189,7 @@ export class BridgeRunner {
         chatId,
         originSender: { ...originSender },
         request,
+        replyCode: this.createInteractionReplyCode(),
         resolve,
         signal,
         abortListener,
@@ -4154,11 +4240,11 @@ export class BridgeRunner {
 
   private async presentPermissionApproval(pending: PendingPermissionApproval): Promise<void> {
     if (!this.sender.createPermissionApprovalCard || !this.sender.updatePermissionApprovalCard) {
-      await this.sendUserInputTextSafely(
+      const delivered = await this.sendUserInputTextSafely(
         pending.chatId,
-        "当前聊天适配器不能安全展示额外权限详情，已拒绝这次请求。",
+        formatPermissionApprovalTextPrompt(pending),
       );
-      if (this.activePermissionApprovals.get(pending.key) === pending) {
+      if (!delivered && this.activePermissionApprovals.get(pending.key) === pending) {
         this.finishPendingPermissionApproval(pending, "cancelled", "deny");
       }
       return;
@@ -4177,13 +4263,15 @@ export class BridgeRunner {
         await this.updatePermissionApprovalCard(handle, pending.terminalCard);
       }
     } catch (error) {
-      this.logger.warn("Permission approval card creation failed; denying", error);
+      this.logger.warn("Permission approval card creation failed; falling back to text", error);
       if (this.activePermissionApprovals.get(pending.key) === pending) {
-        await this.sendUserInputTextSafely(
+        const delivered = await this.sendUserInputTextSafely(
           pending.chatId,
-          "额外权限审批卡发送失败，已按安全策略拒绝这次请求。",
+          formatPermissionApprovalTextPrompt(pending),
         );
-        this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+        if (!delivered && this.activePermissionApprovals.get(pending.key) === pending) {
+          this.finishPendingPermissionApproval(pending, "cancelled", "deny");
+        }
       }
     }
   }
@@ -4348,7 +4436,7 @@ export class BridgeRunner {
         chatId,
         originSender: { ...originSender },
         request,
-        replyCode: this.createMcpReplyCode(),
+        replyCode: this.createInteractionReplyCode(),
         answers: new Map(),
         completedFieldIds: new Set(),
         resolve,
@@ -4356,6 +4444,20 @@ export class BridgeRunner {
         abortListener,
         handle: null,
       };
+      if (this.config.codexApprovalTimeoutMs > 0) {
+        pending.timeoutTimer = setTimeout(() => {
+          if (this.activeMcpElicitations.get(key) !== pending) {
+            return;
+          }
+          const input = this.finishPendingMcpElicitation(
+            pending,
+            "expired",
+            { action: "cancel" },
+          );
+          void this.updateMcpElicitationCard(pending.handle, input);
+        }, this.config.codexApprovalTimeoutMs);
+        pending.timeoutTimer.unref?.();
+      }
       this.activeMcpElicitations.set(key, pending);
       signal.addEventListener("abort", abortListener, { once: true });
       if (signal.aborted) {
@@ -4442,6 +4544,63 @@ export class BridgeRunner {
     await this.sendUserInputTextSafely(message.chatId, formatMcpTextPrompt(pending));
   }
 
+  private async decideMcpFromText(message: IncomingTextMessage): Promise<void> {
+    const command = parseMcpDecisionCommand(routedText(message));
+    if (!command) {
+      await this.sender.sendText(
+        message.chatId,
+        "用法：/mcp-decide <replyCode> <accept|decline|cancel>",
+      );
+      return;
+    }
+    const pending = [...this.activeMcpElicitations.values()].find(
+      (candidate) =>
+        candidate.chatId === message.chatId &&
+        candidate.replyCode.toLowerCase() === command.replyCode,
+    );
+    if (!pending) {
+      await this.sender.sendText(message.chatId, "回复码无效，或这条 MCP 请求已经结束。");
+      return;
+    }
+    if (!sameStableSenderIdentity(pending.originSender, message.sender)) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起当前 Codex 任务的用户可以处理这条 MCP 请求。",
+      );
+      return;
+    }
+    const input = this.mcpElicitationCardInput(pending, "pending");
+    if (!this.interactionPolicy.isMcpDecisionAllowed(input, command.decision)) {
+      await this.sender.sendText(
+        message.chatId,
+        "MCP 请求未完整验证，不能执行这项操作。",
+      );
+      return;
+    }
+    const response: CodexMcpElicitationResponse =
+      command.decision === "accept"
+        ? pending.request.mode === "form"
+          ? { action: "accept", content: mcpElicitationContent(pending) }
+          : { action: "accept", content: null }
+        : { action: command.decision };
+    const status =
+      command.decision === "accept"
+        ? "resolved"
+        : command.decision === "decline"
+          ? "declined"
+          : "cancelled";
+    const terminal = this.finishPendingMcpElicitation(pending, status, response);
+    await this.updateMcpElicitationCard(pending.handle, terminal);
+    await this.sender.sendText(
+      message.chatId,
+      command.decision === "accept"
+        ? "已接受这条 MCP 请求。"
+        : command.decision === "decline"
+          ? "已拒绝这条 MCP 请求。"
+          : "已取消这条 MCP 请求。",
+    );
+  }
+
   private mcpElicitationCardInput(
     pending: PendingMcpElicitation,
     status: McpElicitationCardInput["status"],
@@ -4464,6 +4623,9 @@ export class BridgeRunner {
   ): McpElicitationCardInput {
     if (this.activeMcpElicitations.get(pending.key) === pending) {
       this.activeMcpElicitations.delete(pending.key);
+    }
+    if (pending.timeoutTimer) {
+      clearTimeout(pending.timeoutTimer);
     }
     pending.signal.removeEventListener("abort", pending.abortListener);
     const input = this.mcpElicitationCardInput(pending, status);
@@ -4498,19 +4660,11 @@ export class BridgeRunner {
   }
 
   private async presentMcpTextFallback(pending: PendingMcpElicitation): Promise<void> {
-    if (pending.request.mode !== "form" || !nextMcpElicitationField(pending)) {
-      await this.sendUserInputTextSafely(
-        pending.chatId,
-        "当前聊天适配器不能安全展示这次 MCP 请求，已取消。",
-      );
-      if (this.activeMcpElicitations.get(pending.key) === pending) {
-        this.finishPendingMcpElicitation(pending, "cancelled", { action: "cancel" });
-      }
-      return;
-    }
     const delivered = await this.sendUserInputTextSafely(
       pending.chatId,
-      formatMcpTextPrompt(pending),
+      pending.request.mode === "url"
+        ? formatMcpUrlTextPrompt(pending)
+        : formatMcpTextPrompt(pending),
     );
     if (!delivered && this.activeMcpElicitations.get(pending.key) === pending) {
       this.finishPendingMcpElicitation(pending, "cancelled", { action: "cancel" });
@@ -4545,18 +4699,6 @@ export class BridgeRunner {
       );
       await this.updateMcpElicitationCard(pending.handle, input);
     }
-  }
-
-  private createMcpReplyCode(): string {
-    let code = "";
-    do {
-      code = randomUUID().replaceAll("-", "").slice(0, 8).toLowerCase();
-    } while (
-      [...this.activeMcpElicitations.values()].some(
-        (pending) => pending.replyCode.toLowerCase() === code,
-      )
-    );
-    return code;
   }
 
   private async stopCodex(
@@ -4825,6 +4967,60 @@ export class BridgeRunner {
     return actionView({ kind: "approval", input: resolvedInput });
   }
 
+  private async answerApprovalFromText(message: IncomingTextMessage): Promise<void> {
+    const command = parseApprovalAnswerCommand(routedText(message));
+    if (!command) {
+      await this.sender.sendText(
+        message.chatId,
+        "用法：/approve <replyCode> <选项编号>",
+      );
+      return;
+    }
+    const pending = [...this.activeApprovals.values()].find(
+      (candidate) =>
+        candidate.chatId === message.chatId &&
+        candidate.replyCode.toLowerCase() === command.replyCode,
+    );
+    if (!pending) {
+      await this.sender.sendText(message.chatId, "回复码无效，或这条审批请求已经结束。");
+      return;
+    }
+    if (!sameStableSenderIdentity(pending.originSender, message.sender)) {
+      await this.sender.sendText(
+        message.chatId,
+        "只有发起当前 Codex 任务的用户可以处理这条审批请求。",
+      );
+      return;
+    }
+    const decisionIndex = command.optionNumber - 1;
+    if (!this.interactionPolicy.isApprovalDecisionAllowed(pending.request, decisionIndex)) {
+      await this.sender.sendText(message.chatId, "审批选项无效或已经失效。");
+      return;
+    }
+    const decision = pending.request.decisions[decisionIndex];
+    if (!decision) {
+      await this.sender.sendText(message.chatId, "审批选项无效或已经失效。");
+      return;
+    }
+    this.activeApprovals.delete(pending.key);
+    if (pending.timeoutTimer) {
+      clearTimeout(pending.timeoutTimer);
+    }
+    pending.decision = decision;
+    pending.resolvedAt = new Date().toISOString();
+    pending.resolve(decision);
+    await this.updateApprovalCard(pending.handle, {
+      status: "resolved",
+      request: pending.request,
+      decision,
+      updatedAt: pending.resolvedAt,
+    });
+    await this.sender.sendText(
+      message.chatId,
+      `已提交审批决定：${approvalDecisionLabel(decision)}。`,
+    );
+  }
+
   private async requestApproval(
     chatId: string,
     originSender: SenderIdentity | undefined,
@@ -4874,6 +5070,7 @@ export class BridgeRunner {
         chatId,
         originSender: { ...originSender },
         request,
+        replyCode: this.createInteractionReplyCode(),
         resolve,
         handle: null,
         createdAt: new Date(createdAtMs).toISOString(),
@@ -4940,12 +5137,25 @@ export class BridgeRunner {
         pending.timeoutTimer.unref?.();
       }
 
-      this.createApprovalCard(chatId, {
+      const presentation = this.sender.createApprovalCard && this.sender.updateApprovalCard
+        ? this.createApprovalCard(chatId, {
         status: "pending",
         request,
         updatedAt: new Date().toISOString(),
-      })
+          })
+        : this.sendUserInputTextSafely(chatId, formatApprovalTextPrompt(pending)).then(
+            (delivered) => {
+              if (!delivered) {
+                throw new Error("Approval text prompt delivery failed.");
+              }
+              return null;
+            },
+          );
+      presentation
         .then((handle) => {
+          if (!handle) {
+            return;
+          }
           if (this.activeApprovals.get(key) === pending) {
             pending.handle = handle;
             return;
@@ -4972,10 +5182,22 @@ export class BridgeRunner {
           }
         })
         .catch((error: unknown) => {
-          this.logger.warn("Approval card creation failed; cancelling approval request", error);
+          this.logger.warn("Approval presentation failed", error);
           if (this.activeApprovals.get(key) === pending) {
-            this.activeApprovals.delete(key);
-            resolve("cancel");
+            if (this.sender.createApprovalCard && this.sender.updateApprovalCard) {
+              void this.sendUserInputTextSafely(
+                chatId,
+                formatApprovalTextPrompt(pending),
+              ).then((delivered) => {
+                if (!delivered && this.activeApprovals.get(key) === pending) {
+                  this.activeApprovals.delete(key);
+                  resolve("cancel");
+                }
+              });
+            } else {
+              this.activeApprovals.delete(key);
+              resolve("cancel");
+            }
           }
         });
     });
@@ -6360,6 +6582,12 @@ function isBuiltInRouterCommand(text: string): boolean {
     text.startsWith("/answer ") ||
     text === "/mcp-answer" ||
     text.startsWith("/mcp-answer ") ||
+    text === "/approve" ||
+    text.startsWith("/approve ") ||
+    text === "/permit" ||
+    text.startsWith("/permit ") ||
+    text === "/mcp-decide" ||
+    text.startsWith("/mcp-decide ") ||
     text === "/project" ||
     text.startsWith("/project ") ||
     text === "/history" ||
@@ -6766,6 +6994,58 @@ function isMcpAnswerCommand(message: IncomingTextMessage): boolean {
   return text === "/mcp-answer" || text.startsWith("/mcp-answer ");
 }
 
+function isApprovalAnswerCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/approve" || text.startsWith("/approve ");
+}
+
+function isPermissionAnswerCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/permit" || text.startsWith("/permit ");
+}
+
+function isMcpDecisionCommand(message: IncomingTextMessage): boolean {
+  const text = routedText(message);
+  return text === "/mcp-decide" || text.startsWith("/mcp-decide ");
+}
+
+function parseApprovalAnswerCommand(
+  text: string,
+): { replyCode: string; optionNumber: number } | null {
+  const match = /^\/approve\s+([a-f0-9]{8})\s+([1-9]\d*)$/u.exec(text);
+  if (!match) {
+    return null;
+  }
+  const optionNumber = Number(match[2]);
+  return Number.isSafeInteger(optionNumber)
+    ? { replyCode: match[1]!, optionNumber }
+    : null;
+}
+
+function parsePermissionAnswerCommand(
+  text: string,
+): { replyCode: string; decision: "deny" | "turn" | "session" } | null {
+  const match = /^\/permit\s+([a-f0-9]{8})\s+(deny|turn|session)$/u.exec(text);
+  return match
+    ? {
+        replyCode: match[1]!,
+        decision: match[2] as "deny" | "turn" | "session",
+      }
+    : null;
+}
+
+function parseMcpDecisionCommand(
+  text: string,
+): { replyCode: string; decision: "accept" | "decline" | "cancel" } | null {
+  const match = /^\/mcp-decide\s+([a-f0-9]{8})\s+(accept|decline|cancel)$/u.exec(text);
+  return match
+    ? {
+        replyCode: match[1]!,
+        decision: match[2] as "accept" | "decline" | "cancel",
+      }
+    : null;
+}
+
 function parseUserInputAnswerCommand(
   text: string,
 ): { replyCode: string; answer: string } | null {
@@ -7042,32 +7322,179 @@ function formatMcpTextPrompt(pending: PendingMcpElicitation): string {
     !sensitive && (field.type === "enum" || field.type === "multi_select")
       ? field.options.map((option) =>
           option.title === option.value
-            ? `- ${truncateInline(option.value, 256)}`
-            : `- ${truncateInline(option.title, 160)} (${truncateInline(option.value, 256)})`,
+            ? `• ${option.value}`
+            : `• ${option.title} (${option.value})`,
         )
       : !sensitive && field.type === "boolean"
-        ? ["- true", "- false"]
+        ? ["• true", "• false"]
         : [];
   return [
-    "Codex 正在等待 MCP 结构化输入。",
-    `${truncateInline(field.title ?? field.name, 160)}（fieldId: ${truncateInline(field.name, 128)}，type: ${field.type}，${field.required ? "必填" : "可选"}）`,
-    field.description ? truncateDetail(field.description, 500) : null,
-    ...options,
-    sensitive ? "这个字段看起来包含 secret/password；聊天中不会提供输入入口。" : null,
-    !sensitive && field.type === "multi_select" ? "多选值请使用 JSON 字符串数组。" : null,
-    !field.required
-      ? `发送 /mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} /skip 跳过这个字段。`
-      : null,
-    !sensitive
-      ? `发送 /mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} <内容> 回答当前字段。`
+    "Codex 结构化输入",
+    [
+      "【问题】",
+      `${field.title ?? field.name}（fieldId：${field.name}｜类型：${field.type}｜${field.required ? "必填" : "可选"}）`,
+      field.description,
+    ].filter((line): line is string => Boolean(line)).join("\n"),
+    options.length > 0 ? ["【可选值】", ...options].join("\n") : null,
+    sensitive
+      ? "这个字段可能包含 secret/password，聊天中不会提供输入入口。"
+      : [
+          "【回复命令】",
+          `• 回答：/mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} <内容>`,
+          !field.required
+            ? `• 跳过：/mcp-answer ${pending.replyCode} ${JSON.stringify(field.name)} /skip`
+            : null,
+        ].filter((line): line is string => Boolean(line)).join("\n"),
+    !sensitive && field.type === "multi_select"
+      ? "多选值请使用 JSON 字符串数组。"
       : null,
     !field.required && (field.type === "string" || field.type === "enum")
-      ? '若实际值就是 /skip，请把值写成 JSON 字符串 "/skip"。'
+      ? '若实际值就是 /skip，请写成 JSON 字符串 "/skip"。'
       : null,
     "回答内容不会在聊天中回显，也不会写入 Chat2Codex 持久化状态。",
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
+  ].filter((section): section is string => Boolean(section)).join("\n\n");
+}
+
+function formatMcpUrlTextPrompt(pending: PendingMcpElicitation): string {
+  if (pending.request.mode !== "url") {
+    return formatMcpTextPrompt(pending);
+  }
+  return [
+    "Codex MCP 请求",
+    [
+      "【请求】",
+      `• 服务：${pending.request.serverName}`,
+      `• 说明：${pending.request.message}`,
+      `• URL：${pending.request.url}`,
+    ].join("\n"),
+    [
+      "【可选操作】",
+      `• 接受：/mcp-decide ${pending.replyCode} accept`,
+      `• 拒绝：/mcp-decide ${pending.replyCode} decline`,
+      `• 取消：/mcp-decide ${pending.replyCode} cancel`,
+    ].join("\n"),
+    "只有发起当前 Codex 任务的用户可以处理，回复码在请求结束后立即失效。",
+  ].join("\n\n");
+}
+
+function formatApprovalTextPrompt(pending: PendingApproval): string {
+  const request = pending.request;
+  const requestSection =
+    request.kind === "command"
+      ? [
+          "【命令】",
+          request.command,
+          request.cwd ? `目录：${request.cwd}` : null,
+          request.reason ? `原因：${request.reason}` : null,
+        ]
+      : [
+          "【文件变更】",
+          request.cwd ? `目录：${request.cwd}` : null,
+          request.grantRoot ? `授权根目录：${request.grantRoot}` : null,
+          request.reason ? `原因：${request.reason}` : null,
+        ];
+  const optionLines = request.decisions.map(
+    (decision, index) => `${index + 1}. ${approvalTextDecisionLabel(decision)}`,
+  );
+  const lacksStandaloneDecline =
+    !request.decisions.includes("decline") && request.decisions.includes("cancel");
+  return [
+    request.kind === "command" ? "Codex 命令审批" : "Codex 文件变更审批",
+    requestSection.filter((line): line is string => Boolean(line)).join("\n"),
+    request.additionalPermissions
+      ? formatApprovalMetadata("额外权限", request.additionalPermissions)
+      : null,
+    request.networkApprovalContext
+      ? formatApprovalMetadata("网络审批上下文", request.networkApprovalContext)
+      : null,
+    request.proposedNetworkPolicyAmendments
+      ? formatApprovalMetadata("建议网络规则", request.proposedNetworkPolicyAmendments)
+      : null,
+    ["【可选操作】", ...optionLines].join("\n"),
+    lacksStandaloneDecline
+      ? "说明：Codex 本次未提供 Deny；“拒绝并取消本轮”（Cancel turn）是本次请求提供的拒绝路径。"
+      : null,
+    ["【回复命令】", `/approve ${pending.replyCode} <选项编号>`].join("\n"),
+    [
+      "回复码只对本次请求有效；编号严格映射 Codex 原始 decision。",
+      "/permit 仅用于 Codex 单独发出的网络或文件系统权限请求。",
+    ].join("\n"),
+  ].filter((section): section is string => Boolean(section)).join("\n\n");
+}
+
+function formatPermissionApprovalTextPrompt(
+  pending: PendingPermissionApproval,
+): string {
+  return [
+    "Codex 额外权限请求",
+    [
+      "【请求】",
+      `• 目录：${pending.request.cwd}`,
+      pending.request.reason ? `• 原因：${pending.request.reason}` : null,
+    ].filter((line): line is string => Boolean(line)).join("\n"),
+    formatApprovalMetadata("权限详情", pending.request.permissions),
+    [
+      "【可选操作】",
+      `• 拒绝：/permit ${pending.replyCode} deny`,
+      `• 仅当前 turn 授权：/permit ${pending.replyCode} turn`,
+      `• 当前 session 授权：/permit ${pending.replyCode} session`,
+    ].join("\n"),
+    "只有发起当前 Codex 任务的用户可以处理；请求结束后回复码立即失效。",
+  ].filter((section): section is string => Boolean(section)).join("\n\n");
+}
+
+function approvalTextDecisionLabel(decision: CodexApprovalDecision): string {
+  if (decision === "accept") {
+    return "仅本次允许（Approve）";
+  }
+  if (decision === "acceptForSession") {
+    return "本会话内允许（Approve session）";
+  }
+  if (decision === "decline") {
+    return "拒绝本次执行（Deny）";
+  }
+  if (decision === "cancel") {
+    return "拒绝并取消本轮（Cancel turn）";
+  }
+  if ("acceptWithExecpolicyAmendment" in decision) {
+    return "允许并保存命令规则（Approve rule）";
+  }
+  return "应用网络策略变更（Apply network policy）";
+}
+
+function formatApprovalMetadata(title: string, value: unknown): string {
+  return [`【${title}】`, formatApprovalMetadataValue(value)].join("\n");
+}
+
+function formatApprovalMetadataValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return "• 无";
+    }
+    return value.map((entry) => `• ${formatApprovalMetadataInline(entry)}`).join("\n");
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) {
+      return "• 无";
+    }
+    return entries
+      .map(([key, entry]) => `• ${key}：${formatApprovalMetadataInline(entry)}`)
+      .join("\n");
+  }
+  return `• ${formatApprovalMetadataInline(value)}`;
+}
+
+function formatApprovalMetadataInline(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((entry) => formatApprovalMetadataInline(entry)).join(" · ");
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>)
+      .map(([key, entry]) => `${key}=${formatApprovalMetadataInline(entry)}`)
+      .join(" · ");
+  }
+  return String(value);
 }
 
 function hasStableSenderIdentity(sender: SenderIdentity): boolean {
@@ -7110,17 +7537,24 @@ function formatUserInputTextPrompt(pending: PendingUserInput): string {
   }
   const options = (question.options ?? []).slice(0, 10);
   return [
-    "Codex 正在等待你的补充输入。",
-    `${truncateInline(question.header, 80)}：${truncateInline(question.question, 500)}`,
-    ...options.map((option) => `- ${truncateInline(option.label, 80)}`),
-    `发送 /answer ${pending.replyCode} <内容> 回答当前问题。`,
+    "Codex 补充输入",
+    [
+      "【问题】",
+      truncateInline(question.header, 80),
+      truncateInline(question.question, 500),
+    ].join("\n"),
+    options.length > 0
+      ? [
+          "【可选值】",
+          ...options.map((option) => `• ${truncateInline(option.label, 80)}`),
+        ].join("\n")
+      : null,
+    ["【回复命令】", `/answer ${pending.replyCode} <内容>`].join("\n"),
     options.length > 0 && !question.isOther
       ? "当前问题只接受上面的可选项名称（需完全一致）。"
       : null,
     "回答内容不会在聊天中回显，也不会写入 Chat2Codex 持久化状态。",
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
+  ].filter((section): section is string => Boolean(section)).join("\n\n");
 }
 
 function detailCommandKind(message: IncomingTextMessage): RunDetailKind | null {
